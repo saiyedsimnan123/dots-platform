@@ -1,0 +1,14 @@
+{
+  "name": "dots-platform",
+  "version": "0.1.0",
+  "description": "Next-Generation Dots AI Platform - Secure, durable, provider-independent agent runtime",
+  "type": "module",
+  "scripts": {
+    "test": "node --test \"tests/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
+  }
+}

@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Compilation Output
+dist/
+*.tsbuildinfo
+
+# SQLite Database Files
+*.db
+*.db-wal
+*.db-shm
+
+# Environment & Secrets (Crucial: Never commit credentials)
+.env
+.env.*
+!.env.example
+
+# Logs & Diagnostics
+*.log
+npm-debug.log*
+
+# Sandbox Output (created by sandboxed executions)
+sandbox/
+tmp/
