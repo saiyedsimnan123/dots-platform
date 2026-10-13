@@ -1,0 +1,12 @@
+{
+  "name": "Dots AI Platform",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:24",
+  "postCreateCommand": "npm install",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "typescript.tsdk": "node_modules/typescript/lib"
+      }
+    }
+  }
+}

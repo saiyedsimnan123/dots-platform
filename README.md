@@ -66,4 +66,5 @@ It is completely separated from:
 - **Current Phase**: **Phase 2 — Core Domain, State Machine & SQLite Persistence**
 - **Runtime Code Status**: Active implementation under Node.js 24 + TypeScript.
 - **Dependencies**: Native standard library (`node:sqlite`, `node:test`, `node:crypto`, `node:fs`).
+- **Cloud Readiness**: Configured for GitHub Codespaces (`.devcontainer` with Node.js 24 image).
 - **Next Planned Milestone**: **Phase 3 — Provider-Agnostic Model Gateway & Mock/Local Adapter**.
