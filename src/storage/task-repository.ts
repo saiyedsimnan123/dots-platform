@@ -526,6 +526,15 @@ export class TaskRepository {
   }
 
   /**
+   * Retrieves all approval requests for a task.
+   */
+  public getApprovalRequestsByTaskId(taskId: string): ApprovalRequest[] {
+    const stmt = this.db.prepare('SELECT * FROM approval_requests WHERE task_id = ? ORDER BY created_at ASC');
+    const rows = stmt.all(taskId) as unknown as ApprovalDbRow[];
+    return rows.map((r) => this.mapApprovalRow(r));
+  }
+
+  /**
    * Updates an approval request decision.
    */
   public updateApprovalDecision(

@@ -101,3 +101,29 @@ export class DatabaseError extends DomainError {
     super(message, 'DATABASE_ERROR', details);
   }
 }
+
+/**
+ * Thrown when a security perimeter violation is detected (e.g. path traversal, unauthorized tool).
+ */
+export class SecurityViolationError extends DomainError {
+  public readonly violationType: string;
+
+  constructor(message: string, violationType: string, details: Record<string, unknown> = {}) {
+    super(message, 'SECURITY_VIOLATION', { ...details, violationType });
+    this.violationType = violationType;
+  }
+}
+
+/**
+ * Thrown when a tool execution fails.
+ */
+export class ToolExecutionError extends DomainError {
+  public readonly toolName: string;
+  public readonly exitCode: number;
+
+  constructor(toolName: string, message: string, exitCode: number = 1, details: Record<string, unknown> = {}) {
+    super(message, 'TOOL_EXECUTION_ERROR', { ...details, toolName, exitCode });
+    this.toolName = toolName;
+    this.exitCode = exitCode;
+  }
+}
