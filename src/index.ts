@@ -13,6 +13,7 @@ export * from './storage/db.ts';
 export * from './storage/task-repository.ts';
 export * from './storage/audit-repository.ts';
 export * from './storage/recovery.ts';
+export * from './storage/memory-repository.ts';
 
 // Model Gateway & Intelligence Layer
 export type * from './model/types.ts';

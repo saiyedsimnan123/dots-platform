@@ -16,6 +16,10 @@ test('DatabaseManager - initializes schema migrations in memory', () => {
   assert.ok(migrationRow);
   assert.equal(migrationRow.version, '001_initial_schema');
 
+  const migrationRow2 = db.prepare('SELECT version FROM schema_migrations WHERE version = ?').get('002_memory_subsystem') as { version: string };
+  assert.ok(migrationRow2);
+  assert.equal(migrationRow2.version, '002_memory_subsystem');
+
   // Verify all core tables exist
   const tables = db.prepare(`
     SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
@@ -29,6 +33,8 @@ test('DatabaseManager - initializes schema migrations in memory', () => {
   assert.ok(tableNames.includes('approval_requests'));
   assert.ok(tableNames.includes('audit_events'));
   assert.ok(tableNames.includes('token_usages'));
+  assert.ok(tableNames.includes('memories'));
+  assert.ok(tableNames.includes('memory_task_injections'));
   assert.ok(tableNames.includes('schema_migrations'));
 
   db.close();

@@ -72,7 +72,15 @@ export type AuditEventType =
   | 'TASK_COMPLETED'
   | 'TASK_FAILED'
   | 'TASK_CANCELLED'
-  | 'CRASH_INTERRUPTION_DETECTED';
+  | 'CRASH_INTERRUPTION_DETECTED'
+  | 'MEMORY_CREATED'
+  | 'MEMORY_UPDATED'
+  | 'MEMORY_ARCHIVED'
+  | 'MEMORY_DELETED'
+  | 'MEMORY_RETRIEVED'
+  | 'MEMORY_ACCESS_DENIED'
+  | 'MEMORY_PROPOSAL_SUBMITTED'
+  | 'MEMORY_PROPOSAL_DECIDED';
 
 /**
  * Primary Task Entity.
@@ -238,3 +246,77 @@ export interface AppendAuditEventInput {
   readonly actor: 'USER' | 'AGENT' | 'POLICY_ENGINE' | 'SYSTEM';
   readonly details: Record<string, unknown>;
 }
+
+/**
+ * Phase 7 - Long-Term Memory Domain Entities and DTOs
+ */
+
+export type MemoryCategory = 'USER_PREFERENCE' | 'PROJECT_FACT' | 'LEARNED_PROCEDURE';
+export type MemoryScopeType = 'GLOBAL' | 'WORKSPACE';
+export type MemoryStatus = 'ACTIVE' | 'PENDING_APPROVAL' | 'ARCHIVED';
+
+export interface Memory {
+  readonly id: string;
+  readonly category: MemoryCategory;
+  readonly scopeType: MemoryScopeType;
+  readonly scopeId: string;
+  readonly key: string;
+  readonly content: string;
+  readonly status: MemoryStatus;
+  readonly priority: number;
+  readonly tagsJson: string;
+  readonly metadataJson: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly lastAccessedAt: string | null;
+  readonly accessCount: number;
+}
+
+export interface MemoryTaskInjection {
+  readonly id: string;
+  readonly taskId: string;
+  readonly memoryId: string | null;
+  readonly charCount: number;
+  readonly estimatedTokens: number;
+  readonly injectedAt: string;
+}
+
+export interface CreateMemoryInput {
+  readonly id?: string;
+  readonly category: MemoryCategory;
+  readonly scopeType: MemoryScopeType;
+  readonly scopeId: string;
+  readonly key: string;
+  readonly content: string;
+  readonly status?: MemoryStatus;
+  readonly priority?: number;
+  readonly tags?: readonly string[];
+  readonly metadata?: Record<string, unknown>;
+}
+
+export interface UpdateMemoryInput {
+  readonly content?: string;
+  readonly category?: MemoryCategory;
+  readonly priority?: number;
+  readonly tags?: readonly string[];
+  readonly metadata?: Record<string, unknown>;
+  readonly status?: MemoryStatus;
+}
+
+export interface ListMemoriesFilter {
+  readonly scopeType: MemoryScopeType;
+  readonly scopeId: string;
+  readonly status?: MemoryStatus;
+  readonly category?: MemoryCategory;
+  readonly limit?: number;
+  readonly offset?: number;
+}
+
+export interface RecordMemoryInjectionInput {
+  readonly id?: string;
+  readonly taskId: string;
+  readonly memoryId?: string | null;
+  readonly charCount: number;
+  readonly estimatedTokens: number;
+}
+

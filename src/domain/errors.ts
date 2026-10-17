@@ -156,3 +156,56 @@ export class CircuitBreakerError extends DomainError {
   }
 }
 
+/**
+ * Thrown when a requested memory entity cannot be found.
+ */
+export class MemoryNotFoundError extends DomainError {
+  public readonly memoryId: string;
+
+  constructor(memoryId: string, details: Record<string, unknown> = {}) {
+    super(`Memory with ID '${memoryId}' was not found.`, 'MEMORY_NOT_FOUND', { memoryId, ...details });
+    this.memoryId = memoryId;
+  }
+}
+
+/**
+ * Thrown when an active memory key conflict occurs within the same scope.
+ */
+export class MemoryConflictError extends DomainError {
+  public readonly key: string;
+  public readonly scopeType: string;
+  public readonly scopeId: string;
+
+  constructor(key: string, scopeType: string, scopeId: string, details: Record<string, unknown> = {}) {
+    super(
+      `Active memory with key '${key}' already exists in scope '${scopeType}:${scopeId}'.`,
+      'MEMORY_CONFLICT',
+      { key, scopeType, scopeId, ...details }
+    );
+    this.key = key;
+    this.scopeType = scopeType;
+    this.scopeId = scopeId;
+  }
+}
+
+/**
+ * Thrown when cross-scope access is attempted on a memory record.
+ */
+export class MemoryScopeViolationError extends DomainError {
+  public readonly expectedScope: string;
+  public readonly actualScope: string;
+  public readonly memoryId?: string;
+
+  constructor(expectedScope: string, actualScope: string, memoryId?: string, details: Record<string, unknown> = {}) {
+    super(
+      `Memory scope violation: expected scope '${expectedScope}', but attempted operation in '${actualScope}'.`,
+      'MEMORY_SCOPE_VIOLATION',
+      { expectedScope, actualScope, memoryId, ...details }
+    );
+    this.expectedScope = expectedScope;
+    this.actualScope = actualScope;
+    this.memoryId = memoryId;
+  }
+}
+
+

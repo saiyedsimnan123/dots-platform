@@ -193,6 +193,55 @@ export class DatabaseManager {
             CREATE INDEX IF NOT EXISTS idx_token_usages_task_id ON token_usages(task_id);
           `);
         }
+      },
+      {
+        version: '002_memory_subsystem',
+        up: (db) => {
+          db.exec(`
+            -- Memories table: user-controlled long-term memory records
+            CREATE TABLE IF NOT EXISTS memories (
+              id TEXT PRIMARY KEY,
+              category TEXT NOT NULL CHECK (
+                category IN ('USER_PREFERENCE', 'PROJECT_FACT', 'LEARNED_PROCEDURE')
+              ),
+              scope_type TEXT NOT NULL CHECK (
+                scope_type IN ('GLOBAL', 'WORKSPACE')
+              ),
+              scope_id TEXT NOT NULL,
+              key TEXT NOT NULL,
+              content TEXT NOT NULL,
+              status TEXT NOT NULL CHECK (
+                status IN ('ACTIVE', 'PENDING_APPROVAL', 'ARCHIVED')
+              ),
+              priority INTEGER NOT NULL DEFAULT 50 CHECK (priority >= 0 AND priority <= 100),
+              tags_json TEXT NOT NULL DEFAULT '[]',
+              metadata_json TEXT NOT NULL DEFAULT '{}',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              last_accessed_at TEXT,
+              access_count INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope_type, scope_id, status);
+            CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category, status);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_unique_active_key 
+              ON memories(scope_type, scope_id, key) 
+              WHERE status = 'ACTIVE';
+
+            -- Memory task injections table: provenance tracking
+            CREATE TABLE IF NOT EXISTS memory_task_injections (
+              id TEXT PRIMARY KEY,
+              task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+              memory_id TEXT REFERENCES memories(id) ON DELETE SET NULL,
+              char_count INTEGER NOT NULL,
+              estimated_tokens INTEGER NOT NULL,
+              injected_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_injections_task_id ON memory_task_injections(task_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_injections_memory_id ON memory_task_injections(memory_id);
+          `);
+        }
       }
     ];
 
