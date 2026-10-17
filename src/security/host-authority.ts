@@ -43,36 +43,9 @@ import {
   type CreateTaskWithScopeInput,
   type TaskScopeAttestation
 } from './memory-authorizer.ts';
+import { HOST_INIT_CAPABILITY, type HostInitHandle } from './host-bridge.ts';
 
 const SYSTEM_PERMISSIONS: ReadonlySet<MemoryPermission> = new Set(['READ', 'WRITE', 'DELETE']);
-
-/**
- * Internal host-bound authorizer subclass.
- * Only constructible within host-authority.ts; never exported.
- * Restricts context registration and secret access to callers holding the private #capabilityKey.
- */
-class HostBoundAuthorizer extends MemoryAuthorizer {
-  readonly #capabilityKey: symbol;
-
-  constructor(options: MemoryAuthorizerOptions, capabilityKey: symbol) {
-    super(options);
-    this.#capabilityKey = capabilityKey;
-  }
-
-  public registerSystemContext(key: symbol, context: CallerContext): void {
-    if (key !== this.#capabilityKey) {
-      throw new SecurityViolationError('Unauthorized context registration.', 'HOST_TOKEN_REQUIRED');
-    }
-    this.issuedContexts.add(context);
-  }
-
-  public getHostSecret(key: symbol): Buffer {
-    if (key !== this.#capabilityKey) {
-      throw new SecurityViolationError('Unauthorized secret access.', 'HOST_TOKEN_REQUIRED');
-    }
-    return this.hostSecret;
-  }
-}
 
 export interface HostMemoryAuthorityOptions extends MemoryAuthorizerOptions {}
 
@@ -80,27 +53,45 @@ export interface HostMemoryAuthorityOptions extends MemoryAuthorizerOptions {}
  * Privileged Host Authorization Control Plane.
  * 
  * Held strictly by trusted host initialization and orchestration bootstrap code.
- * Encapsulates the host capability key and exposes privileged operations:
+ * Encapsulates the host capability and exposes privileged operations:
  * - createTask: creates tasks with verified cryptographic host scope attestations
  * - authorizeSystem: issues system-level CallerContext
  * - attestTaskScope: generates cryptographic scope attestations
  * 
  * The unprivileged authorizer getter provides the unprivileged MemoryAuthorizer instance
  * suitable for distribution to services, callers, and context verifiers.
+ * Host secrets and context registries are runtime-protected in ECMAScript #private fields.
  */
 export class HostMemoryAuthority {
-  readonly #authorizer: HostBoundAuthorizer;
-  readonly #capabilityKey: symbol;
+  readonly #hostSecret: Buffer;
+  readonly #authorizer: MemoryAuthorizer;
+  readonly #registerContext: (context: CallerContext) => void;
 
   constructor(options: HostMemoryAuthorityOptions = {}) {
-    const capabilityKey = Symbol('host.capability');
-    this.#capabilityKey = capabilityKey;
-    this.#authorizer = new HostBoundAuthorizer(options, capabilityKey);
+    const hostSecret = options.hostSecret
+      ? (typeof options.hostSecret === 'string' ? Buffer.from(options.hostSecret, 'hex') : options.hostSecret)
+      : randomBytes(32);
+    this.#hostSecret = hostSecret;
+
+    let registrar: ((context: CallerContext) => void) | undefined;
+    const handle: HostInitHandle = {
+      capability: HOST_INIT_CAPABILITY,
+      setRegistrar(r) {
+        registrar = r;
+      }
+    };
+
+    this.#authorizer = new MemoryAuthorizer({ ...options, hostSecret }, handle);
+    if (!registrar) {
+      throw new SecurityViolationError('Host authorization bootstrap failed.', 'HOST_BOOTSTRAP_FAILED');
+    }
+    this.#registerContext = registrar;
   }
 
   /**
    * Returns the unprivileged MemoryAuthorizer instance for caller/agent context verification.
    * This instance cannot mint system authority or create tasks.
+   * Host secrets and context registries are protected in ECMAScript #private fields.
    */
   public get authorizer(): MemoryAuthorizer {
     return this.#authorizer;
@@ -139,11 +130,10 @@ export class HostMemoryAuthority {
     }
     validateScope(input.scope.scopeType, input.scope.scopeId);
 
-    const secret = this.#authorizer.getHostSecret(this.#capabilityKey);
     const nonce = randomBytes(16).toString('hex');
     const sortedPerms = Array.from(SYSTEM_PERMISSIONS).sort().join(',');
     const payload = `SYSTEM|${input.scope.scopeType}|${input.scope.scopeId}|${sortedPerms}|${input.taskId ?? ''}|${nonce}`;
-    const signature = createHmac('sha256', secret).update(payload, 'utf8').digest('hex');
+    const signature = createHmac('sha256', this.#hostSecret).update(payload, 'utf8').digest('hex');
 
     const context: CallerContext = Object.freeze({
       actor: 'SYSTEM',
@@ -159,7 +149,7 @@ export class HostMemoryAuthority {
       })
     });
 
-    this.#authorizer.registerSystemContext(this.#capabilityKey, context);
+    this.#registerContext(context);
     return context;
   }
 
@@ -168,10 +158,9 @@ export class HostMemoryAuthority {
    */
   public attestTaskScope(taskId: string, scope: ScopeIdentifier): TaskScopeAttestation {
     validateScope(scope.scopeType, scope.scopeId);
-    const secret = this.#authorizer.getHostSecret(this.#capabilityKey);
     const timestamp = new Date().toISOString();
     const payload = `TASK_SCOPE|${taskId}|${scope.scopeType}|${scope.scopeId}|${timestamp}`;
-    const signature = createHmac('sha256', secret).update(payload, 'utf8').digest('hex');
+    const signature = createHmac('sha256', this.#hostSecret).update(payload, 'utf8').digest('hex');
 
     return {
       scopeType: scope.scopeType,

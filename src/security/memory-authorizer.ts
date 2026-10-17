@@ -1,6 +1,6 @@
 /**
  * Next-Generation Dots AI Platform - Memory Authorization Boundary
- * Phase 7.3: Security Hardening & Trusted Identity Boundary
+ * Phase 7.3: Security Hardening & Runtime Secret Protection
  * 
  * Architectural Mandate:
  * Implements a host-controlled authorization boundary for memory operations.
@@ -22,9 +22,10 @@
  * 3. Privileged host authority construction (HostMemoryAuthority) is encapsulated entirely
  *    within the internal host bootstrap module (src/security/host-authority.ts) and is NOT exported
  *    from the public package entry point (src/index.ts).
- * 4. This module (src/security/memory-authorizer.ts) contains NO privileged host factories, NO capability
- *    injection parameters, and NO privileged operations. Ordinary callers and callers importing this
- *    module acquire only the unprivileged MemoryAuthorizer.
+ * 4. All sensitive host secrets (#hostSecret) and context-registration registries (#issuedContexts)
+ *    are held strictly in ECMAScript #private fields. They cannot be read, mutated, or discovered
+ *    through runtime property access (e.g., Object.getOwnPropertyNames, Reflect.ownKeys, or indexed property lookup)
+ *    on authorizer instances.
  * 
  * Core Security Guarantees:
  * 1. Trusted Identity Provider Resolution:
@@ -59,6 +60,7 @@ import type {
 } from '../domain/types.ts';
 import { SecurityViolationError, ValidationError, TaskNotFoundError } from '../domain/errors.ts';
 import type { TaskRepository } from '../storage/task-repository.ts';
+import { HOST_INIT_CAPABILITY, type HostInitHandle } from './host-bridge.ts';
 
 export type UserRole = 'ADMIN' | 'MEMBER' | 'VIEWER';
 
@@ -159,25 +161,37 @@ export function validateScope(scopeType: MemoryScopeType, scopeId: string): void
  * Contains only unprivileged methods for user authorization, agent authorization,
  * context verification, and task scope verification.
  * 
- * Privileged operations (authorizeSystem, createTask, attestTaskScope) DO NOT EXIST
- * on this class and cannot be acquired or injected by ordinary callers.
+ * Encapsulation Guarantees:
+ * - #hostSecret: Stored in an ECMAScript #private field; never accessible via runtime property lookup.
+ * - #issuedContexts: Stored in an ECMAScript #private field; cannot be inspected or tampered with.
+ * - Privileged operations (authorizeSystem, createTask, attestTaskScope) DO NOT EXIST on this class.
  */
 export class MemoryAuthorizer {
-  protected readonly hostSecret: Buffer;
-  protected readonly taskRepo?: TaskRepository;
-  protected readonly identityProvider?: TrustedIdentityProvider;
-  protected readonly issuedContexts: WeakSet<object> = new WeakSet();
+  readonly #hostSecret: Buffer;
+  readonly #taskRepo?: TaskRepository;
+  readonly #identityProvider?: TrustedIdentityProvider;
+  readonly #issuedContexts: WeakSet<object> = new WeakSet();
 
-  constructor(options: MemoryAuthorizerOptions = {}) {
+  constructor(
+    options: MemoryAuthorizerOptions = {},
+    hostHandle?: HostInitHandle
+  ) {
     if (options.hostSecret) {
-      this.hostSecret = typeof options.hostSecret === 'string'
+      this.#hostSecret = typeof options.hostSecret === 'string'
         ? Buffer.from(options.hostSecret, 'hex')
         : options.hostSecret;
     } else {
-      this.hostSecret = randomBytes(32);
+      this.#hostSecret = randomBytes(32);
     }
-    this.taskRepo = options.taskRepo;
-    this.identityProvider = options.identityProvider;
+    this.#taskRepo = options.taskRepo;
+    this.#identityProvider = options.identityProvider;
+
+    // Connect context registrar exclusively when created with a valid host bootstrap handle
+    if (hostHandle && hostHandle.capability === HOST_INIT_CAPABILITY) {
+      hostHandle.setRegistrar((context: CallerContext) => {
+        this.#issuedContexts.add(context);
+      });
+    }
   }
 
   // --- Trusted Identity & Policy Resolution ---
@@ -193,7 +207,7 @@ export class MemoryAuthorizer {
       throw new ValidationError('AuthorizeUserInput must be an object.');
     }
 
-    if (!this.identityProvider) {
+    if (!this.#identityProvider) {
       throw new SecurityViolationError(
         'Authentication integration is not implemented or not configured on host authorizer. Trusted identity cannot be verified.',
         'MISSING_IDENTITY_INTEGRATION'
@@ -207,7 +221,7 @@ export class MemoryAuthorizer {
       );
     }
 
-    const principal = this.identityProvider.authenticate(input.credentials);
+    const principal = this.#identityProvider.authenticate(input.credentials);
     if (!principal) {
       throw new SecurityViolationError(
         'Invalid or unverified authentication credentials.',
@@ -259,8 +273,8 @@ export class MemoryAuthorizer {
     }
 
     // If a taskId is associated, verify the task exists and scope matches
-    if (input.taskId && this.taskRepo) {
-      const task = this.taskRepo.getTaskById(input.taskId);
+    if (input.taskId && this.#taskRepo) {
+      const task = this.#taskRepo.getTaskById(input.taskId);
       if (!task) {
         throw new TaskNotFoundError(input.taskId);
       }
@@ -278,7 +292,7 @@ export class MemoryAuthorizer {
 
     const permissions = ROLE_PERMISSIONS_USER[principal.role];
 
-    return this.sealContext({
+    return this.#sealContext({
       actor: 'USER',
       scope,
       permissions,
@@ -301,11 +315,11 @@ export class MemoryAuthorizer {
     if (!input.taskId || typeof input.taskId !== 'string' || input.taskId.trim() === '') {
       throw new ValidationError('Task ID must be provided to authorize an agent.');
     }
-    if (!this.taskRepo) {
+    if (!this.#taskRepo) {
       throw new ValidationError('TaskRepository is required to authorize an agent.');
     }
 
-    const task = this.taskRepo.getTaskById(input.taskId);
+    const task = this.#taskRepo.getTaskById(input.taskId);
     if (!task) {
       throw new TaskNotFoundError(input.taskId);
     }
@@ -313,7 +327,7 @@ export class MemoryAuthorizer {
     // Authoritative scope derived strictly from verified host attestation
     const scope = this.verifyTaskScope(task);
 
-    return this.sealContext({
+    return this.#sealContext({
       actor: 'AGENT',
       scope,
       permissions: AGENT_PERMISSIONS,
@@ -353,7 +367,7 @@ export class MemoryAuthorizer {
     validateScope(attestation.scopeType, attestation.scopeId);
 
     const payload = `TASK_SCOPE|${task.id}|${attestation.scopeType}|${attestation.scopeId}|${attestation.timestamp}`;
-    const expectedSig = createHmac('sha256', this.hostSecret).update(payload, 'utf8').digest('hex');
+    const expectedSig = createHmac('sha256', this.#hostSecret).update(payload, 'utf8').digest('hex');
     const expectedBuf = Buffer.from(expectedSig, 'hex');
 
     let actualBuf: Buffer;
@@ -389,8 +403,8 @@ export class MemoryAuthorizer {
       throw new ValidationError('CallerContext must be provided.');
     }
 
-    // 1. WeakSet reference identity check
-    if (!this.issuedContexts.has(caller as object)) {
+    // 1. WeakSet reference identity check (stored in ECMAScript #private field)
+    if (!this.#issuedContexts.has(caller as object)) {
       throw new SecurityViolationError(
         'Untrusted caller context: context was not issued by trusted host authorization boundary.',
         'FORGED_CALLER_CONTEXT'
@@ -406,8 +420,8 @@ export class MemoryAuthorizer {
       );
     }
 
-    // 2. Cryptographic HMAC verification
-    const expectedSig = this.computeHmac(
+    // 2. Cryptographic HMAC verification using ECMAScript #private hostSecret
+    const expectedSig = this.#computeHmac(
       c.actor,
       c.scope,
       c.permissions,
@@ -436,16 +450,16 @@ export class MemoryAuthorizer {
     return c;
   }
 
-  // --- Protected Helpers ---
+  // --- Private Helpers ---
 
-  protected sealContext(params: {
+  #sealContext(params: {
     readonly actor: MemoryActor;
     readonly scope: ScopeIdentifier;
     readonly permissions: ReadonlySet<MemoryPermission>;
     readonly taskId?: string;
   }): CallerContext {
     const nonce = randomBytes(16).toString('hex');
-    const signature = this.computeHmac(
+    const signature = this.#computeHmac(
       params.actor,
       params.scope,
       params.permissions,
@@ -467,11 +481,11 @@ export class MemoryAuthorizer {
       })
     });
 
-    this.issuedContexts.add(context);
+    this.#issuedContexts.add(context);
     return context;
   }
 
-  protected computeHmac(
+  #computeHmac(
     actor: MemoryActor,
     scope: ScopeIdentifier,
     permissions: ReadonlySet<MemoryPermission> | readonly MemoryPermission[],
@@ -480,6 +494,6 @@ export class MemoryAuthorizer {
   ): string {
     const sortedPerms = Array.from(permissions).sort().join(',');
     const payload = `${actor}|${scope.scopeType}|${scope.scopeId}|${sortedPerms}|${taskId ?? ''}|${nonce}`;
-    return createHmac('sha256', this.hostSecret).update(payload, 'utf8').digest('hex');
+    return createHmac('sha256', this.#hostSecret).update(payload, 'utf8').digest('hex');
   }
 }

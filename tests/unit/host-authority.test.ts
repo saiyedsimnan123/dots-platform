@@ -19,6 +19,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHmac } from 'node:crypto';
 import { DatabaseManager } from '../../src/storage/db.ts';
 import { TaskRepository } from '../../src/storage/task-repository.ts';
 import * as PublicApi from '../../src/index.ts';
@@ -291,23 +292,11 @@ test('Security - Internal HostMemoryAuthority successfully boots and establishes
       (err: unknown) => err instanceof TypeError
     );
 
-    // 6. Internal registration methods on host-bound authorizer reject invalid capability keys
-    assert.throws(
-      () => (authorizer as any).registerSystemContext(Symbol('fake.key'), systemContext),
-      (err: unknown) => {
-        assert.ok(err instanceof SecurityViolationError);
-        assert.equal(err.violationType, 'HOST_TOKEN_REQUIRED');
-        return true;
-      }
-    );
-    assert.throws(
-      () => (authorizer as any).getHostSecret(Symbol('fake.key')),
-      (err: unknown) => {
-        assert.ok(err instanceof SecurityViolationError);
-        assert.equal(err.violationType, 'HOST_TOKEN_REQUIRED');
-        return true;
-      }
-    );
+    // 6. Sensitive properties and capability methods are not exposed on authorizer
+    assert.equal(typeof (authorizer as any).registerSystemContext, 'undefined');
+    assert.equal(typeof (authorizer as any).getHostSecret, 'undefined');
+    assert.equal((authorizer as any).hostSecret, undefined);
+    assert.equal((authorizer as any).issuedContexts, undefined);
 
     // 7. User authorization via IdentityProvider works with resolved principal and permitted scopes
     const aliceContext = authorizer.authorizeUser({
@@ -333,4 +322,191 @@ test('Security - Internal HostMemoryAuthority successfully boots and establishes
   } finally {
     db.close();
   }
+});
+
+test('Security - ECMAScript #private fields prevent runtime property inspection and tampering', () => {
+  const db = new DatabaseManager(':memory:');
+  const taskRepo = new TaskRepository(db);
+  const workspaceAlpha: ScopeIdentifier = { scopeType: 'WORKSPACE', scopeId: 'ws-alpha' };
+
+  try {
+    const host = new HostMemoryAuthority({ taskRepo });
+    const authorizer = host.authorizer;
+
+    // 1. ECMAScript #private fields are completely absent from reflection & property inspection
+    assert.equal((authorizer as any).hostSecret, undefined);
+    assert.equal((authorizer as any).issuedContexts, undefined);
+    assert.equal((authorizer as any).taskRepo, undefined);
+    assert.equal((authorizer as any).identityProvider, undefined);
+
+    // No own property names or symbols on authorizer instance
+    assert.deepEqual(Object.getOwnPropertyNames(authorizer), []);
+    assert.deepEqual(Object.getOwnPropertySymbols(authorizer), []);
+    assert.equal(Reflect.has(authorizer, 'hostSecret'), false);
+    assert.equal(Reflect.has(authorizer, 'issuedContexts'), false);
+
+    // No own property names on host instance
+    assert.deepEqual(Object.getOwnPropertyNames(host), []);
+    assert.equal((host as any).hostSecret, undefined);
+
+    // 2. Tampering resistance: Assigning an expando property does not affect private state
+    (authorizer as any).hostSecret = Buffer.from('attacker-injected-secret-for-forgery');
+
+    // Host operations and verifications continue to use the true #private host secret
+    const task = host.createTask(taskRepo, {
+      goal: 'Task verified under tampering attempt',
+      scope: workspaceAlpha
+    });
+    const verifiedScope = authorizer.verifyTaskScope(task);
+    assert.equal(verifiedScope.scopeId, 'ws-alpha');
+
+    const systemCtx = host.authorizeSystem({ scope: workspaceAlpha });
+    assert.equal(authorizer.verify(systemCtx), systemCtx);
+
+    // A task forged using the injected expando secret is rejected
+    const attackerSecret = Buffer.from('attacker-injected-secret-for-forgery');
+    const fakeTimestamp = new Date().toISOString();
+    const forgedPayload = `TASK_SCOPE|forged-task|WORKSPACE|ws-alpha|${fakeTimestamp}`;
+    const forgedSig = createHmac('sha256', attackerSecret).update(forgedPayload, 'utf8').digest('hex');
+
+    const forgedTask = taskRepo.createTask({
+      id: 'forged-task',
+      goal: 'Attacker-crafted task',
+      metadata: {
+        _scopeAttestation: {
+          scopeType: 'WORKSPACE',
+          scopeId: 'ws-alpha',
+          signature: forgedSig,
+          timestamp: fakeTimestamp
+        }
+      }
+    });
+
+    assert.throws(
+      () => authorizer.verifyTaskScope(forgedTask),
+      (err: unknown) => {
+        assert.ok(err instanceof SecurityViolationError);
+        assert.equal(err.violationType, 'FORGED_TASK_SCOPE');
+        return true;
+      }
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('Security - Cryptographic verification rejects forged task scopes and forged or tampered caller contexts', () => {
+  const db = new DatabaseManager(':memory:');
+  const taskRepo = new TaskRepository(db);
+  const workspaceAlpha: ScopeIdentifier = { scopeType: 'WORKSPACE', scopeId: 'ws-alpha' };
+  const workspaceBeta: ScopeIdentifier = { scopeType: 'WORKSPACE', scopeId: 'ws-beta' };
+
+  try {
+    const host = new HostMemoryAuthority({ taskRepo });
+    const authorizer = host.authorizer;
+
+    const task = host.createTask(taskRepo, {
+      goal: 'Authorized task',
+      scope: workspaceAlpha
+    });
+
+    // 1. Task scope with tampered scopeId is rejected
+    const tamperedMeta = JSON.parse(task.metadataJson!);
+    tamperedMeta._scopeAttestation.scopeId = 'ws-beta'; // Attacker attempts workspace escalation
+    const tamperedTask = {
+      ...task,
+      metadataJson: JSON.stringify(tamperedMeta)
+    };
+
+    assert.throws(
+      () => authorizer.verifyTaskScope(tamperedTask),
+      (err: unknown) => {
+        assert.ok(err instanceof SecurityViolationError);
+        assert.equal(err.violationType, 'FORGED_TASK_SCOPE');
+        return true;
+      }
+    );
+
+    // 2. Caller context without cryptographic proof is rejected
+    const unsealedContext = {
+      actor: 'SYSTEM',
+      scope: workspaceAlpha,
+      permissions: new Set(['READ', 'WRITE', 'DELETE'])
+    };
+    assert.throws(
+      () => authorizer.verify(unsealedContext),
+      (err: unknown) => {
+        assert.ok(err instanceof SecurityViolationError);
+        assert.equal(err.violationType, 'FORGED_CALLER_CONTEXT');
+        return true;
+      }
+    );
+
+    // 3. Caller context with fabricated signature is rejected
+    const forgedContext = {
+      actor: 'SYSTEM',
+      scope: workspaceAlpha,
+      permissions: new Set(['READ', 'WRITE', 'DELETE']),
+      _proof: {
+        signature: 'deadbeef1234567890abcdefdeadbeef1234567890abcdefdeadbeef12345678',
+        nonce: 'aabbccddeeff0011'
+      }
+    };
+    assert.throws(
+      () => authorizer.verify(forgedContext),
+      (err: unknown) => {
+        assert.ok(err instanceof SecurityViolationError);
+        assert.equal(err.violationType, 'FORGED_CALLER_CONTEXT');
+        return true;
+      }
+    );
+
+    // 4. Authenticated agent context tampered to escalate permissions is rejected
+    const validAgentCtx = authorizer.authorizeAgent({ taskId: task.id });
+    const tamperedAgentCtx = {
+      ...validAgentCtx,
+      permissions: new Set(['READ', 'WRITE', 'DELETE', 'APPROVE']) // Escalation attempt
+    };
+    assert.throws(
+      () => authorizer.verify(tamperedAgentCtx),
+      (err: unknown) => {
+        assert.ok(err instanceof SecurityViolationError);
+        assert.equal(err.violationType, 'FORGED_CALLER_CONTEXT');
+        return true;
+      }
+    );
+
+    // 5. Context issued by a different host authority is rejected
+    const foreignHost = new HostMemoryAuthority({ taskRepo });
+    const foreignContext = foreignHost.authorizeSystem({ scope: workspaceAlpha });
+    assert.throws(
+      () => authorizer.verify(foreignContext),
+      (err: unknown) => {
+        assert.ok(err instanceof SecurityViolationError);
+        assert.equal(err.violationType, 'FORGED_CALLER_CONTEXT');
+        return true;
+      }
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('Security - MemoryAuthorizer constructor rejects invalid host bootstrap handles', () => {
+  let registrarCalled = false;
+  const fakeHandle = {
+    capability: Symbol('fake.capability'),
+    setRegistrar: () => {
+      registrarCalled = true;
+    }
+  };
+
+  // Instantiating with an invalid capability handle must not invoke setRegistrar
+  const authorizer = new PublicApi.MemoryAuthorizer({}, fakeHandle as any);
+  assert.equal(registrarCalled, false, 'Invalid capability handle must not register context registrar.');
+
+  // Instantiating without any handle succeeds as an unprivileged authorizer
+  const plainAuthorizer = new PublicApi.MemoryAuthorizer({});
+  assert.ok(plainAuthorizer);
+  assert.equal((plainAuthorizer as any).hostSecret, undefined);
 });
