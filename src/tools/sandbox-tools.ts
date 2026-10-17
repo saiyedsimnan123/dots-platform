@@ -244,12 +244,93 @@ export const hashFileTool: RegisteredTool = {
 };
 
 /**
+ * Tier 0: Pure in-memory text transformation tool
+ */
+export const textTransformTool: RegisteredTool = {
+  definition: {
+    name: 'text_transform',
+    description: 'Performs safe text transformations (uppercase, lowercase, trim, replace, json_parse, json_stringify).',
+    parameters: {
+      operation: {
+        type: 'string',
+        description: 'Operation to perform',
+        enum: ['uppercase', 'lowercase', 'trim', 'replace', 'json_parse', 'json_stringify']
+      },
+      text: {
+        type: 'string',
+        description: 'Input text to transform'
+      },
+      pattern: {
+        type: 'string',
+        description: 'Search string or regex pattern (for replace operation)'
+      },
+      replacement: {
+        type: 'string',
+        description: 'Replacement string (for replace operation)'
+      }
+    },
+    required: ['operation', 'text']
+  },
+  riskTier: 'TIER_0',
+  handler: async (args) => {
+    const start = Date.now();
+    const op = String(args.operation || '').toLowerCase();
+    const text = String(args.text ?? '');
+
+    try {
+      let result: unknown;
+      switch (op) {
+        case 'uppercase':
+          result = text.toUpperCase();
+          break;
+        case 'lowercase':
+          result = text.toLowerCase();
+          break;
+        case 'trim':
+          result = text.trim();
+          break;
+        case 'replace': {
+          const pattern = String(args.pattern ?? '');
+          const replacement = String(args.replacement ?? '');
+          result = text.replaceAll(pattern, replacement);
+          break;
+        }
+        case 'json_parse':
+          result = JSON.parse(text);
+          break;
+        case 'json_stringify':
+          result = JSON.stringify(JSON.parse(text), null, 2);
+          break;
+        default:
+          throw new ToolExecutionError(
+            'text_transform',
+            `Unsupported text_transform operation: '${op}'`
+          );
+      }
+
+      return {
+        output: { operation: op, result },
+        exitCode: 0,
+        durationMs: Date.now() - start
+      };
+    } catch (err) {
+      throw new ToolExecutionError(
+        'text_transform',
+        `Text transform error: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+};
+
+/**
  * Standard registry collection of built-in safe tools
  */
 export const standardTools: readonly RegisteredTool[] = [
   calculateTool,
+  textTransformTool,
   fileReadTool,
   fileListTool,
   fileWriteTool,
   hashFileTool
 ];
+

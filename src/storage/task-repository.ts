@@ -352,6 +352,24 @@ export class TaskRepository {
   }
 
   /**
+   * Updates the tool arguments for a step (e.g. after variable interpolation).
+   */
+  public updateStepArguments(stepId: string, toolArguments: Record<string, unknown>): TaskStep {
+    const argsJson = JSON.stringify(toolArguments);
+    const stmt = this.db.prepare('UPDATE task_steps SET tool_arguments_json = ? WHERE id = ?');
+    const result = stmt.run(argsJson, stepId);
+    if (result.changes === 0) {
+      throw new ValidationError(`Task step with ID '${stepId}' not found.`);
+    }
+    const updated = this.getStepById(stepId);
+    if (!updated) {
+      throw new ValidationError(`Task step with ID '${stepId}' not found.`);
+    }
+    return updated;
+  }
+
+
+  /**
    * Records a completed tool execution in the audit store.
    */
   public recordToolExecution(input: CreateToolExecutionInput): ToolExecution {

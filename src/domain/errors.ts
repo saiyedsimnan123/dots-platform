@@ -127,3 +127,32 @@ export class ToolExecutionError extends DomainError {
     this.exitCode = exitCode;
   }
 }
+
+/**
+ * Thrown when a multi-step workflow dependency resolution or execution fails.
+ */
+export class WorkflowExecutionError extends DomainError {
+  public readonly stepOrder?: number;
+
+  constructor(message: string, stepOrder?: number, details: Record<string, unknown> = {}) {
+    super(message, 'WORKFLOW_EXECUTION_ERROR', { ...details, stepOrder });
+    this.stepOrder = stepOrder;
+  }
+}
+
+/**
+ * Thrown when an automated safety circuit breaker is tripped (e.g. max retries, max steps, loop limit).
+ */
+export class CircuitBreakerError extends DomainError {
+  public readonly breakerType: string;
+  public readonly limit: number;
+  public readonly current: number;
+
+  constructor(message: string, breakerType: string, limit: number, current: number, details: Record<string, unknown> = {}) {
+    super(message, 'CIRCUIT_BREAKER_TRIPPED', { ...details, breakerType, limit, current });
+    this.breakerType = breakerType;
+    this.limit = limit;
+    this.current = current;
+  }
+}
+

@@ -63,17 +63,23 @@ It is completely separated from:
 
 ## 5. Current Project Status
 
-- **Current Phase**: **Phase 5 Completed — First Complete Vertical Slice & Security Core**
-- **Runtime Code Status**: Operational modular monolith under Node.js 24 + TypeScript (66 automated tests passing, 0 flakiness).
+- **Current Phase**: **Phase 6 Completed — Extended Tooling, Multi-Step Workflows & Bounded Recovery**
+- **Runtime Code Status**: Operational modular monolith under Node.js 24 + TypeScript (81 automated tests passing, 0 flakiness).
 - **Core Pillars Active**:
   - Provider-agnostic model gateway with Google Gemini and offline Mock provider.
   - Secret scrubber filter protecting against API key leakage.
   - Token and financial budget ceiling controller.
   - Policy engine enforcing 5-tier permissions and sandboxed path jailing.
-  - Standard sandboxed capabilities (`calculate`, `file_read`, `file_write`, `file_list`, `hash_file`).
+  - Standard sandboxed capabilities (`calculate`, `text_transform`, `file_read`, `file_write`, `file_list`, `hash_file`).
   - Human approval broker for consequential operations.
   - Closed-loop verification engine certifying tangible proof-of-work.
   - End-to-end task coordinator with cold-start crash resilience.
-- **Dependencies**: Native standard library (`node:sqlite`, `node:test`, `node:crypto`, `node:fs`, `fetch`).
+  - Multi-step DAG workflow execution with typed variable templating and output chaining (`VariableResolver`).
+  - Bounded recovery engine with exponential backoff and jitter.
+  - Dynamic replanning on exhausted step failures via fallback prompt synthesis.
+  - Hard loop-prevention circuit breakers (`maxPlanSteps`, `maxTotalRetries`, `maxReplans`).
+  - Automated workspace mutation compensation and rollback manager (`CompensationManager`).
+- **Dependencies**: Native standard library (`node:sqlite`, `node:test`, `node:crypto`, `node:fs`, `fetch`). Zero runtime production dependencies.
 - **Cloud Readiness**: Configured for GitHub Codespaces (`.devcontainer` with Node.js 24 image).
-- **Next Planned Milestone**: **Phase 6 — Extended Tooling, Multi-Step Workflows & Dynamic Replanning**.
+- **Next Planned Milestone**: **Phase 7 — User-Controlled Long-Term Memory & Context Management**.
+
