@@ -36,6 +36,10 @@ function cleanupTest() {
   if (existsSync(externalDir)) rmSync(externalDir, { recursive: true, force: true });
 }
 
+function sha256(text: string): string {
+  return createHash('sha256').update(text).digest('hex');
+}
+
 test('CompensationManager - safely deletes newly created files (existedBefore: false)', async () => {
   const { db, taskRepo, auditRepo, compensationManager } = setupTest();
 
@@ -57,7 +61,7 @@ test('CompensationManager - safely deletes newly created files (existedBefore: f
       stepId: step.id,
       toolName: 'file_write',
       input: { path: scratchPath, content: 'temporary' },
-      output: { path: scratchPath, bytesWritten: 9, existedBefore: false },
+      output: { path: scratchPath, bytesWritten: 9, writtenHash: sha256('temporary'), existedBefore: false },
       exitCode: 0,
       durationMs: 5
     });
@@ -81,39 +85,186 @@ test('CompensationManager - safely deletes newly created files (existedBefore: f
   }
 });
 
-test('CompensationManager - restores pre-existing files from verified backup and NEVER deletes them', async () => {
+test('CompensationManager - multiple writes to one pre-existing file restores original content in reverse order', async () => {
   const { db, taskRepo, compensationManager } = setupTest();
 
   try {
-    const filePath = resolve(testWorkspace, 'important_config.json');
-    const originalContent = '{"version": "1.0.0", "safe": true}';
-    const originalHash = createHash('sha256').update(originalContent).digest('hex');
+    const filePath = resolve(testWorkspace, 'chained_config.json');
+    const v0 = '{"version": "0.0.0"}';
+    const v1 = '{"version": "1.0.0"}';
+    const v2 = '{"version": "2.0.0"}';
 
-    // Create file before task
+    // File existed before workflow
+    writeFileSync(filePath, v0, 'utf8');
+
+    const task = taskRepo.createTask({ goal: 'Chained writes to pre-existing file' });
+
+    // Step 1: writes v1 over v0
+    const step1 = taskRepo.createStep({
+      taskId: task.id,
+      stepOrder: 1,
+      description: 'Write v1',
+      toolName: 'file_write',
+      toolArguments: { path: filePath, content: v1 }
+    });
+    taskRepo.recordToolExecution({
+      stepId: step1.id,
+      toolName: 'file_write',
+      input: { path: filePath, content: v1 },
+      output: {
+        path: filePath,
+        bytesWritten: v1.length,
+        writtenHash: sha256(v1),
+        existedBefore: true,
+        previousContent: v0,
+        previousHash: sha256(v0)
+      },
+      exitCode: 0,
+      durationMs: 5
+    });
+
+    // Step 2: writes v2 over v1
+    const step2 = taskRepo.createStep({
+      taskId: task.id,
+      stepOrder: 2,
+      description: 'Write v2',
+      toolName: 'file_write',
+      toolArguments: { path: filePath, content: v2 }
+    });
+    taskRepo.recordToolExecution({
+      stepId: step2.id,
+      toolName: 'file_write',
+      input: { path: filePath, content: v2 },
+      output: {
+        path: filePath,
+        bytesWritten: v2.length,
+        writtenHash: sha256(v2),
+        existedBefore: true,
+        previousContent: v1,
+        previousHash: sha256(v1)
+      },
+      exitCode: 0,
+      durationMs: 5
+    });
+
+    // Current state on disk is v2
+    writeFileSync(filePath, v2, 'utf8');
+
+    const result = await compensationManager.compensate(task.id);
+    assert.equal(result.totalReverted, 2);
+    assert.equal(result.totalFailed, 0);
+
+    // Final state on disk MUST be the original v0
+    assert.ok(existsSync(filePath));
+    const contentOnDisk = readFileSync(filePath, 'utf8');
+    assert.equal(contentOnDisk, v0);
+  } finally {
+    db.close();
+    cleanupTest();
+  }
+});
+
+test('CompensationManager - newly created file written multiple times is cleanly removed in reverse order', async () => {
+  const { db, taskRepo, compensationManager } = setupTest();
+
+  try {
+    const filePath = resolve(testWorkspace, 'multi_scratch.txt');
+    const d1 = 'first draft';
+    const d2 = 'final draft';
+
+    const task = taskRepo.createTask({ goal: 'Multiple writes to new file' });
+
+    // Step 1: creates file with d1
+    const step1 = taskRepo.createStep({
+      taskId: task.id,
+      stepOrder: 1,
+      description: 'Create file with d1',
+      toolName: 'file_write',
+      toolArguments: { path: filePath, content: d1 }
+    });
+    taskRepo.recordToolExecution({
+      stepId: step1.id,
+      toolName: 'file_write',
+      input: { path: filePath, content: d1 },
+      output: {
+        path: filePath,
+        bytesWritten: d1.length,
+        writtenHash: sha256(d1),
+        existedBefore: false
+      },
+      exitCode: 0,
+      durationMs: 5
+    });
+
+    // Step 2: updates file with d2
+    const step2 = taskRepo.createStep({
+      taskId: task.id,
+      stepOrder: 2,
+      description: 'Update file with d2',
+      toolName: 'file_write',
+      toolArguments: { path: filePath, content: d2 }
+    });
+    taskRepo.recordToolExecution({
+      stepId: step2.id,
+      toolName: 'file_write',
+      input: { path: filePath, content: d2 },
+      output: {
+        path: filePath,
+        bytesWritten: d2.length,
+        writtenHash: sha256(d2),
+        existedBefore: true,
+        previousContent: d1,
+        previousHash: sha256(d1)
+      },
+      exitCode: 0,
+      durationMs: 5
+    });
+
+    // Current state on disk is d2
+    writeFileSync(filePath, d2, 'utf8');
+
+    const result = await compensationManager.compensate(task.id);
+    assert.equal(result.totalReverted, 2);
+    assert.equal(result.totalFailed, 0);
+
+    // Final state on disk: file MUST NOT exist!
+    assert.equal(existsSync(filePath), false);
+  } finally {
+    db.close();
+    cleanupTest();
+  }
+});
+
+test('CompensationManager - safely restores an originally empty file ("")', async () => {
+  const { db, taskRepo, compensationManager } = setupTest();
+
+  try {
+    const filePath = resolve(testWorkspace, 'empty_sentinel.lock');
+    const originalContent = ''; // Empty string
     writeFileSync(filePath, originalContent, 'utf8');
 
-    const task = taskRepo.createTask({ goal: 'Task that mutated config' });
+    const task = taskRepo.createTask({ goal: 'Mutate empty file' });
     const step = taskRepo.createStep({
       taskId: task.id,
       stepOrder: 1,
-      description: 'Overwrite config',
+      description: 'Write over empty file',
       toolName: 'file_write',
-      toolArguments: { path: filePath, content: 'corrupted payload' }
+      toolArguments: { path: filePath, content: 'locked' }
     });
 
-    // Mutate file
-    writeFileSync(filePath, 'corrupted payload', 'utf8');
+    writeFileSync(filePath, 'locked', 'utf8');
 
     taskRepo.recordToolExecution({
       stepId: step.id,
       toolName: 'file_write',
-      input: { path: filePath, content: 'corrupted payload' },
+      input: { path: filePath, content: 'locked' },
       output: {
         path: filePath,
-        bytesWritten: 17,
+        bytesWritten: 6,
+        writtenHash: sha256('locked'),
         existedBefore: true,
         previousContent: originalContent,
-        previousHash: originalHash
+        previousHash: sha256(originalContent)
       },
       exitCode: 0,
       durationMs: 5
@@ -124,10 +275,110 @@ test('CompensationManager - restores pre-existing files from verified backup and
     assert.equal(result.actions[0]!.action, 'file_restore');
     assert.equal(result.actions[0]!.status, 'REVERTED');
 
-    // File MUST exist and MUST match original content
+    // File MUST exist and be empty
     assert.ok(existsSync(filePath));
-    const restoredContent = readFileSync(filePath, 'utf8');
-    assert.equal(restoredContent, originalContent);
+    const content = readFileSync(filePath, 'utf8');
+    assert.equal(content, '');
+  } finally {
+    db.close();
+    cleanupTest();
+  }
+});
+
+test('CompensationManager - preserves newly created file if modified after workflow wrote it', async () => {
+  const { db, taskRepo, compensationManager } = setupTest();
+
+  try {
+    const filePath = resolve(testWorkspace, 'user_edited_scratch.txt');
+    const workflowContent = 'created by agent';
+    const userModifiedContent = 'created by agent\nUser added manual critical notes!';
+
+    const task = taskRepo.createTask({ goal: 'Task that created scratch file' });
+    const step = taskRepo.createStep({
+      taskId: task.id,
+      stepOrder: 1,
+      description: 'Write file',
+      toolName: 'file_write',
+      toolArguments: { path: filePath, content: workflowContent }
+    });
+
+    // Write file with user modifications
+    writeFileSync(filePath, userModifiedContent, 'utf8');
+
+    taskRepo.recordToolExecution({
+      stepId: step.id,
+      toolName: 'file_write',
+      input: { path: filePath, content: workflowContent },
+      output: {
+        path: filePath,
+        bytesWritten: workflowContent.length,
+        writtenHash: sha256(workflowContent),
+        existedBefore: false
+      },
+      exitCode: 0,
+      durationMs: 5
+    });
+
+    const result = await compensationManager.compensate(task.id);
+    assert.equal(result.totalReverted, 0);
+    assert.equal(result.totalSkipped, 1);
+    assert.equal(result.actions[0]!.status, 'SKIPPED');
+    assert.ok(result.actions[0]!.details?.includes('modified after workflow'));
+
+    // File MUST NOT be deleted
+    assert.ok(existsSync(filePath));
+    assert.equal(readFileSync(filePath, 'utf8'), userModifiedContent);
+  } finally {
+    db.close();
+    cleanupTest();
+  }
+});
+
+test('CompensationManager - preserves overwritten pre-existing file if modified after workflow wrote it', async () => {
+  const { db, taskRepo, compensationManager } = setupTest();
+
+  try {
+    const filePath = resolve(testWorkspace, 'user_edited_config.json');
+    const originalV0 = '{"v": 0}';
+    const workflowV1 = '{"v": 1}';
+    const userV2 = '{"v": 1, "external_patch": true}';
+
+    const task = taskRepo.createTask({ goal: 'Task that mutated config' });
+    const step = taskRepo.createStep({
+      taskId: task.id,
+      stepOrder: 1,
+      description: 'Write v1',
+      toolName: 'file_write',
+      toolArguments: { path: filePath, content: workflowV1 }
+    });
+
+    // File now contains userV2 on disk
+    writeFileSync(filePath, userV2, 'utf8');
+
+    taskRepo.recordToolExecution({
+      stepId: step.id,
+      toolName: 'file_write',
+      input: { path: filePath, content: workflowV1 },
+      output: {
+        path: filePath,
+        bytesWritten: workflowV1.length,
+        writtenHash: sha256(workflowV1),
+        existedBefore: true,
+        previousContent: originalV0,
+        previousHash: sha256(originalV0)
+      },
+      exitCode: 0,
+      durationMs: 5
+    });
+
+    const result = await compensationManager.compensate(task.id);
+    assert.equal(result.totalReverted, 0);
+    assert.equal(result.totalSkipped, 1);
+    assert.equal(result.actions[0]!.status, 'SKIPPED');
+    assert.ok(result.actions[0]!.details?.includes('modified after workflow'));
+
+    // User's modifications MUST NOT be overwritten
+    assert.equal(readFileSync(filePath, 'utf8'), userV2);
   } finally {
     db.close();
     cleanupTest();
@@ -150,12 +401,11 @@ test('CompensationManager - leaves overwritten file untouched if backup is missi
       toolArguments: { path: filePath, content: 'mutated content' }
     });
 
-    // existedBefore: true, but missing previousContent/previousHash
     taskRepo.recordToolExecution({
       stepId: step.id,
       toolName: 'file_write',
       input: { path: filePath, content: 'mutated content' },
-      output: { path: filePath, bytesWritten: 15, existedBefore: true },
+      output: { path: filePath, bytesWritten: 15, writtenHash: sha256('mutated content'), existedBefore: true },
       exitCode: 0,
       durationMs: 5
     });
@@ -166,7 +416,6 @@ test('CompensationManager - leaves overwritten file untouched if backup is missi
     assert.equal(result.actions[0]!.status, 'SKIPPED');
     assert.ok(result.actions[0]!.details?.includes('missing backup'));
 
-    // File MUST NOT have been deleted
     assert.ok(existsSync(filePath));
     assert.equal(readFileSync(filePath, 'utf8'), 'mutated content');
   } finally {
@@ -198,6 +447,7 @@ test('CompensationManager - leaves overwritten file untouched if backup hash is 
       output: {
         path: filePath,
         bytesWritten: 15,
+        writtenHash: sha256('current content'),
         existedBefore: true,
         previousContent: 'backup text',
         previousHash: 'wrong_sha256_hash_value_that_does_not_match'
@@ -212,7 +462,6 @@ test('CompensationManager - leaves overwritten file untouched if backup hash is 
     assert.equal(result.actions[0]!.status, 'SKIPPED');
     assert.ok(result.actions[0]!.details?.includes('hash mismatch'));
 
-    // File MUST NOT have been deleted
     assert.ok(existsSync(filePath));
   } finally {
     db.close();
@@ -387,7 +636,7 @@ test('CompensationManager - is idempotent across repeated compensation runs', as
       stepId: step.id,
       toolName: 'file_write',
       input: { path: filePath, content: 'to be deleted' },
-      output: { path: filePath, bytesWritten: 13, existedBefore: false },
+      output: { path: filePath, bytesWritten: 13, writtenHash: sha256('to be deleted'), existedBefore: false },
       exitCode: 0,
       durationMs: 5
     });

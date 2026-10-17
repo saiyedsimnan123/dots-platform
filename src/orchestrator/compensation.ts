@@ -4,18 +4,20 @@
  * Architectural Mandate:
  * Provides bounded rollback and safe cleanup for partially failed workflow tasks.
  * Strictly guarantees data safety:
- * 1. Rejects path traversal, sibling prefix spoofing, and symlink escapes.
- * 2. Never deletes pre-existing files that were overwritten during the task.
- * 3. Restores overwritten files only when a verified backup hash matches.
- * 4. Leaves files untouched when safe restoration is impossible and reports incomplete status.
- * 5. Idempotent across repeated compensation runs.
- * 6. Records detailed audit events for every reverted, skipped, or failed action.
+ * 1. Reverse execution order: compensates mutations from latest to oldest, unwinding multi-write chains.
+ * 2. Rejects path traversal, sibling prefix spoofing, and symlink escapes via PathValidator.
+ * 3. Never deletes pre-existing files that were overwritten during the task.
+ * 4. Explicit missing-value checks allowing empty files ("") to be safely restored.
+ * 5. Protects post-write edits: verifies file on disk matches expected written hash before reverting or deleting.
+ * 6. Idempotent across repeated compensation runs.
+ * 7. Records detailed audit events for every reverted, skipped, or failed action.
  */
 
-import { existsSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, unlinkSync, writeFileSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import type { TaskRepository } from '../storage/task-repository.ts';
 import type { AuditRepository } from '../storage/audit-repository.ts';
+import type { TaskStep, ToolExecution } from '../domain/types.ts';
 import { PathValidator } from '../security/path-validator.ts';
 
 export interface CompensationAction {
@@ -51,20 +53,33 @@ export class CompensationManager {
 
   /**
    * Reverts mutations created by a failed task within the sandboxed workspace.
-   * Safe, non-destructive, and idempotent.
+   * Executed in reverse execution order.
    */
   public async compensate(taskId: string): Promise<CompensationResult> {
     const steps = this.taskRepo.getStepsByTaskId(taskId);
     const actions: CompensationAction[] = [];
 
     try {
-      for (const step of steps) {
+      // 1. Gather all file_write executions in chronological order
+      const sortedSteps = [...steps].sort((a, b) => a.stepOrder - b.stepOrder);
+      const writeExecutions: { step: TaskStep; exec: ToolExecution }[] = [];
+
+      for (const step of sortedSteps) {
         const executions = this.taskRepo.getToolExecutionsByStepId(step.id);
-        for (const exec of executions) {
+        const sortedExecs = [...executions].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+        for (const exec of sortedExecs) {
           if (exec.toolName === 'file_write') {
-            await this.compensateFileWrite(exec.inputJson, exec.outputJson, actions);
+            writeExecutions.push({ step, exec });
           }
         }
+      }
+
+      // 2. Reverse execution order: compensate most recent writes first!
+      writeExecutions.reverse();
+
+      // 3. Compensate each mutation
+      for (const item of writeExecutions) {
+        await this.compensateFileWrite(item.exec.inputJson, item.exec.outputJson, actions);
       }
     } catch (err) {
       actions.push({
@@ -104,23 +119,25 @@ export class CompensationManager {
   }
 
   /**
-   * Safely rolls back a single file_write mutation.
+   * Safely rolls back a single file_write mutation in reverse execution sequence.
    */
   private async compensateFileWrite(
     inputJson: string,
     outputJson: string,
     actions: CompensationAction[]
   ): Promise<void> {
-    let input: { path?: string };
+    let input: { path?: string; content?: string };
     let output: {
       path?: string;
+      bytesWritten?: number;
+      writtenHash?: string;
       existedBefore?: boolean;
       previousContent?: string;
       previousHash?: string;
     };
 
     try {
-      input = JSON.parse(inputJson) as { path?: string };
+      input = JSON.parse(inputJson) as typeof input;
       output = JSON.parse(outputJson) as typeof output;
     } catch {
       actions.push({
@@ -149,10 +166,23 @@ export class CompensationManager {
 
     const canonicalPath = containment.canonicalPath;
 
+    // Determine expected content hash written by this execution
+    const expectedWrittenHash = output.writtenHash || (typeof input.content === 'string'
+      ? createHash('sha256').update(input.content).digest('hex')
+      : undefined);
+
     // 2. Protect pre-existing files vs newly created files
     if (output.existedBefore === true) {
       // Overwritten pre-existing file: NEVER delete. Attempt restore only if verified backup exists.
-      if (!output.previousContent || !output.previousHash) {
+      // Explicit missing-value check allows empty file string ("") as a valid backup
+      if (
+        output.previousContent === undefined ||
+        output.previousContent === null ||
+        typeof output.previousContent !== 'string' ||
+        output.previousHash === undefined ||
+        output.previousHash === null ||
+        typeof output.previousHash !== 'string'
+      ) {
         actions.push({
           action: 'file_restore',
           resource: rawPath,
@@ -160,6 +190,33 @@ export class CompensationManager {
           details: 'Pre-existing file left untouched: missing backup snapshot.'
         });
         return;
+      }
+
+      // If file exists on disk, check if it was modified after workflow wrote it
+      if (existsSync(canonicalPath)) {
+        try {
+          const currentContent = readFileSync(canonicalPath, 'utf8');
+          const currentHash = createHash('sha256').update(currentContent).digest('hex');
+
+          // If current hash doesn't match what this execution wrote, external/post-write modifications occurred!
+          if (expectedWrittenHash && currentHash !== expectedWrittenHash) {
+            actions.push({
+              action: 'file_restore',
+              resource: rawPath,
+              status: 'SKIPPED',
+              details: 'Pre-existing file was modified after workflow execution; left untouched to prevent overwriting external changes.'
+            });
+            return;
+          }
+        } catch (err) {
+          actions.push({
+            action: 'file_restore',
+            resource: rawPath,
+            status: 'FAILED',
+            details: `Failed to inspect current file state on disk: ${err instanceof Error ? err.message : String(err)}`
+          });
+          return;
+        }
       }
 
       // Verify backup integrity
@@ -194,7 +251,7 @@ export class CompensationManager {
     }
 
     if (output.existedBefore === false) {
-      // Newly created file during task: safe to delete
+      // Newly created file during task: safe to delete if it has not been modified post-write
       if (!existsSync(canonicalPath)) {
         // Idempotency: already deleted or not created
         actions.push({
@@ -207,6 +264,20 @@ export class CompensationManager {
       }
 
       try {
+        const currentContent = readFileSync(canonicalPath, 'utf8');
+        const currentHash = createHash('sha256').update(currentContent).digest('hex');
+
+        // Protect post-write edits: if file differs from what workflow wrote, leave untouched!
+        if (expectedWrittenHash && currentHash !== expectedWrittenHash) {
+          actions.push({
+            action: 'file_delete',
+            resource: rawPath,
+            status: 'SKIPPED',
+            details: 'Newly created file was modified after workflow execution; left untouched to prevent data loss.'
+          });
+          return;
+        }
+
         unlinkSync(canonicalPath);
         actions.push({
           action: 'file_delete',

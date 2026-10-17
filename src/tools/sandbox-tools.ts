@@ -212,17 +212,20 @@ export const fileWriteTool: RegisteredTool = {
 
       writeFileSync(filePath, content, 'utf8');
       const bytesWritten = Buffer.byteLength(content, 'utf8');
+      const writtenHash = createHash('sha256').update(content).digest('hex');
 
       return {
         output: {
           path: filePath,
           bytesWritten,
+          writtenHash,
           existedBefore,
           ...(existedBefore ? { previousContent, previousHash, previousByteSize } : {})
         },
         exitCode: 0,
         durationMs: Date.now() - start
       };
+
     } catch (err) {
       if (err instanceof SecurityViolationError) throw err;
       throw new ToolExecutionError(
