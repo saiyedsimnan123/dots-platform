@@ -145,7 +145,7 @@ export class MemoryRepository {
       throw err;
     }
 
-    const created = this.getMemoryById(id);
+    const created = this.getMemoryByIdInternal(id);
     if (!created) {
       throw new ValidationError(`Failed to retrieve newly created memory '${id}'.`);
     }
@@ -153,24 +153,26 @@ export class MemoryRepository {
   }
 
   /**
-   * Retrieves a memory record by ID.
-   * If scope is provided, strictly enforces scope containment.
+   * Retrieves a memory record by ID strictly within the designated scope.
+   * Throws MemoryScopeViolationError if the memory exists under a different scope.
+   * Returns null if no record with this ID exists.
    */
-  public getMemoryById(id: string, scope?: ScopeIdentifier): Memory | null {
+  public getMemoryById(id: string, scope: ScopeIdentifier): Memory | null {
     if (!id || typeof id !== 'string' || id.trim() === '') {
       throw new ValidationError('Memory ID must be a non-empty string.');
     }
+    if (!scope || typeof scope !== 'object') {
+      throw new ValidationError('Scope must be provided to getMemoryById.');
+    }
+    this.validateScope(scope.scopeType, scope.scopeId);
 
-    const stmt = this.db.prepare('SELECT * FROM memories WHERE id = ?');
-    const row = stmt.get(id) as unknown as MemoryDbRow | undefined;
+    const row = this.getMemoryRowById(id);
     if (!row) {
       return null;
     }
 
-    // Verify scope isolation if scope was specified
-    if (scope) {
-      this.assertScopeMatch(row.scope_type as MemoryScopeType, row.scope_id, scope, id);
-    }
+    // Verify scope isolation: must strictly match the expected scope
+    this.assertScopeMatch(row.scope_type as MemoryScopeType, row.scope_id, scope, id);
 
     return this.mapMemoryRow(row);
   }
@@ -180,6 +182,9 @@ export class MemoryRepository {
    */
   public getMemoryByKey(key: string, scope: ScopeIdentifier, status: MemoryStatus = 'ACTIVE'): Memory | null {
     this.validateKey(key);
+    if (!scope || typeof scope !== 'object') {
+      throw new ValidationError('Scope must be provided to getMemoryByKey.');
+    }
     this.validateScope(scope.scopeType, scope.scopeId);
     this.validateStatus(status);
 
@@ -198,6 +203,9 @@ export class MemoryRepository {
    * Lists memories within an explicit scope, with optional status and category filters.
    */
   public listMemories(filter: ListMemoriesFilter): Memory[] {
+    if (!filter || typeof filter !== 'object') {
+      throw new ValidationError('Filter must be provided to listMemories.');
+    }
     this.validateScope(filter.scopeType, filter.scopeId);
 
     const conditions: string[] = ['scope_type = ?', 'scope_id = ?'];
@@ -435,6 +443,19 @@ export class MemoryRepository {
   }
 
   // --- Private Helpers ---
+
+  private getMemoryRowById(id: string): MemoryDbRow | undefined {
+    const stmt = this.db.prepare('SELECT * FROM memories WHERE id = ?');
+    return stmt.get(id) as unknown as MemoryDbRow | undefined;
+  }
+
+  private getMemoryByIdInternal(id: string): Memory | null {
+    const row = this.getMemoryRowById(id);
+    if (!row) {
+      return null;
+    }
+    return this.mapMemoryRow(row);
+  }
 
   private getActiveByKey(key: string, scopeType: MemoryScopeType, scopeId: string): MemoryDbRow | undefined {
     const stmt = this.db.prepare(`

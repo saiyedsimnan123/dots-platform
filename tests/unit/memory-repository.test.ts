@@ -549,7 +549,7 @@ test('MemoryRepository - hard deletion physically erases content and nulls injec
     assert.equal(deleted, true);
 
     // 1. Memory must be completely gone from memories table
-    assert.equal(memoryRepo.getMemoryById(mem.id), null);
+    assert.equal(memoryRepo.getMemoryById(mem.id, workspaceA), null);
 
     // 2. Querying raw SQLite confirms physical erasure
     const rawMem = db.prepare('SELECT * FROM memories WHERE id = ?').get(mem.id);
@@ -643,3 +643,213 @@ test('MemoryRepository - transactional failure rolls back multi-step mutations',
     db.close();
   }
 });
+
+test('MemoryRepository - getMemoryById enforces mandatory scope at compile-time and runtime', () => {
+  const { db, memoryRepo } = setupTest();
+
+  try {
+    const mem = memoryRepo.createMemory({
+      category: 'USER_PREFERENCE',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceA.scopeId,
+      key: 'mandatory.scope.check',
+      content: 'Scope enforcement test content'
+    });
+
+    // 1. Compile-time enforcement:
+    // Calling getMemoryById with only 1 argument MUST trigger a TypeScript compile-time error.
+    // The @ts-expect-error directive ensures the compiler catches missing arguments.
+    assert.throws(
+      // @ts-expect-error Expected 2 arguments, but got 1. getMemoryById requires (id, scope).
+      () => memoryRepo.getMemoryById(mem.id),
+      (err: unknown) => {
+        assert.ok(err instanceof ValidationError);
+        assert.match((err as Error).message, /Scope must be provided/);
+        return true;
+      }
+    );
+
+    // 2. Runtime enforcement: bypass type system to simulate untyped/runtime callers
+    const repoUntyped = memoryRepo as unknown as {
+      getMemoryById: (id: string, scope?: unknown) => unknown;
+    };
+
+    // Omitted scope
+    assert.throws(
+      () => repoUntyped.getMemoryById(mem.id),
+      (err: unknown) => err instanceof ValidationError && /Scope must be provided/.test((err as Error).message)
+    );
+
+    // null scope
+    assert.throws(
+      () => repoUntyped.getMemoryById(mem.id, null),
+      (err: unknown) => err instanceof ValidationError && /Scope must be provided/.test((err as Error).message)
+    );
+
+    // undefined scope
+    assert.throws(
+      () => repoUntyped.getMemoryById(mem.id, undefined),
+      (err: unknown) => err instanceof ValidationError && /Scope must be provided/.test((err as Error).message)
+    );
+
+    // Non-object scope
+    assert.throws(
+      () => repoUntyped.getMemoryById(mem.id, 'invalid-scope-string'),
+      (err: unknown) => err instanceof ValidationError
+    );
+
+    // Incomplete/invalid scope object
+    assert.throws(
+      () => repoUntyped.getMemoryById(mem.id, {}),
+      (err: unknown) => err instanceof ValidationError && /Invalid memory scope type/.test((err as Error).message)
+    );
+
+    assert.throws(
+      () => repoUntyped.getMemoryById(mem.id, { scopeType: 'WORKSPACE' }),
+      (err: unknown) => err instanceof ValidationError && /scopeId must be a non-empty string/.test((err as Error).message)
+    );
+
+    assert.throws(
+      () => repoUntyped.getMemoryById(mem.id, { scopeType: 'GLOBAL', scopeId: 'wrong-id' }),
+      (err: unknown) => err instanceof ValidationError && /Global memory scopeId must be 'default'/.test((err as Error).message)
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('MemoryRepository - getMemoryById succeeds with correct scope and rejects cross-workspace / global access', () => {
+  const { db, memoryRepo } = setupTest();
+
+  try {
+    const memWsA = memoryRepo.createMemory({
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceA.scopeId,
+      key: 'workspace.a.fact',
+      content: 'Workspace A isolated knowledge'
+    });
+
+    const memWsB = memoryRepo.createMemory({
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceB.scopeId,
+      key: 'workspace.b.fact',
+      content: 'Workspace B isolated knowledge'
+    });
+
+    const memGlobal = memoryRepo.createMemory({
+      category: 'USER_PREFERENCE',
+      scopeType: 'GLOBAL',
+      scopeId: globalScope.scopeId,
+      key: 'global.preference',
+      content: 'Global user preference'
+    });
+
+    // 1. Correct-scope retrieval succeeds
+    const foundA = memoryRepo.getMemoryById(memWsA.id, workspaceA);
+    assert.ok(foundA);
+    assert.equal(foundA.id, memWsA.id);
+    assert.equal(foundA.content, 'Workspace A isolated knowledge');
+
+    const foundB = memoryRepo.getMemoryById(memWsB.id, workspaceB);
+    assert.ok(foundB);
+    assert.equal(foundB.id, memWsB.id);
+    assert.equal(foundB.content, 'Workspace B isolated knowledge');
+
+    const foundGlobal = memoryRepo.getMemoryById(memGlobal.id, globalScope);
+    assert.ok(foundGlobal);
+    assert.equal(foundGlobal.id, memGlobal.id);
+    assert.equal(foundGlobal.content, 'Global user preference');
+
+    // 2. Cross-workspace retrieval fails with MemoryScopeViolationError
+    assert.throws(
+      () => memoryRepo.getMemoryById(memWsA.id, workspaceB),
+      (err: unknown) => {
+        assert.ok(err instanceof MemoryScopeViolationError);
+        assert.equal(err.expectedScope, `${workspaceB.scopeType}:${workspaceB.scopeId}`);
+        assert.equal(err.actualScope, `${workspaceA.scopeType}:${workspaceA.scopeId}`);
+        assert.equal(err.memoryId, memWsA.id);
+        return true;
+      }
+    );
+
+    assert.throws(
+      () => memoryRepo.getMemoryById(memWsB.id, workspaceA),
+      (err: unknown) => {
+        assert.ok(err instanceof MemoryScopeViolationError);
+        assert.equal(err.expectedScope, `${workspaceA.scopeType}:${workspaceA.scopeId}`);
+        assert.equal(err.actualScope, `${workspaceB.scopeType}:${workspaceB.scopeId}`);
+        assert.equal(err.memoryId, memWsB.id);
+        return true;
+      }
+    );
+
+    // 3. Workspace vs. Global isolation
+    // Workspace memory queried with global scope
+    assert.throws(
+      () => memoryRepo.getMemoryById(memWsA.id, globalScope),
+      (err: unknown) => {
+        assert.ok(err instanceof MemoryScopeViolationError);
+        assert.equal(err.expectedScope, `${globalScope.scopeType}:${globalScope.scopeId}`);
+        assert.equal(err.actualScope, `${workspaceA.scopeType}:${workspaceA.scopeId}`);
+        assert.equal(err.memoryId, memWsA.id);
+        return true;
+      }
+    );
+
+    // Global memory queried with workspace scope
+    assert.throws(
+      () => memoryRepo.getMemoryById(memGlobal.id, workspaceA),
+      (err: unknown) => {
+        assert.ok(err instanceof MemoryScopeViolationError);
+        assert.equal(err.expectedScope, `${workspaceA.scopeType}:${workspaceA.scopeId}`);
+        assert.equal(err.actualScope, `${globalScope.scopeType}:${globalScope.scopeId}`);
+        assert.equal(err.memoryId, memGlobal.id);
+        return true;
+      }
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('MemoryRepository - missing memory returns null on reads and throws MemoryNotFoundError on mutations', () => {
+  const { db, memoryRepo } = setupTest();
+
+  try {
+    const nonExistentId = '00000000-0000-4000-8000-000000000000';
+
+    // Reading non-existent ID within workspace scope returns null (not throwing scope violation)
+    assert.equal(memoryRepo.getMemoryById(nonExistentId, workspaceA), null);
+    assert.equal(memoryRepo.getMemoryById(nonExistentId, globalScope), null);
+
+    // Reading non-existent key within workspace scope returns null
+    assert.equal(memoryRepo.getMemoryByKey('non.existent.key', workspaceA), null);
+    assert.equal(memoryRepo.getMemoryByKey('non.existent.key', globalScope), null);
+
+    // Mutating non-existent memory throws MemoryNotFoundError
+    assert.throws(
+      () => memoryRepo.updateMemory(nonExistentId, workspaceA, { content: 'New' }),
+      (err: unknown) => err instanceof MemoryNotFoundError
+    );
+
+    assert.throws(
+      () => memoryRepo.archiveMemory(nonExistentId, workspaceA),
+      (err: unknown) => err instanceof MemoryNotFoundError
+    );
+
+    assert.throws(
+      () => memoryRepo.deleteMemory(nonExistentId, workspaceA),
+      (err: unknown) => err instanceof MemoryNotFoundError
+    );
+
+    assert.throws(
+      () => memoryRepo.recordAccess(nonExistentId, workspaceA),
+      (err: unknown) => err instanceof MemoryNotFoundError
+    );
+  } finally {
+    db.close();
+  }
+});
+
