@@ -63,7 +63,7 @@ import type { AuditRepository } from '../storage/audit-repository.ts';
 import type { TaskRepository } from '../storage/task-repository.ts';
 import { RelevanceMatcher } from './relevance-matcher.ts';
 import { MemoryContextBuilder } from './context-builder.ts';
-import { MemoryAuthorizer, type IssueCallerContextInput } from '../security/memory-authorizer.ts';
+import { MemoryAuthorizer } from '../security/memory-authorizer.ts';
 
 const VALID_SCOPES: ReadonlySet<MemoryScopeType> = new Set([
   'GLOBAL',
@@ -83,7 +83,7 @@ export class MemoryService {
   private readonly memoryRepo: MemoryRepository;
   private readonly auditRepo?: AuditRepository;
   private readonly taskRepo?: TaskRepository;
-  public readonly authorizer: MemoryAuthorizer;
+  readonly #authorizer: MemoryAuthorizer;
   private readonly relevanceMatcher: RelevanceMatcher;
   private readonly contextBuilder: MemoryContextBuilder;
   private systemTaskId?: string;
@@ -99,16 +99,9 @@ export class MemoryService {
     this.memoryRepo = options.memoryRepo;
     this.auditRepo = options.auditRepo;
     this.taskRepo = options.taskRepo;
-    this.authorizer = options.authorizer ?? new MemoryAuthorizer();
+    this.#authorizer = options.authorizer ?? new MemoryAuthorizer({ taskRepo: options.taskRepo });
     this.relevanceMatcher = options.relevanceMatcher ?? new RelevanceMatcher();
     this.contextBuilder = options.contextBuilder ?? new MemoryContextBuilder({ matcher: this.relevanceMatcher });
-  }
-
-  /**
-   * Helper to issue an authentic, host-sealed CallerContext via the service's authorizer.
-   */
-  public issueContext(input: IssueCallerContextInput): CallerContext {
-    return this.authorizer.issueContext(input);
   }
 
   // --- Public Operations ---
@@ -224,36 +217,38 @@ export class MemoryService {
       status = input.status ?? 'ACTIVE';
     }
 
-    const memory = this.memoryRepo.createMemory({
-      ...input,
-      scopeType: caller.scope.scopeType,
-      scopeId: caller.scope.scopeId,
-      status
+    return this.memoryRepo.transaction(() => {
+      const memory = this.memoryRepo.createMemory({
+        ...input,
+        scopeType: caller.scope.scopeType,
+        scopeId: caller.scope.scopeId,
+        status
+      });
+
+      // Mandatory audit write for state creation
+      if (status === 'ACTIVE') {
+        this.audit(caller, 'MEMORY_CREATED', {
+          memoryId: memory.id,
+          key: memory.key,
+          category: memory.category,
+          scopeType: memory.scopeType,
+          scopeId: memory.scopeId,
+          status: 'ACTIVE'
+        }, true);
+      } else {
+        this.audit(caller, 'MEMORY_PROPOSAL_SUBMITTED', {
+          memoryId: memory.id,
+          key: memory.key,
+          category: memory.category,
+          scopeType: memory.scopeType,
+          scopeId: memory.scopeId,
+          status: 'PENDING_APPROVAL',
+          proposedBy: caller.actor
+        }, true);
+      }
+
+      return memory;
     });
-
-    // Mandatory audit write for state creation
-    if (status === 'ACTIVE') {
-      this.audit(caller, 'MEMORY_CREATED', {
-        memoryId: memory.id,
-        key: memory.key,
-        category: memory.category,
-        scopeType: memory.scopeType,
-        scopeId: memory.scopeId,
-        status: 'ACTIVE'
-      }, true);
-    } else {
-      this.audit(caller, 'MEMORY_PROPOSAL_SUBMITTED', {
-        memoryId: memory.id,
-        key: memory.key,
-        category: memory.category,
-        scopeType: memory.scopeType,
-        scopeId: memory.scopeId,
-        status: 'PENDING_APPROVAL',
-        proposedBy: caller.actor
-      }, true);
-    }
-
-    return memory;
   }
 
   /**
@@ -338,18 +333,20 @@ export class MemoryService {
       }
     }
 
-    const updated = this.memoryRepo.updateMemory(id, caller.scope, input);
+    return this.memoryRepo.transaction(() => {
+      const updated = this.memoryRepo.updateMemory(id, caller.scope, input);
 
-    // Mandatory audit write for state update
-    this.audit(caller, 'MEMORY_UPDATED', {
-      memoryId: updated.id,
-      key: updated.key,
-      scopeType: updated.scopeType,
-      scopeId: updated.scopeId,
-      updatedFields: Object.keys(input)
-    }, true);
+      // Mandatory audit write for state update
+      this.audit(caller, 'MEMORY_UPDATED', {
+        memoryId: updated.id,
+        key: updated.key,
+        scopeType: updated.scopeType,
+        scopeId: updated.scopeId,
+        updatedFields: Object.keys(input)
+      }, true);
 
-    return updated;
+      return updated;
+    });
   }
 
   /**
@@ -362,25 +359,27 @@ export class MemoryService {
       throw new ValidationError('Memory ID must be a non-empty string.');
     }
 
-    try {
-      const archived = this.memoryRepo.archiveMemory(id, caller.scope);
-      this.audit(caller, 'MEMORY_ARCHIVED', {
-        memoryId: archived.id,
-        key: archived.key,
-        scopeType: archived.scopeType,
-        scopeId: archived.scopeId
-      }, true);
-      return archived;
-    } catch (err) {
-      if (err instanceof MemoryScopeViolationError) {
-        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
-          reason: 'CROSS_SCOPE_ARCHIVE_ATTEMPT',
-          memoryId: id,
-          expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
-        }, false);
+    return this.memoryRepo.transaction(() => {
+      try {
+        const archived = this.memoryRepo.archiveMemory(id, caller.scope);
+        this.audit(caller, 'MEMORY_ARCHIVED', {
+          memoryId: archived.id,
+          key: archived.key,
+          scopeType: archived.scopeType,
+          scopeId: archived.scopeId
+        }, true);
+        return archived;
+      } catch (err) {
+        if (err instanceof MemoryScopeViolationError) {
+          this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+            reason: 'CROSS_SCOPE_ARCHIVE_ATTEMPT',
+            memoryId: id,
+            expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+          }, false);
+        }
+        throw err;
       }
-      throw err;
-    }
+    });
   }
 
   /**
@@ -412,17 +411,19 @@ export class MemoryService {
       throw new MemoryNotFoundError(id);
     }
 
-    const deleted = this.memoryRepo.deleteMemory(id, caller.scope);
+    return this.memoryRepo.transaction(() => {
+      const deleted = this.memoryRepo.deleteMemory(id, caller.scope);
 
-    // Mandatory audit write for hard deletion
-    this.audit(caller, 'MEMORY_DELETED', {
-      memoryId: existing.id,
-      key: existing.key,
-      scopeType: existing.scopeType,
-      scopeId: existing.scopeId
-    }, true);
+      // Mandatory audit write for hard deletion
+      this.audit(caller, 'MEMORY_DELETED', {
+        memoryId: existing.id,
+        key: existing.key,
+        scopeType: existing.scopeType,
+        scopeId: existing.scopeId
+      }, true);
 
-    return deleted;
+      return deleted;
+    });
   }
 
   /**
@@ -505,23 +506,25 @@ export class MemoryService {
       );
     }
 
-    const newStatus: MemoryStatus = input.decision === 'APPROVED' ? 'ACTIVE' : 'ARCHIVED';
-    const updated = this.memoryRepo.updateMemory(input.memoryId, caller.scope, { status: newStatus });
+    return this.memoryRepo.transaction(() => {
+      const newStatus: MemoryStatus = input.decision === 'APPROVED' ? 'ACTIVE' : 'ARCHIVED';
+      const updated = this.memoryRepo.updateMemory(input.memoryId, caller.scope, { status: newStatus });
 
-    // Mandatory audit write for proposal decision
-    this.audit(caller, 'MEMORY_PROPOSAL_DECIDED', {
-      memoryId: updated.id,
-      key: updated.key,
-      category: updated.category,
-      decision: input.decision,
-      decidedBy: caller.actor,
-      scopeType: updated.scopeType,
-      scopeId: updated.scopeId,
-      previousStatus: 'PENDING_APPROVAL',
-      newStatus
-    }, true);
+      // Mandatory audit write for proposal decision
+      this.audit(caller, 'MEMORY_PROPOSAL_DECIDED', {
+        memoryId: updated.id,
+        key: updated.key,
+        category: updated.category,
+        decision: input.decision,
+        decidedBy: caller.actor,
+        scopeType: updated.scopeType,
+        scopeId: updated.scopeId,
+        previousStatus: 'PENDING_APPROVAL',
+        newStatus
+      }, true);
 
-    return updated;
+      return updated;
+    });
   }
 
   /**
@@ -832,7 +835,7 @@ export class MemoryService {
     requiredPermission?: MemoryPermission
   ): Set<MemoryPermission> {
     // 1. Authoritative verification: caller must be issued and un-tampered by host boundary
-    const verified = this.authorizer.verify(caller);
+    const verified = this.#authorizer.verify(caller);
 
     this.validateScope(verified.scope.scopeType, verified.scope.scopeId);
 
@@ -859,6 +862,16 @@ export class MemoryService {
       const task = this.taskRepo.getTaskById(verified.taskId);
       if (!task) {
         throw new TaskNotFoundError(verified.taskId);
+      }
+      const taskScope = this.extractAuthoritativeTaskScope(task);
+      if (
+        taskScope.scopeType !== verified.scope.scopeType ||
+        taskScope.scopeId !== verified.scope.scopeId
+      ) {
+        throw new SecurityViolationError(
+          `Caller scope '${verified.scope.scopeType}:${verified.scope.scopeId}' does not match task scope '${taskScope.scopeType}:${taskScope.scopeId}'.`,
+          'TASK_CALLER_SCOPE_MISMATCH'
+        );
       }
     }
 
@@ -917,59 +930,12 @@ export class MemoryService {
   }
 
   /**
-   * Extracts authoritative task scope strictly from trusted task metadata.
-   * Fails closed if metadata is missing, malformed, or lacks valid scope fields.
+   * Extracts authoritative task scope strictly from verified host task attestation.
+   * Fails closed if metadata is missing, malformed, or untrusted.
    * NEVER falls back to caller scope.
    */
   private extractAuthoritativeTaskScope(task: Task): ScopeIdentifier {
-    if (!task.metadataJson) {
-      throw new ValidationError(
-        `Task '${task.id}' lacks metadata required to establish authoritative scope.`
-      );
-    }
-
-    let meta: Record<string, unknown>;
-    try {
-      meta = JSON.parse(task.metadataJson);
-    } catch {
-      throw new ValidationError(
-        `Task '${task.id}' metadata is malformed JSON; cannot establish authoritative scope.`
-      );
-    }
-
-    if (!meta || typeof meta !== 'object') {
-      throw new ValidationError(
-        `Task '${task.id}' metadata is not an object; cannot establish authoritative scope.`
-      );
-    }
-
-    if (meta.scopeType && meta.scopeId) {
-      const scopeType = meta.scopeType as MemoryScopeType;
-      const scopeId = String(meta.scopeId);
-      this.validateScope(scopeType, scopeId);
-      return { scopeType, scopeId };
-    }
-
-    if (meta.workspaceId && typeof meta.workspaceId === 'string' && meta.workspaceId.trim() !== '') {
-      return {
-        scopeType: 'WORKSPACE',
-        scopeId: meta.workspaceId.trim()
-      };
-    }
-
-    if (meta.scope && typeof meta.scope === 'object') {
-      const s = meta.scope as Record<string, unknown>;
-      if (s.scopeType && s.scopeId) {
-        const scopeType = s.scopeType as MemoryScopeType;
-        const scopeId = String(s.scopeId);
-        this.validateScope(scopeType, scopeId);
-        return { scopeType, scopeId };
-      }
-    }
-
-    throw new ValidationError(
-      `Task '${task.id}' metadata does not contain valid scope information (workspaceId or scopeType/scopeId).`
-    );
+    return this.#authorizer.verifyTaskScope(task);
   }
 
   /**
@@ -1034,10 +1000,10 @@ export class MemoryService {
         this.systemTaskId = existing.id;
         return this.systemTaskId;
       }
-      const created = this.taskRepo.createTask({
+      const created = this.#authorizer.createTask(this.taskRepo, {
         id: '__system_memory__',
         goal: 'System long-term memory operations',
-        metadata: { scopeType: 'GLOBAL', scopeId: 'default' }
+        scope: { scopeType: 'GLOBAL', scopeId: 'default' }
       });
       this.systemTaskId = created.id;
       return this.systemTaskId;
