@@ -128,6 +128,21 @@ export class RelevanceMatcher {
   public readonly stopWords: ReadonlySet<string>;
 
   constructor(options: RelevanceMatcherOptions = {}) {
+    if ('keyWeight' in options && options.keyWeight !== undefined) {
+      this.validateWeight('keyWeight', options.keyWeight);
+    }
+    if ('tagWeight' in options && options.tagWeight !== undefined) {
+      this.validateWeight('tagWeight', options.tagWeight);
+    }
+    if ('wordWeight' in options && options.wordWeight !== undefined) {
+      this.validateWeight('wordWeight', options.wordWeight);
+    }
+    if ('stopWords' in options && options.stopWords !== undefined) {
+      if (!(options.stopWords instanceof Set)) {
+        throw new ValidationError('Stop words must be a Set of strings.');
+      }
+    }
+
     const keyWeight = options.keyWeight ?? RelevanceMatcher.DEFAULT_KEY_WEIGHT;
     const tagWeight = options.tagWeight ?? RelevanceMatcher.DEFAULT_TAG_WEIGHT;
     const wordWeight = options.wordWeight ?? RelevanceMatcher.DEFAULT_WORD_WEIGHT;

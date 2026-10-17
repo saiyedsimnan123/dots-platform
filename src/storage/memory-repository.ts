@@ -23,7 +23,8 @@ import type {
   CreateMemoryInput,
   UpdateMemoryInput,
   ListMemoriesFilter,
-  RecordMemoryInjectionInput
+  RecordMemoryInjectionInput,
+  ScopeIdentifier
 } from '../domain/types.ts';
 import {
   ValidationError,
@@ -32,10 +33,7 @@ import {
   MemoryScopeViolationError
 } from '../domain/errors.ts';
 
-export interface ScopeIdentifier {
-  readonly scopeType: MemoryScopeType;
-  readonly scopeId: string;
-}
+export type { ScopeIdentifier };
 
 interface MemoryDbRow {
   id: string;

@@ -383,3 +383,39 @@ export interface BuiltMemoryContext {
   readonly isTokenCountEstimate: true;
 }
 
+/**
+ * Phase 7.3 - Permission-Controlled Memory Service Types
+ */
+
+export interface ScopeIdentifier {
+  readonly scopeType: MemoryScopeType;
+  readonly scopeId: string;
+}
+
+export type MemoryPermission = 'READ' | 'WRITE' | 'DELETE' | 'APPROVE';
+export type MemoryActor = 'USER' | 'AGENT' | 'SYSTEM' | 'POLICY_ENGINE';
+
+export interface CallerContext {
+  readonly actor: MemoryActor;
+  readonly scope: ScopeIdentifier;
+  readonly permissions: ReadonlySet<MemoryPermission> | readonly MemoryPermission[];
+  readonly taskId?: string;
+}
+
+export type ProposalDecision = 'APPROVED' | 'REJECTED';
+
+export interface ProposalDecisionInput {
+  readonly memoryId: string;
+  readonly decision: ProposalDecision;
+  readonly reason?: string;
+}
+
+export interface BuildTaskMemoryContextOptions {
+  readonly query: string;
+  readonly taskId?: string;
+  readonly category?: MemoryCategory;
+  readonly relevanceThreshold?: number;
+  readonly maxBudgetChars?: number;
+  readonly recordInjections?: boolean;
+}
+

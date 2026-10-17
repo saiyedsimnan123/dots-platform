@@ -93,6 +93,12 @@ export class MemoryContextBuilder {
       }
     }
 
+    if ('matcher' in options && options.matcher !== undefined) {
+      if (!(options.matcher instanceof RelevanceMatcher)) {
+        throw new ValidationError('Matcher must be an instance of RelevanceMatcher.');
+      }
+    }
+
     this.maxBudgetChars = options.maxBudgetChars ?? MemoryContextBuilder.DEFAULT_MAX_BUDGET_CHARS;
     this.relevanceThreshold = options.relevanceThreshold ?? 0.0;
     this.matcher = options.matcher ?? new RelevanceMatcher();
