@@ -320,3 +320,66 @@ export interface RecordMemoryInjectionInput {
   readonly estimatedTokens: number;
 }
 
+/**
+ * Phase 7.2 - Relevance Matching & Context Builder Domain Types
+ */
+
+export type MemoryExclusionReason =
+  | 'EXCLUDED_NO_RELEVANCE'
+  | 'EXCLUDED_BUDGET_CEILING'
+  | 'EXCLUDED_INVALID_MEMORY';
+
+export interface RelevanceBreakdown {
+  readonly keyMatch: number;
+  readonly tagMatch: number;
+  readonly wordOverlap: number;
+  readonly matchedTags: readonly string[];
+  readonly matchedWords: readonly string[];
+  readonly keyMatched: boolean;
+}
+
+export interface ScoredMemory {
+  readonly memory: Memory;
+  readonly score: number;
+  readonly breakdown: RelevanceBreakdown;
+}
+
+export interface IncludedMemoryInfo {
+  readonly id: string;
+  readonly key: string;
+  readonly score: number;
+  readonly category: MemoryCategory;
+}
+
+export interface ExcludedMemoryInfo {
+  readonly id: string;
+  readonly key?: string;
+  readonly reason: MemoryExclusionReason;
+  readonly details?: string;
+}
+
+export interface SerializedMemoryRecord {
+  readonly id: string;
+  readonly category: MemoryCategory;
+  readonly key: string;
+  readonly content: string;
+  readonly tags: readonly string[];
+  readonly metadata: Record<string, unknown>;
+}
+
+export interface SerializedMemoryPayload {
+  readonly _boundary: string;
+  readonly _securityNotice: string;
+  readonly records: readonly SerializedMemoryRecord[];
+  readonly _boundaryEnd: string;
+}
+
+export interface BuiltMemoryContext {
+  readonly serializedContext: string;
+  readonly included: readonly IncludedMemoryInfo[];
+  readonly excluded: readonly ExcludedMemoryInfo[];
+  readonly totalChars: number;
+  readonly estimatedTokens: number;
+  readonly isTokenCountEstimate: true;
+}
+

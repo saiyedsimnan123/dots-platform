@@ -35,5 +35,9 @@ export * from './tools/registry.ts';
 // Verification Subsystem
 export * from './verification/verifier.ts';
 
+// Memory Subsystem
+export * from './memory/relevance-matcher.ts';
+export * from './memory/context-builder.ts';
+
 // Orchestration Layer
 export * from './orchestrator/coordinator.ts';
