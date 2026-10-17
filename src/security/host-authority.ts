@@ -28,21 +28,22 @@
 import type { CallerContext, ScopeIdentifier, Task } from '../domain/types.ts';
 import type { TaskRepository } from '../storage/task-repository.ts';
 import {
-  MemoryAuthorizer,
-  HostToken,
+  createHostAuthorizerPair,
+  type HostPrivilegedOperations,
+  type MemoryAuthorizer,
   type MemoryAuthorizerOptions,
   type AuthorizeSystemInput,
   type CreateTaskWithScopeInput,
   type TaskScopeAttestation
 } from './memory-authorizer.ts';
 
-export interface HostMemoryAuthorityOptions extends Omit<MemoryAuthorizerOptions, 'hostToken'> {}
+export interface HostMemoryAuthorityOptions extends MemoryAuthorizerOptions {}
 
 /**
  * Privileged Host Authorization Control Plane.
  * 
  * Held strictly by trusted host initialization and orchestration bootstrap code.
- * Encapsulates the process-private HostToken and exposes privileged operations:
+ * Encapsulates the module-private host capability closure and exposes privileged operations:
  * - createTask: creates tasks with verified cryptographic host scope attestations
  * - authorizeSystem: issues system-level CallerContext
  * - attestTaskScope: generates cryptographic scope attestations
@@ -51,42 +52,39 @@ export interface HostMemoryAuthorityOptions extends Omit<MemoryAuthorizerOptions
  * suitable for distribution to services, callers, and context verifiers.
  */
 export class HostMemoryAuthority {
-  readonly #authorizer: MemoryAuthorizer;
-  readonly #hostToken: HostToken;
+  readonly #ops: HostPrivilegedOperations;
 
   constructor(options: HostMemoryAuthorityOptions = {}) {
-    const hostToken = new HostToken(Symbol('host.capability'));
-    this.#hostToken = hostToken;
-    this.#authorizer = new MemoryAuthorizer({ ...options, hostToken });
+    this.#ops = createHostAuthorizerPair(options);
   }
 
   /**
    * Returns the unprivileged MemoryAuthorizer instance for caller/agent context verification.
-   * This instance cannot mint system authority or create tasks without the HostToken.
+   * This instance cannot mint system authority or create tasks.
    */
   public get authorizer(): MemoryAuthorizer {
-    return this.#authorizer;
+    return this.#ops.authorizer;
   }
 
   /**
    * Privileged host operation: creates an attested task in designated workspace.
    */
   public createTask(taskRepo: TaskRepository, input: CreateTaskWithScopeInput): Task {
-    return this.#authorizer._createTask(taskRepo, input, this.#hostToken);
+    return this.#ops.createTask(taskRepo, input);
   }
 
   /**
    * Privileged host operation: authorizes an internal system operation.
    */
   public authorizeSystem(input: AuthorizeSystemInput): CallerContext {
-    return this.#authorizer._authorizeSystem(input, this.#hostToken);
+    return this.#ops.authorizeSystem(input);
   }
 
   /**
    * Privileged host operation: generates a scope attestation.
    */
   public attestTaskScope(taskId: string, scope: ScopeIdentifier): TaskScopeAttestation {
-    return this.#authorizer._attestTaskScope(taskId, scope, this.#hostToken);
+    return this.#ops.attestTaskScope(taskId, scope);
   }
 }
 

@@ -4,13 +4,15 @@
  * 
  * Verifies:
  * 1. Public API boundary: src/index.ts does NOT export HostMemoryAuthority, HostToken,
- *    or privileged factories that let ordinary callers mint host authority or system capabilities.
- * 2. Unprivileged MemoryAuthorizer: Callers importing public MemoryAuthorizer cannot
- *    perform privileged operations (authorizeSystem, createTask, attestTaskScope); attempts fail closed.
+ *    createHostAuthorizerPair, or privileged factories.
+ * 2. Unprivileged MemoryAuthorizer: Callers constructing ordinary MemoryAuthorizer (even with
+ *    forged hostToken options) do not acquire privileged methods; all privileged operations
+ *    (authorizeSystem, createTask, attestTaskScope, and internal variants) are completely undefined
+ *    on the authorizer object.
  * 3. Host Bootstrap Module: src/security/host-authority.ts operates as an internal control plane,
- *    allowing trusted host bootstrap to create attested tasks and issue system contexts.
+ *    allowing trusted host bootstrap to create attested tasks and issue system contexts via closures.
  * 4. Verification Boundary: Unprivileged authorizer instances can verify host-issued contexts
- *    and task attestations, while rejecting forged or unverified callers and tasks.
+ *    and task attestations, while rejecting forged contexts and unverified tasks.
  */
 
 import { test } from 'node:test';
@@ -41,7 +43,14 @@ test('Security Regression - Public API (src/index.ts) does NOT export privileged
     'Public package entry point src/index.ts must NOT export HostToken.'
   );
 
-  // 3. No privileged functions or factories exported
+  // 3. createHostAuthorizerPair factory must NOT be exported
+  assert.equal(
+    (PublicApi as Record<string, unknown>).createHostAuthorizerPair,
+    undefined,
+    'Public package entry point src/index.ts must NOT export createHostAuthorizerPair.'
+  );
+
+  // 4. No privileged functions or factories exported
   assert.equal(
     (PublicApi as Record<string, unknown>).createTask,
     undefined,
@@ -58,12 +67,22 @@ test('Security Regression - Public API (src/index.ts) does NOT export privileged
     'Public package entry point src/index.ts must NOT export _authorizeSystem.'
   );
   assert.equal(
+    (PublicApi as Record<string, unknown>)._createTask,
+    undefined,
+    'Public package entry point src/index.ts must NOT export _createTask.'
+  );
+  assert.equal(
     (PublicApi as Record<string, unknown>).attestTaskScope,
     undefined,
     'Public package entry point src/index.ts must NOT export attestTaskScope.'
   );
+  assert.equal(
+    (PublicApi as Record<string, unknown>)._attestTaskScope,
+    undefined,
+    'Public package entry point src/index.ts must NOT export _attestTaskScope.'
+  );
 
-  // 4. MemoryAuthorizer IS exported as the unprivileged authorizer
+  // 5. MemoryAuthorizer IS exported as the unprivileged authorizer
   assert.equal(
     typeof PublicApi.MemoryAuthorizer,
     'function',
@@ -71,56 +90,53 @@ test('Security Regression - Public API (src/index.ts) does NOT export privileged
   );
 });
 
-test('Security Regression - Public MemoryAuthorizer fails closed on privileged operations', () => {
+test('Security Regression - Public MemoryAuthorizer with forged hostToken cannot acquire privileged capabilities', () => {
   const db = new DatabaseManager(':memory:');
   const taskRepo = new TaskRepository(db);
   const workspaceA: ScopeIdentifier = { scopeType: 'WORKSPACE', scopeId: 'ws-alpha' };
 
   try {
-    // Ordinary caller constructs unprivileged authorizer from public API
-    const publicAuthorizer = new PublicApi.MemoryAuthorizer({ taskRepo });
+    // Ordinary caller constructs unprivileged authorizer from public API, attempting to pass a forged hostToken
+    const publicAuthorizer = new PublicApi.MemoryAuthorizer({
+      taskRepo,
+      hostToken: 'forged-host-token-attempt'
+    } as any);
 
-    // 1. Attempting authorizeSystem fails closed with HOST_TOKEN_REQUIRED
+    // 1. Privileged methods DO NOT EXIST on the authorizer object (undefined at runtime)
+    assert.equal(typeof (publicAuthorizer as any).authorizeSystem, 'undefined');
+    assert.equal(typeof (publicAuthorizer as any)._authorizeSystem, 'undefined');
+    assert.equal(typeof (publicAuthorizer as any).createTask, 'undefined');
+    assert.equal(typeof (publicAuthorizer as any)._createTask, 'undefined');
+    assert.equal(typeof (publicAuthorizer as any).attestTaskScope, 'undefined');
+    assert.equal(typeof (publicAuthorizer as any)._attestTaskScope, 'undefined');
+
+    // 2. Attempting to invoke any privileged method throws TypeError (not a function)
     assert.throws(
-      () => publicAuthorizer.authorizeSystem({ scope: workspaceA }),
-      (err: unknown) => {
-        assert.ok(err instanceof SecurityViolationError);
-        assert.equal(err.violationType, 'HOST_TOKEN_REQUIRED');
-        return true;
-      }
+      () => (publicAuthorizer as any).authorizeSystem({ scope: workspaceA }),
+      (err: unknown) => err instanceof TypeError
+    );
+    assert.throws(
+      () => (publicAuthorizer as any)._authorizeSystem({ scope: workspaceA }),
+      (err: unknown) => err instanceof TypeError
+    );
+    assert.throws(
+      () => (publicAuthorizer as any).createTask(taskRepo, { goal: 'rogue task', scope: workspaceA }),
+      (err: unknown) => err instanceof TypeError
+    );
+    assert.throws(
+      () => (publicAuthorizer as any)._createTask(taskRepo, { goal: 'rogue task', scope: workspaceA }),
+      (err: unknown) => err instanceof TypeError
+    );
+    assert.throws(
+      () => (publicAuthorizer as any).attestTaskScope('rogue-id', workspaceA),
+      (err: unknown) => err instanceof TypeError
+    );
+    assert.throws(
+      () => (publicAuthorizer as any)._attestTaskScope('rogue-id', workspaceA),
+      (err: unknown) => err instanceof TypeError
     );
 
-    // 2. Attempting authorizeSystem with fake token fails closed
-    assert.throws(
-      () => publicAuthorizer.authorizeSystem({ scope: workspaceA }, {} as any),
-      (err: unknown) => {
-        assert.ok(err instanceof SecurityViolationError);
-        assert.equal(err.violationType, 'HOST_TOKEN_REQUIRED');
-        return true;
-      }
-    );
-
-    // 3. Attempting createTask on public authorizer fails closed
-    assert.throws(
-      () => publicAuthorizer.createTask(taskRepo, { goal: 'rogue task', scope: workspaceA }),
-      (err: unknown) => {
-        assert.ok(err instanceof SecurityViolationError);
-        assert.equal(err.violationType, 'HOST_TOKEN_REQUIRED');
-        return true;
-      }
-    );
-
-    // 4. Attempting attestTaskScope on public authorizer fails closed
-    assert.throws(
-      () => publicAuthorizer.attestTaskScope('rogue-id', workspaceA),
-      (err: unknown) => {
-        assert.ok(err instanceof SecurityViolationError);
-        assert.equal(err.violationType, 'HOST_TOKEN_REQUIRED');
-        return true;
-      }
-    );
-
-    // 5. User authorization without identity provider fails closed with MISSING_IDENTITY_INTEGRATION
+    // 3. User authorization without identity provider fails closed with MISSING_IDENTITY_INTEGRATION
     assert.throws(
       () => publicAuthorizer.authorizeUser({ credentials: 'some-token' }),
       (err: unknown) => {
@@ -130,10 +146,36 @@ test('Security Regression - Public MemoryAuthorizer fails closed on privileged o
       }
     );
 
-    // 6. Agent authorization without a real task fails closed with TaskNotFoundError
+    // 4. Agent authorization without a real task fails closed with TaskNotFoundError
     assert.throws(
       () => publicAuthorizer.authorizeAgent({ taskId: 'non-existent-task' }),
       (err: unknown) => err instanceof TaskNotFoundError
+    );
+
+    // 5. Attempting to pass a forged context to verify() fails closed
+    assert.throws(
+      () => publicAuthorizer.verify({
+        actor: 'SYSTEM',
+        scope: workspaceA,
+        permissions: new Set(['READ', 'WRITE', 'DELETE']),
+        _proof: { signature: 'forged-signature', nonce: 'forged-nonce' }
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof SecurityViolationError);
+        assert.equal(err.violationType, 'FORGED_CALLER_CONTEXT');
+        return true;
+      }
+    );
+
+    // 6. Attempting to verify a task created without host attestation fails closed
+    const forgedTask = taskRepo.createTask({
+      id: 'forged-task-1',
+      goal: 'Forged task lacking host attestation',
+      metadata: { scope: workspaceA }
+    });
+    assert.throws(
+      () => publicAuthorizer.verifyTaskScope(forgedTask),
+      (err: unknown) => err instanceof ValidationError
     );
   } finally {
     db.close();
@@ -205,22 +247,21 @@ test('Security - Internal HostMemoryAuthority successfully boots and establishes
     const verifiedSystemContext = authorizer.verify(systemContext);
     assert.equal(verifiedSystemContext, systemContext);
 
-    // 5. Calling privileged operations on the unprivileged authorizer property fails closed
+    // 5. Privileged operations DO NOT EXIST on the authorizer property
+    assert.equal(typeof (authorizer as any).authorizeSystem, 'undefined');
+    assert.equal(typeof (authorizer as any)._authorizeSystem, 'undefined');
+    assert.equal(typeof (authorizer as any).createTask, 'undefined');
+    assert.equal(typeof (authorizer as any)._createTask, 'undefined');
+    assert.equal(typeof (authorizer as any).attestTaskScope, 'undefined');
+    assert.equal(typeof (authorizer as any)._attestTaskScope, 'undefined');
+
     assert.throws(
-      () => authorizer.authorizeSystem({ scope: workspaceAlpha }),
-      (err: unknown) => {
-        assert.ok(err instanceof SecurityViolationError);
-        assert.equal(err.violationType, 'HOST_TOKEN_REQUIRED');
-        return true;
-      }
+      () => (authorizer as any).authorizeSystem({ scope: workspaceAlpha }),
+      (err: unknown) => err instanceof TypeError
     );
     assert.throws(
-      () => authorizer.createTask(taskRepo, { goal: 'unauthorized', scope: workspaceAlpha }),
-      (err: unknown) => {
-        assert.ok(err instanceof SecurityViolationError);
-        assert.equal(err.violationType, 'HOST_TOKEN_REQUIRED');
-        return true;
-      }
+      () => (authorizer as any).createTask(taskRepo, { goal: 'unauthorized', scope: workspaceAlpha }),
+      (err: unknown) => err instanceof TypeError
     );
 
     // 6. User authorization via IdentityProvider works with resolved principal and permitted scopes

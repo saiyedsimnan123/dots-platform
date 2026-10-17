@@ -1163,54 +1163,44 @@ test('MemoryAuthorizer - Untrusted caller cannot obtain ADMIN permissions, imper
     assert.equal(memberPerms.has('APPROVE'), false, 'MEMBER must not receive APPROVE permission');
     assert.equal(memberPerms.has('DELETE'), false, 'MEMBER must not receive DELETE permission');
 
-    // 4. Untrusted caller CANNOT mint system authority without a valid HostToken
+    // 4. Privileged methods DO NOT EXIST on unprivileged authorizer object
+    assert.equal(typeof (authorizer as any).authorizeSystem, 'undefined');
+    assert.equal(typeof (authorizer as any)._authorizeSystem, 'undefined');
+    assert.equal(typeof (authorizer as any).createTask, 'undefined');
+    assert.equal(typeof (authorizer as any)._createTask, 'undefined');
+    assert.equal(typeof (authorizer as any).attestTaskScope, 'undefined');
+    assert.equal(typeof (authorizer as any)._attestTaskScope, 'undefined');
+
+    // Attempting to invoke them directly throws TypeError
     assert.throws(
-      () => authorizer.authorizeSystem({ scope: workspaceA }),
-      (err: unknown) => {
-        assert.ok(err instanceof SecurityViolationError);
-        assert.equal(err.violationType, 'HOST_TOKEN_REQUIRED');
-        return true;
-      }
+      () => (authorizer as any).authorizeSystem({ scope: workspaceA }),
+      (err: unknown) => err instanceof TypeError
+    );
+    assert.throws(
+      () => (authorizer as any)._authorizeSystem({ scope: workspaceA }),
+      (err: unknown) => err instanceof TypeError
+    );
+    assert.throws(
+      () => (authorizer as any).createTask(taskRepo, { goal: 'unauthorized task', scope: workspaceA }),
+      (err: unknown) => err instanceof TypeError
+    );
+    assert.throws(
+      () => (authorizer as any).attestTaskScope('some-task-id', workspaceA),
+      (err: unknown) => err instanceof TypeError
     );
 
-    // Passing a fake/handcrafted host token is rejected
+    // 5. Caller cannot inject hostToken or acquire host capabilities through MemoryAuthorizer options
+    const forgedAuthorizer = new MemoryAuthorizer({
+      taskRepo,
+      hostToken: 'forged-token'
+    } as any);
+    assert.equal(typeof (forgedAuthorizer as any).authorizeSystem, 'undefined');
+    assert.equal(typeof (forgedAuthorizer as any)._authorizeSystem, 'undefined');
+    assert.equal(typeof (forgedAuthorizer as any).createTask, 'undefined');
+    assert.equal(typeof (forgedAuthorizer as any)._createTask, 'undefined');
     assert.throws(
-      () => authorizer.authorizeSystem({ scope: workspaceA }, {} as any),
-      (err: unknown) => {
-        assert.ok(err instanceof SecurityViolationError);
-        assert.equal(err.violationType, 'HOST_TOKEN_REQUIRED');
-        return true;
-      }
-    );
-
-    // Internal _authorizeSystem with fake token is also rejected
-    assert.throws(
-      () => (authorizer as any)._authorizeSystem({ scope: workspaceA }, {} as any),
-      (err: unknown) => {
-        assert.ok(err instanceof SecurityViolationError);
-        assert.equal(err.violationType, 'HOST_TOKEN_REQUIRED');
-        return true;
-      }
-    );
-
-    // 5. Untrusted caller CANNOT create a task without a valid HostToken
-    assert.throws(
-      () => authorizer.createTask(taskRepo, { goal: 'unauthorized task', scope: workspaceA }),
-      (err: unknown) => {
-        assert.ok(err instanceof SecurityViolationError);
-        assert.equal(err.violationType, 'HOST_TOKEN_REQUIRED');
-        return true;
-      }
-    );
-
-    // Untrusted caller CANNOT attest a task scope without a valid HostToken
-    assert.throws(
-      () => authorizer.attestTaskScope('some-task-id', workspaceA),
-      (err: unknown) => {
-        assert.ok(err instanceof SecurityViolationError);
-        assert.equal(err.violationType, 'HOST_TOKEN_REQUIRED');
-        return true;
-      }
+      () => (forgedAuthorizer as any).authorizeSystem({ scope: workspaceA }),
+      (err: unknown) => err instanceof TypeError
     );
 
     // 6. Authenticated user CANNOT access an unauthorized workspace

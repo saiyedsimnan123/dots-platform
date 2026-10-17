@@ -21,9 +21,11 @@
  *    isolated environments (e.g. separate processes, Docker/WASM sandboxes) outside the host Node.js runtime.
  * 3. Privileged host authority construction (HostMemoryAuthority) is isolated to the internal
  *    host bootstrap module (src/security/host-authority.ts) and is NOT exported from the public package
- *    entry point (src/index.ts). Ordinary callers and agents importing the package receive only the
- *    unprivileged MemoryAuthorizer, which cannot mint system authority or create tasks without an
- *    internal HostToken held exclusively by host initialization code.
+ *    entry point (src/index.ts).
+ * 4. The unprivileged MemoryAuthorizer has NO public capability parameter or token injection option,
+ *    and privileged operations (authorizeSystem, createTask, attestTaskScope) do not exist on the
+ *    authorizer object at all. Ordinary callers constructing MemoryAuthorizer cannot acquire
+ *    or invoke host capabilities.
  * 
  * Core Security Guarantees:
  * 1. Trusted Identity Provider Resolution:
@@ -34,10 +36,10 @@
  *      The principal, role, and permitted scopes are resolved strictly by the IdentityProvider
  *      from authenticated credentials.
  * 2. Privileged Host Capability Boundary:
- *    - Privileged host operations (authorizeSystem, createTask, attestTaskScope) require
- *      a process-private HostToken held exclusively by HostMemoryAuthority during host bootstrap.
+ *    - Privileged host operations (authorizeSystem, createTask, attestTaskScope) are closures
+ *      created exclusively during host bootstrap via createHostAuthorizerPair().
  *    - Untrusted callers, agents, and task payloads cannot mint system authority or create
- *      arbitrary tasks in unauthorized workspaces. Unprivileged authorizer instances fail closed.
+ *      arbitrary tasks in unauthorized workspaces. Privileged methods are inaccessible on authorizer instances.
  * 3. Automated Agent Scope & Permission Binding:
  *    - Agents must present an authoritative taskId. An agent's scope is derived strictly from
  *      the task's verified host cryptographic scope attestation.
@@ -71,6 +73,10 @@ const AGENT_PERMISSIONS: ReadonlySet<MemoryPermission> = new Set(['READ', 'WRITE
 const SYSTEM_PERMISSIONS: ReadonlySet<MemoryPermission> = new Set(['READ', 'WRITE', 'DELETE']);
 
 const VALID_SCOPES: ReadonlySet<MemoryScopeType> = new Set(['GLOBAL', 'WORKSPACE']);
+
+// Module-private symbol to distinguish host-bootstrap authorizer pairing from public constructor calls.
+// Strictly private to this module closure. NEVER exported.
+const HOST_BOOTSTRAP_SECRET = Symbol('dots.host.bootstrap.internal');
 
 /**
  * Represents an authenticated principal verified by the trusted identity provider.
@@ -129,33 +135,49 @@ export interface TaskScopeAttestation {
   readonly timestamp: string;
 }
 
-/**
- * Process-private capability token for trusted host initialization.
- * Only mintable by HostMemoryAuthority.
- */
-export class HostToken {
-  readonly #secret: symbol;
-  constructor(secret: symbol) {
-    this.#secret = secret;
-  }
-}
-
 export interface MemoryAuthorizerOptions {
   readonly hostSecret?: Buffer | string;
   readonly taskRepo?: TaskRepository;
   readonly identityProvider?: TrustedIdentityProvider;
-  /** Internal host capability token generated exclusively during host initialization */
-  readonly hostToken?: HostToken;
 }
 
+/**
+ * Validates memory scope type and scopeId consistency.
+ */
+function validateScope(scopeType: MemoryScopeType, scopeId: string): void {
+  if (!VALID_SCOPES.has(scopeType)) {
+    throw new ValidationError(
+      `Invalid scopeType '${String(scopeType)}'. Must be 'GLOBAL' or 'WORKSPACE'.`
+    );
+  }
+  if (typeof scopeId !== 'string' || scopeId.trim() === '') {
+    throw new ValidationError('scopeId must be a non-empty string.');
+  }
+  if (scopeType === 'GLOBAL' && scopeId !== 'default') {
+    throw new ValidationError(`Global scope must have scopeId 'default', received '${scopeId}'.`);
+  }
+}
+
+/**
+ * Unprivileged Memory Authorizer.
+ * 
+ * Safe for distribution to callers, services, and context verifiers.
+ * Contains only unprivileged methods for user authorization, agent authorization,
+ * context verification, and task scope verification.
+ * 
+ * Privileged operations (authorizeSystem, createTask, attestTaskScope) DO NOT EXIST
+ * on this class and cannot be acquired or injected by ordinary callers.
+ */
 export class MemoryAuthorizer {
   private readonly hostSecret: Buffer;
   private readonly taskRepo?: TaskRepository;
   private readonly identityProvider?: TrustedIdentityProvider;
-  readonly #hostToken?: HostToken;
-  private readonly issuedContexts: WeakSet<object> = new WeakSet();
+  private readonly issuedContexts: WeakSet<object>;
 
-  constructor(options: MemoryAuthorizerOptions = {}) {
+  constructor(
+    options: MemoryAuthorizerOptions = {},
+    internalInit?: { readonly secret: symbol; readonly issuedContexts: WeakSet<object> }
+  ) {
     if (options.hostSecret) {
       this.hostSecret = typeof options.hostSecret === 'string'
         ? Buffer.from(options.hostSecret, 'hex')
@@ -165,7 +187,13 @@ export class MemoryAuthorizer {
     }
     this.taskRepo = options.taskRepo;
     this.identityProvider = options.identityProvider;
-    this.#hostToken = options.hostToken;
+
+    // Use host-paired issuedContexts set if created via trusted host bootstrap; otherwise isolate
+    if (internalInit && internalInit.secret === HOST_BOOTSTRAP_SECRET) {
+      this.issuedContexts = internalInit.issuedContexts;
+    } else {
+      this.issuedContexts = new WeakSet();
+    }
   }
 
   // --- Trusted Identity & Policy Resolution ---
@@ -219,7 +247,7 @@ export class MemoryAuthorizer {
 
     let scope: ScopeIdentifier;
     if (input.requestedScope) {
-      this.validateScope(input.requestedScope.scopeType, input.requestedScope.scopeId);
+      validateScope(input.requestedScope.scopeType, input.requestedScope.scopeId);
       const isAllowed = principal.permittedScopes?.some(
         (s) => s.scopeType === input.requestedScope!.scopeType && s.scopeId === input.requestedScope!.scopeId
       );
@@ -309,108 +337,7 @@ export class MemoryAuthorizer {
     });
   }
 
-  /**
-   * Internal host capability for system authorization.
-   * Requires a valid HostToken held strictly by HostMemoryAuthority during host bootstrap.
-   * @internal
-   */
-  public _authorizeSystem(input: AuthorizeSystemInput, hostToken?: HostToken): CallerContext {
-    this.assertHostToken(hostToken, 'authorizeSystem');
-    if (!input || typeof input !== 'object') {
-      throw new ValidationError('AuthorizeSystemInput must be an object.');
-    }
-    this.validateScope(input.scope.scopeType, input.scope.scopeId);
-
-    return this.sealContext({
-      actor: 'SYSTEM',
-      scope: input.scope,
-      permissions: SYSTEM_PERMISSIONS,
-      taskId: input.taskId
-    });
-  }
-
-  /**
-   * Fail-closed trap for unauthorized direct calls to authorizeSystem on unprivileged authorizers.
-   * Unprivileged MemoryAuthorizer instances cannot mint system authority.
-   */
-  public authorizeSystem(input?: unknown, hostToken?: unknown): never {
-    throw new SecurityViolationError(
-      'Privileged host operation \'authorizeSystem\' requires a valid HostToken from trusted host initialization code.',
-      'HOST_TOKEN_REQUIRED'
-    );
-  }
-
-  // --- Task Scope Attestation & Verification ---
-
-  /**
-   * Internal host capability for creating a task with cryptographic scope attestation.
-   * Requires a valid HostToken held strictly by HostMemoryAuthority during host bootstrap.
-   * @internal
-   */
-  public _createTask(taskRepo: TaskRepository, input: CreateTaskWithScopeInput, hostToken?: HostToken): Task {
-    this.assertHostToken(hostToken, 'createTask');
-    if (!input.goal || input.goal.trim() === '') {
-      throw new ValidationError('Task goal must not be empty.');
-    }
-    this.validateScope(input.scope.scopeType, input.scope.scopeId);
-
-    // If an ID is provided, use it; otherwise generate a UUID
-    const id = input.id ?? randomBytes(16).toString('hex');
-    const attestation = this._attestTaskScope(id, input.scope, hostToken);
-
-    const metadata = {
-      ...(input.metadata ?? {}),
-      _scopeAttestation: attestation
-    };
-
-    return taskRepo.createTask({
-      id,
-      goal: input.goal.trim(),
-      metadata
-    });
-  }
-
-  /**
-   * Fail-closed trap for unauthorized direct calls to createTask on unprivileged authorizers.
-   * Unprivileged MemoryAuthorizer instances cannot create tasks.
-   */
-  public createTask(taskRepo?: unknown, input?: unknown, hostToken?: unknown): never {
-    throw new SecurityViolationError(
-      'Privileged host operation \'createTask\' requires a valid HostToken from trusted host initialization code.',
-      'HOST_TOKEN_REQUIRED'
-    );
-  }
-
-  /**
-   * Internal host capability for generating a cryptographic host scope attestation for a task ID.
-   * Requires a valid HostToken held strictly by HostMemoryAuthority during host bootstrap.
-   * @internal
-   */
-  public _attestTaskScope(taskId: string, scope: ScopeIdentifier, hostToken?: HostToken): TaskScopeAttestation {
-    this.assertHostToken(hostToken, 'attestTaskScope');
-    this.validateScope(scope.scopeType, scope.scopeId);
-    const timestamp = new Date().toISOString();
-    const payload = `TASK_SCOPE|${taskId}|${scope.scopeType}|${scope.scopeId}|${timestamp}`;
-    const signature = createHmac('sha256', this.hostSecret).update(payload, 'utf8').digest('hex');
-
-    return {
-      scopeType: scope.scopeType,
-      scopeId: scope.scopeId,
-      signature,
-      timestamp
-    };
-  }
-
-  /**
-   * Fail-closed trap for unauthorized direct calls to attestTaskScope on unprivileged authorizers.
-   * Unprivileged MemoryAuthorizer instances cannot generate host scope attestations.
-   */
-  public attestTaskScope(taskId?: unknown, scope?: unknown, hostToken?: unknown): never {
-    throw new SecurityViolationError(
-      'Privileged host operation \'attestTaskScope\' requires a valid HostToken from trusted host initialization code.',
-      'HOST_TOKEN_REQUIRED'
-    );
-  }
+  // --- Task Scope Attestation Verification ---
 
   /**
    * Verifies the cryptographic host scope attestation on a task.
@@ -439,7 +366,7 @@ export class MemoryAuthorizer {
       );
     }
 
-    this.validateScope(attestation.scopeType, attestation.scopeId);
+    validateScope(attestation.scopeType, attestation.scopeId);
 
     const payload = `TASK_SCOPE|${task.id}|${attestation.scopeType}|${attestation.scopeId}|${attestation.timestamp}`;
     const expectedSig = createHmac('sha256', this.hostSecret).update(payload, 'utf8').digest('hex');
@@ -527,15 +454,6 @@ export class MemoryAuthorizer {
 
   // --- Private Helpers ---
 
-  private assertHostToken(token: unknown, operation: string): void {
-    if (!this.#hostToken || !token || token !== this.#hostToken) {
-      throw new SecurityViolationError(
-        `Privileged host operation '${operation}' requires a valid HostToken from trusted host initialization code.`,
-        'HOST_TOKEN_REQUIRED'
-      );
-    }
-  }
-
   private sealContext(params: {
     readonly actor: MemoryActor;
     readonly scope: ScopeIdentifier;
@@ -580,19 +498,110 @@ export class MemoryAuthorizer {
     const payload = `${actor}|${scope.scopeType}|${scope.scopeId}|${sortedPerms}|${taskId ?? ''}|${nonce}`;
     return createHmac('sha256', this.hostSecret).update(payload, 'utf8').digest('hex');
   }
-
-  private validateScope(scopeType: MemoryScopeType, scopeId: string): void {
-    if (!VALID_SCOPES.has(scopeType)) {
-      throw new ValidationError(
-        `Invalid scopeType '${String(scopeType)}'. Must be 'GLOBAL' or 'WORKSPACE'.`
-      );
-    }
-    if (typeof scopeId !== 'string' || scopeId.trim() === '') {
-      throw new ValidationError('scopeId must be a non-empty string.');
-    }
-    if (scopeType === 'GLOBAL' && scopeId !== 'default') {
-      throw new ValidationError(`Global scope must have scopeId 'default', received '${scopeId}'.`);
-    }
-  }
 }
 
+/**
+ * Privileged Host Operations interface provided exclusively to HostMemoryAuthority.
+ * Never exported by the public package entry point.
+ */
+export interface HostPrivilegedOperations {
+  readonly authorizer: MemoryAuthorizer;
+  createTask(taskRepo: TaskRepository, input: CreateTaskWithScopeInput): Task;
+  authorizeSystem(input: AuthorizeSystemInput): CallerContext;
+  attestTaskScope(taskId: string, scope: ScopeIdentifier): TaskScopeAttestation;
+}
+
+/**
+ * Trusted Host Bootstrap Factory.
+ * 
+ * Creates an unprivileged MemoryAuthorizer instance paired with privileged host operations.
+ * Uses a module-private closure with a shared issuedContexts WeakSet and hostSecret.
+ * Ordinary callers constructing MemoryAuthorizer via its public constructor cannot acquire
+ * or invoke this capability.
+ * 
+ * Strictly internal to host bootstrap (src/security/host-authority.ts).
+ * Never exported by the public package entry point (src/index.ts).
+ */
+export function createHostAuthorizerPair(options: MemoryAuthorizerOptions = {}): HostPrivilegedOperations {
+  const hostSecret = options.hostSecret
+    ? (typeof options.hostSecret === 'string' ? Buffer.from(options.hostSecret, 'hex') : options.hostSecret)
+    : randomBytes(32);
+
+  const issuedContexts = new WeakSet<object>();
+
+  const authorizer = new MemoryAuthorizer(
+    { ...options, hostSecret },
+    { secret: HOST_BOOTSTRAP_SECRET, issuedContexts }
+  );
+
+  function attestTaskScope(taskId: string, scope: ScopeIdentifier): TaskScopeAttestation {
+    validateScope(scope.scopeType, scope.scopeId);
+    const timestamp = new Date().toISOString();
+    const payload = `TASK_SCOPE|${taskId}|${scope.scopeType}|${scope.scopeId}|${timestamp}`;
+    const signature = createHmac('sha256', hostSecret).update(payload, 'utf8').digest('hex');
+
+    return {
+      scopeType: scope.scopeType,
+      scopeId: scope.scopeId,
+      signature,
+      timestamp
+    };
+  }
+
+  function createTask(taskRepo: TaskRepository, input: CreateTaskWithScopeInput): Task {
+    if (!input.goal || input.goal.trim() === '') {
+      throw new ValidationError('Task goal must not be empty.');
+    }
+    validateScope(input.scope.scopeType, input.scope.scopeId);
+
+    const id = input.id ?? randomBytes(16).toString('hex');
+    const attestation = attestTaskScope(id, input.scope);
+
+    const metadata = {
+      ...(input.metadata ?? {}),
+      _scopeAttestation: attestation
+    };
+
+    return taskRepo.createTask({
+      id,
+      goal: input.goal.trim(),
+      metadata
+    });
+  }
+
+  function authorizeSystem(input: AuthorizeSystemInput): CallerContext {
+    if (!input || typeof input !== 'object') {
+      throw new ValidationError('AuthorizeSystemInput must be an object.');
+    }
+    validateScope(input.scope.scopeType, input.scope.scopeId);
+
+    const nonce = randomBytes(16).toString('hex');
+    const sortedPerms = Array.from(SYSTEM_PERMISSIONS).sort().join(',');
+    const payload = `SYSTEM|${input.scope.scopeType}|${input.scope.scopeId}|${sortedPerms}|${input.taskId ?? ''}|${nonce}`;
+    const signature = createHmac('sha256', hostSecret).update(payload, 'utf8').digest('hex');
+
+    const context: CallerContext = Object.freeze({
+      actor: 'SYSTEM',
+      scope: Object.freeze({
+        scopeType: input.scope.scopeType,
+        scopeId: input.scope.scopeId
+      }),
+      permissions: Object.freeze(new Set(SYSTEM_PERMISSIONS)),
+      taskId: input.taskId,
+      _proof: Object.freeze({
+        signature,
+        nonce
+      })
+    });
+
+    issuedContexts.add(context);
+    return context;
+  }
+
+  return {
+    authorizer,
+    createTask,
+    authorizeSystem,
+    attestTaskScope
+  };
+}
