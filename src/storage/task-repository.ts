@@ -100,7 +100,7 @@ interface ApprovalDbRow {
 }
 
 export class TaskRepository {
-  private readonly db: DatabaseManager;
+  public readonly db: DatabaseManager;
 
   constructor(db: DatabaseManager) {
     this.db = db;

@@ -78,7 +78,7 @@ const VALID_STATUSES: ReadonlySet<MemoryStatus> = new Set([
 ]);
 
 export class MemoryRepository {
-  private readonly db: DatabaseManager;
+  public readonly db: DatabaseManager;
 
   constructor(db: DatabaseManager) {
     this.db = db;

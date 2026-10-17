@@ -23,7 +23,7 @@ interface AuditDbRow {
 }
 
 export class AuditRepository {
-  private readonly db: DatabaseManager;
+  public readonly db: DatabaseManager;
 
   constructor(db: DatabaseManager) {
     this.db = db;

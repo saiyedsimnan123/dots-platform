@@ -63,7 +63,7 @@ import type { AuditRepository } from '../storage/audit-repository.ts';
 import type { TaskRepository } from '../storage/task-repository.ts';
 import { RelevanceMatcher } from './relevance-matcher.ts';
 import { MemoryContextBuilder } from './context-builder.ts';
-import { MemoryAuthorizer } from '../security/memory-authorizer.ts';
+import { MemoryAuthorizer, HostMemoryAuthority } from '../security/memory-authorizer.ts';
 
 const VALID_SCOPES: ReadonlySet<MemoryScopeType> = new Set([
   'GLOBAL',
@@ -75,8 +75,11 @@ export interface MemoryServiceOptions {
   readonly auditRepo?: AuditRepository;
   readonly taskRepo?: TaskRepository;
   readonly authorizer?: MemoryAuthorizer;
+  readonly hostAuthority?: HostMemoryAuthority;
   readonly relevanceMatcher?: RelevanceMatcher;
   readonly contextBuilder?: MemoryContextBuilder;
+  /** Internal hook for testing transactional failure after audit append */
+  readonly _testPostAuditHook?: () => void;
 }
 
 export class MemoryService {
@@ -84,8 +87,10 @@ export class MemoryService {
   private readonly auditRepo?: AuditRepository;
   private readonly taskRepo?: TaskRepository;
   readonly #authorizer: MemoryAuthorizer;
+  readonly #hostAuthority?: HostMemoryAuthority;
   private readonly relevanceMatcher: RelevanceMatcher;
   private readonly contextBuilder: MemoryContextBuilder;
+  private readonly _testPostAuditHook?: () => void;
   private systemTaskId?: string;
 
   constructor(options: MemoryServiceOptions) {
@@ -96,10 +101,27 @@ export class MemoryService {
       throw new ValidationError('MemoryRepository must be provided to MemoryService.');
     }
 
+    // Transaction boundary invariant: AuditRepository must share the exact same DatabaseManager
+    // instance as MemoryRepository to guarantee two-way atomic rollback for memory audit events.
+    if (options.auditRepo && options.auditRepo.db !== options.memoryRepo.db) {
+      throw new ValidationError(
+        'MemoryRepository and AuditRepository must share the exact same DatabaseManager instance to guarantee transactional atomicity.'
+      );
+    }
+
+    // TaskRepository must also share the same DatabaseManager if provided.
+    if (options.taskRepo && options.taskRepo.db !== options.memoryRepo.db) {
+      throw new ValidationError(
+        'MemoryRepository and TaskRepository must share the exact same DatabaseManager instance.'
+      );
+    }
+
     this.memoryRepo = options.memoryRepo;
     this.auditRepo = options.auditRepo;
     this.taskRepo = options.taskRepo;
-    this.#authorizer = options.authorizer ?? new MemoryAuthorizer({ taskRepo: options.taskRepo });
+    this.#authorizer = options.authorizer ?? options.hostAuthority?.authorizer ?? new MemoryAuthorizer({ taskRepo: options.taskRepo });
+    this.#hostAuthority = options.hostAuthority;
+    this._testPostAuditHook = options._testPostAuditHook;
     this.relevanceMatcher = options.relevanceMatcher ?? new RelevanceMatcher();
     this.contextBuilder = options.contextBuilder ?? new MemoryContextBuilder({ matcher: this.relevanceMatcher });
   }
@@ -245,6 +267,10 @@ export class MemoryService {
           status: 'PENDING_APPROVAL',
           proposedBy: caller.actor
         }, true);
+      }
+
+      if (this._testPostAuditHook) {
+        this._testPostAuditHook();
       }
 
       return memory;
@@ -1000,13 +1026,16 @@ export class MemoryService {
         this.systemTaskId = existing.id;
         return this.systemTaskId;
       }
-      const created = this.#authorizer.createTask(this.taskRepo, {
-        id: '__system_memory__',
-        goal: 'System long-term memory operations',
-        scope: { scopeType: 'GLOBAL', scopeId: 'default' }
-      });
-      this.systemTaskId = created.id;
-      return this.systemTaskId;
+      if (this.#hostAuthority) {
+        const created = this.#hostAuthority.createTask(this.taskRepo, {
+          id: '__system_memory__',
+          goal: 'System long-term memory operations',
+          scope: { scopeType: 'GLOBAL', scopeId: 'default' }
+        });
+        this.systemTaskId = created.id;
+        return this.systemTaskId;
+      }
+      return null;
     } catch {
       return null;
     }

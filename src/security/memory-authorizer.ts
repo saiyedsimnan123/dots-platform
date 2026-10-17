@@ -1,33 +1,32 @@
 /**
  * Next-Generation Dots AI Platform - Memory Authorization Boundary
- * Phase 7.3: Security Hardening
+ * Phase 7.3: Security Hardening & Trusted Identity Boundary
  * 
  * Architectural Mandate:
  * Implements a host-controlled authorization boundary for memory operations.
- * Permissions and scopes are derived strictly from trusted identity and host policy,
- * NOT accepted from untrusted caller claims.
+ * Permissions, identities, and scopes are derived strictly from trusted identity providers
+ * and process-private host policies, NOT accepted from untrusted caller claims.
  * 
  * Core Security Guarantees:
- * 1. Role-Based Policy Resolution:
- *    - Human users must provide a verified identity and role (ADMIN, MEMBER, VIEWER).
- *      Permissions are determined by host policy, never caller-selected.
- *    - Automated agents must present an authoritative task ID. The agent's scope is
- *      strictly derived from the task's verified host scope attestation, and its
- *      permissions are permanently locked by policy to READ and WRITE (never APPROVE or DELETE).
- * 2. Trusted Task Scope Origin:
- *    - Task scope is cryptographically attested by the host authorizer at task creation time.
- *      Arbitrary caller-supplied task metadata without valid host cryptographic attestation
- *      is rejected as untrusted, preventing scope spoofing through task creation.
- * 3. Cryptographic Context Sealing:
- *    - Each issued CallerContext is stamped with an HMAC-SHA256 signature computed using
- *      a process-private host secret over actor, scope, permissions, taskId, and a nonce.
- *    - Verified via private WeakSet containment and constant-time HMAC verification.
- * 
- * Documented Architectural Limitation:
- * In a single Node.js runtime process sharing the same JavaScript heap, this cryptographic
- * and WeakSet boundary ensures that untrusted logic cannot fabricate valid contexts,
- * elevate permissions, or select unauthorized workspaces. Full security isolation against
- * hostile code execution requires executing agent code in separated sandboxed worker processes.
+ * 1. Trusted Identity Provider Resolution:
+ *    - Human user authorization requires a configured TrustedIdentityProvider.
+ *    - If authentication is not implemented or configured on the host authorizer,
+ *      it explicitly fails closed with MISSING_IDENTITY_INTEGRATION.
+ *    - Untrusted callers cannot pass self-assigned userId, role, or unauthorized scopes.
+ *      The principal, role, and permitted scopes are resolved strictly by the IdentityProvider
+ *      from authenticated credentials.
+ * 2. Privileged Host Capability Boundary:
+ *    - Privileged host operations (authorizeSystem, createTask, attestTaskScope) require
+ *      a process-private HostToken held exclusively by HostMemoryAuthority during host bootstrap.
+ *    - Untrusted callers, agents, and task payloads cannot mint system authority or create
+ *      arbitrary tasks in unauthorized workspaces.
+ * 3. Automated Agent Scope & Permission Binding:
+ *    - Agents must present an authoritative taskId. An agent's scope is derived strictly from
+ *      the task's verified host cryptographic scope attestation.
+ *    - Agent permissions are permanently locked by host policy to READ and WRITE (never APPROVE or DELETE).
+ * 4. Cryptographic Context & Task Attestation Sealing:
+ *    - Each issued CallerContext and task scope is stamped with an HMAC-SHA256 signature computed
+ *      using a process-private host secret. Verified via private WeakSet containment and constant-time HMAC.
  */
 
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
@@ -55,10 +54,37 @@ const SYSTEM_PERMISSIONS: ReadonlySet<MemoryPermission> = new Set(['READ', 'WRIT
 
 const VALID_SCOPES: ReadonlySet<MemoryScopeType> = new Set(['GLOBAL', 'WORKSPACE']);
 
-export interface AuthorizeUserInput {
-  readonly userId: string;
+/**
+ * Represents an authenticated principal verified by the trusted identity provider.
+ */
+export interface AuthenticatedPrincipal {
+  readonly principalId: string;
   readonly role: UserRole;
-  readonly scope: ScopeIdentifier;
+  readonly permittedScopes: readonly ScopeIdentifier[];
+}
+
+/**
+ * Trusted Identity Provider contract.
+ * Resolves an authenticated principal, assigned role, and permitted workspaces from caller credentials.
+ */
+export interface TrustedIdentityProvider {
+  authenticate(credentials: unknown): AuthenticatedPrincipal | null;
+}
+
+export interface AuthorizeUserInput {
+  /**
+   * Authentication credentials (e.g. session token, bearer token, API credential)
+   * passed to the trusted identity provider to resolve identity and role.
+   */
+  readonly credentials?: unknown;
+  /**
+   * Requested scope for the operation. Must match one of the principal's permitted scopes.
+   * If omitted and the principal has exactly one permitted scope, defaults to that scope.
+   */
+  readonly requestedScope?: ScopeIdentifier;
+  /**
+   * Optional associated task ID. If supplied, the task's verified scope must match the authorized scope.
+   */
   readonly taskId?: string;
 }
 
@@ -85,14 +111,30 @@ export interface TaskScopeAttestation {
   readonly timestamp: string;
 }
 
+/**
+ * Process-private capability token for trusted host initialization.
+ * Only mintable by HostMemoryAuthority.
+ */
+export class HostToken {
+  readonly #secret: symbol;
+  constructor(secret: symbol) {
+    this.#secret = secret;
+  }
+}
+
 export interface MemoryAuthorizerOptions {
   readonly hostSecret?: Buffer | string;
   readonly taskRepo?: TaskRepository;
+  readonly identityProvider?: TrustedIdentityProvider;
+  /** Internal host capability token generated exclusively during host initialization */
+  readonly hostToken?: HostToken;
 }
 
 export class MemoryAuthorizer {
   private readonly hostSecret: Buffer;
   private readonly taskRepo?: TaskRepository;
+  private readonly identityProvider?: TrustedIdentityProvider;
+  readonly #hostToken?: HostToken;
   private readonly issuedContexts: WeakSet<object> = new WeakSet();
 
   constructor(options: MemoryAuthorizerOptions = {}) {
@@ -104,29 +146,87 @@ export class MemoryAuthorizer {
       this.hostSecret = randomBytes(32);
     }
     this.taskRepo = options.taskRepo;
+    this.identityProvider = options.identityProvider;
+    this.#hostToken = options.hostToken;
   }
 
   // --- Trusted Identity & Policy Resolution ---
 
   /**
-   * Authorizes a human user based on verified user identity and role.
-   * Permissions are derived strictly by host policy from the assigned role.
+   * Authorizes a human user.
+   * Resolves the authoritative principal, role, and permitted scope via the trusted IdentityProvider.
+   * Callers cannot supply their own userId, role, or arbitrary scope.
+   * Fails closed if the identity provider is missing or if credentials are invalid.
    */
   public authorizeUser(input: AuthorizeUserInput): CallerContext {
     if (!input || typeof input !== 'object') {
       throw new ValidationError('AuthorizeUserInput must be an object.');
     }
-    if (!input.userId || typeof input.userId !== 'string' || input.userId.trim() === '') {
-      throw new ValidationError('User ID must be provided.');
-    }
-    if (!input.role || !ROLE_PERMISSIONS_USER[input.role]) {
-      throw new ValidationError(`Invalid user role: ${String(input.role)}`);
-    }
-    if (!input.scope || typeof input.scope !== 'object') {
-      throw new ValidationError('Caller scope must be provided.');
+
+    if (!this.identityProvider) {
+      throw new SecurityViolationError(
+        'Authentication integration is not implemented or not configured on host authorizer. Trusted identity cannot be verified.',
+        'MISSING_IDENTITY_INTEGRATION'
+      );
     }
 
-    this.validateScope(input.scope.scopeType, input.scope.scopeId);
+    if (input.credentials === undefined || input.credentials === null) {
+      throw new SecurityViolationError(
+        'Authentication credentials are required to authorize a user.',
+        'UNAUTHENTICATED'
+      );
+    }
+
+    const principal = this.identityProvider.authenticate(input.credentials);
+    if (!principal) {
+      throw new SecurityViolationError(
+        'Invalid or unverified authentication credentials.',
+        'UNAUTHENTICATED'
+      );
+    }
+
+    if (!principal.principalId || typeof principal.principalId !== 'string' || principal.principalId.trim() === '') {
+      throw new SecurityViolationError(
+        'Identity provider returned principal with invalid principalId.',
+        'INVALID_PRINCIPAL'
+      );
+    }
+
+    if (!principal.role || !ROLE_PERMISSIONS_USER[principal.role]) {
+      throw new SecurityViolationError(
+        `Identity provider returned principal '${principal.principalId}' with invalid role: ${String(principal.role)}.`,
+        'INVALID_ROLE'
+      );
+    }
+
+    let scope: ScopeIdentifier;
+    if (input.requestedScope) {
+      this.validateScope(input.requestedScope.scopeType, input.requestedScope.scopeId);
+      const isAllowed = principal.permittedScopes?.some(
+        (s) => s.scopeType === input.requestedScope!.scopeType && s.scopeId === input.requestedScope!.scopeId
+      );
+      if (!isAllowed) {
+        throw new SecurityViolationError(
+          `Principal '${principal.principalId}' is not authorized to access scope '${input.requestedScope.scopeType}:${input.requestedScope.scopeId}'.`,
+          'UNAUTHORIZED_WORKSPACE'
+        );
+      }
+      scope = input.requestedScope;
+    } else {
+      if (!principal.permittedScopes || principal.permittedScopes.length === 0) {
+        throw new SecurityViolationError(
+          `Principal '${principal.principalId}' has no permitted scopes assigned.`,
+          'UNAUTHORIZED_WORKSPACE'
+        );
+      }
+      if (principal.permittedScopes.length === 1) {
+        scope = principal.permittedScopes[0]!;
+      } else {
+        throw new ValidationError(
+          'Principal has multiple permitted scopes; requestedScope must be explicitly specified.'
+        );
+      }
+    }
 
     // If a taskId is associated, verify the task exists and scope matches
     if (input.taskId && this.taskRepo) {
@@ -136,21 +236,21 @@ export class MemoryAuthorizer {
       }
       const taskScope = this.verifyTaskScope(task);
       if (
-        taskScope.scopeType !== input.scope.scopeType ||
-        taskScope.scopeId !== input.scope.scopeId
+        taskScope.scopeType !== scope.scopeType ||
+        taskScope.scopeId !== scope.scopeId
       ) {
         throw new SecurityViolationError(
-          `User scope '${input.scope.scopeType}:${input.scope.scopeId}' does not match task scope '${taskScope.scopeType}:${taskScope.scopeId}'.`,
+          `User scope '${scope.scopeType}:${scope.scopeId}' does not match task scope '${taskScope.scopeType}:${taskScope.scopeId}'.`,
           'TASK_CALLER_SCOPE_MISMATCH'
         );
       }
     }
 
-    const permissions = ROLE_PERMISSIONS_USER[input.role];
+    const permissions = ROLE_PERMISSIONS_USER[principal.role];
 
     return this.sealContext({
       actor: 'USER',
-      scope: input.scope,
+      scope,
       permissions,
       taskId: input.taskId
     });
@@ -193,8 +293,10 @@ export class MemoryAuthorizer {
 
   /**
    * Authorizes an internal system operation.
+   * Requires a verified HostToken held only by trusted host initialization code.
    */
-  public authorizeSystem(input: AuthorizeSystemInput): CallerContext {
+  public authorizeSystem(input: AuthorizeSystemInput, hostToken?: HostToken): CallerContext {
+    this.assertHostToken(hostToken, 'authorizeSystem');
     if (!input || typeof input !== 'object') {
       throw new ValidationError('AuthorizeSystemInput must be an object.');
     }
@@ -213,8 +315,10 @@ export class MemoryAuthorizer {
   /**
    * Creates a new task with a cryptographically signed host scope attestation.
    * Establishes a verified scope origin at task creation time.
+   * Requires a verified HostToken held only by trusted host initialization code.
    */
-  public createTask(taskRepo: TaskRepository, input: CreateTaskWithScopeInput): Task {
+  public createTask(taskRepo: TaskRepository, input: CreateTaskWithScopeInput, hostToken?: HostToken): Task {
+    this.assertHostToken(hostToken, 'createTask');
     if (!input.goal || input.goal.trim() === '') {
       throw new ValidationError('Task goal must not be empty.');
     }
@@ -222,7 +326,7 @@ export class MemoryAuthorizer {
 
     // If an ID is provided, use it; otherwise generate a UUID
     const id = input.id ?? randomBytes(16).toString('hex');
-    const attestation = this.attestTaskScope(id, input.scope);
+    const attestation = this.attestTaskScope(id, input.scope, hostToken);
 
     const metadata = {
       ...(input.metadata ?? {}),
@@ -238,8 +342,10 @@ export class MemoryAuthorizer {
 
   /**
    * Generates a cryptographic host scope attestation for a task ID.
+   * Requires a verified HostToken held only by trusted host initialization code.
    */
-  public attestTaskScope(taskId: string, scope: ScopeIdentifier): TaskScopeAttestation {
+  public attestTaskScope(taskId: string, scope: ScopeIdentifier, hostToken?: HostToken): TaskScopeAttestation {
+    this.assertHostToken(hostToken, 'attestTaskScope');
     this.validateScope(scope.scopeType, scope.scopeId);
     const timestamp = new Date().toISOString();
     const payload = `TASK_SCOPE|${taskId}|${scope.scopeType}|${scope.scopeId}|${timestamp}`;
@@ -368,6 +474,15 @@ export class MemoryAuthorizer {
 
   // --- Private Helpers ---
 
+  private assertHostToken(token: unknown, operation: string): void {
+    if (!this.#hostToken || !token || token !== this.#hostToken) {
+      throw new SecurityViolationError(
+        `Privileged host operation '${operation}' requires a valid HostToken from trusted host initialization code.`,
+        'HOST_TOKEN_REQUIRED'
+      );
+    }
+  }
+
   private sealContext(params: {
     readonly actor: MemoryActor;
     readonly scope: ScopeIdentifier;
@@ -425,5 +540,58 @@ export class MemoryAuthorizer {
     if (scopeType === 'GLOBAL' && scopeId !== 'default') {
       throw new ValidationError(`Global scope must have scopeId 'default', received '${scopeId}'.`);
     }
+  }
+}
+
+export interface HostMemoryAuthorityOptions extends Omit<MemoryAuthorizerOptions, 'hostToken'> {}
+
+/**
+ * Privileged Host Authorization Control Plane.
+ * 
+ * Held strictly by trusted host initialization and orchestration bootstrap code.
+ * Encapsulates the process-private HostToken and exposes privileged operations:
+ * - createTask (creates tasks with verified host scope attestations)
+ * - authorizeSystem (issues system-level CallerContext)
+ * - attestTaskScope (generates cryptographic scope attestations)
+ * 
+ * The unprivileged authorizer property may be passed safely to untrusted callers,
+ * services, and agents without granting them access to privileged operations.
+ */
+export class HostMemoryAuthority {
+  readonly #authorizer: MemoryAuthorizer;
+  readonly #hostToken: HostToken;
+
+  constructor(options: HostMemoryAuthorityOptions = {}) {
+    const hostToken = new HostToken(Symbol('host.capability'));
+    this.#hostToken = hostToken;
+    this.#authorizer = new MemoryAuthorizer({ ...options, hostToken });
+  }
+
+  /**
+   * Returns the unprivileged MemoryAuthorizer instance for caller/agent context verification.
+   */
+  public get authorizer(): MemoryAuthorizer {
+    return this.#authorizer;
+  }
+
+  /**
+   * Privileged host operation: creates an attested task in designated workspace.
+   */
+  public createTask(taskRepo: TaskRepository, input: CreateTaskWithScopeInput): Task {
+    return this.#authorizer.createTask(taskRepo, input, this.#hostToken);
+  }
+
+  /**
+   * Privileged host operation: authorizes an internal system operation.
+   */
+  public authorizeSystem(input: AuthorizeSystemInput): CallerContext {
+    return this.#authorizer.authorizeSystem(input, this.#hostToken);
+  }
+
+  /**
+   * Privileged host operation: generates a scope attestation.
+   */
+  public attestTaskScope(taskId: string, scope: ScopeIdentifier): TaskScopeAttestation {
+    return this.#authorizer.attestTaskScope(taskId, scope, this.#hostToken);
   }
 }
