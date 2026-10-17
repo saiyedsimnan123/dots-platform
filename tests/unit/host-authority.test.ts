@@ -5,13 +5,15 @@
  * Verifies:
  * 1. Public API boundary: src/index.ts does NOT export HostMemoryAuthority, HostToken,
  *    createHostAuthorizerPair, or privileged factories.
- * 2. Unprivileged MemoryAuthorizer: Callers constructing ordinary MemoryAuthorizer (even with
+ * 2. Internal Authorizer module boundary: src/security/memory-authorizer.ts does NOT export
+ *    any host factory or privileged operations (createHostAuthorizerPair is absent).
+ * 3. Unprivileged MemoryAuthorizer: Callers constructing ordinary MemoryAuthorizer (even with
  *    forged hostToken options) do not acquire privileged methods; all privileged operations
  *    (authorizeSystem, createTask, attestTaskScope, and internal variants) are completely undefined
  *    on the authorizer object.
- * 3. Host Bootstrap Module: src/security/host-authority.ts operates as an internal control plane,
- *    allowing trusted host bootstrap to create attested tasks and issue system contexts via closures.
- * 4. Verification Boundary: Unprivileged authorizer instances can verify host-issued contexts
+ * 4. Host Bootstrap Module: src/security/host-authority.ts encapsulates host authority creation,
+ *    allowing trusted host bootstrap to create attested tasks and issue system contexts.
+ * 5. Verification Boundary: Unprivileged authorizer instances can verify host-issued contexts
  *    and task attestations, while rejecting forged contexts and unverified tasks.
  */
 
@@ -20,6 +22,7 @@ import assert from 'node:assert/strict';
 import { DatabaseManager } from '../../src/storage/db.ts';
 import { TaskRepository } from '../../src/storage/task-repository.ts';
 import * as PublicApi from '../../src/index.ts';
+import * as MemoryAuthorizerModule from '../../src/security/memory-authorizer.ts';
 import { HostMemoryAuthority } from '../../src/security/host-authority.ts';
 import {
   SecurityViolationError,
@@ -43,7 +46,7 @@ test('Security Regression - Public API (src/index.ts) does NOT export privileged
     'Public package entry point src/index.ts must NOT export HostToken.'
   );
 
-  // 3. createHostAuthorizerPair factory must NOT be exported
+  // 3. createHostAuthorizerPair factory must NOT be exported from public package index
   assert.equal(
     (PublicApi as Record<string, unknown>).createHostAuthorizerPair,
     undefined,
@@ -87,6 +90,30 @@ test('Security Regression - Public API (src/index.ts) does NOT export privileged
     typeof PublicApi.MemoryAuthorizer,
     'function',
     'Public package entry point must export unprivileged MemoryAuthorizer constructor.'
+  );
+});
+
+test('Security Regression - src/security/memory-authorizer.ts does NOT export any host factory', () => {
+  // Direct import of memory-authorizer module must not reveal any host factory
+  assert.equal(
+    (MemoryAuthorizerModule as Record<string, unknown>).createHostAuthorizerPair,
+    undefined,
+    'memory-authorizer.ts must NOT export createHostAuthorizerPair.'
+  );
+  assert.equal(
+    (MemoryAuthorizerModule as Record<string, unknown>).HostMemoryAuthority,
+    undefined,
+    'memory-authorizer.ts must NOT export HostMemoryAuthority.'
+  );
+  assert.equal(
+    (MemoryAuthorizerModule as Record<string, unknown>).HostToken,
+    undefined,
+    'memory-authorizer.ts must NOT export HostToken.'
+  );
+  assert.equal(
+    (MemoryAuthorizerModule as Record<string, unknown>).HostPrivilegedOperations,
+    undefined,
+    'memory-authorizer.ts must NOT export HostPrivilegedOperations.'
   );
 });
 
@@ -264,7 +291,25 @@ test('Security - Internal HostMemoryAuthority successfully boots and establishes
       (err: unknown) => err instanceof TypeError
     );
 
-    // 6. User authorization via IdentityProvider works with resolved principal and permitted scopes
+    // 6. Internal registration methods on host-bound authorizer reject invalid capability keys
+    assert.throws(
+      () => (authorizer as any).registerSystemContext(Symbol('fake.key'), systemContext),
+      (err: unknown) => {
+        assert.ok(err instanceof SecurityViolationError);
+        assert.equal(err.violationType, 'HOST_TOKEN_REQUIRED');
+        return true;
+      }
+    );
+    assert.throws(
+      () => (authorizer as any).getHostSecret(Symbol('fake.key')),
+      (err: unknown) => {
+        assert.ok(err instanceof SecurityViolationError);
+        assert.equal(err.violationType, 'HOST_TOKEN_REQUIRED');
+        return true;
+      }
+    );
+
+    // 7. User authorization via IdentityProvider works with resolved principal and permitted scopes
     const aliceContext = authorizer.authorizeUser({
       credentials: 'alice-secret',
       requestedScope: workspaceAlpha,

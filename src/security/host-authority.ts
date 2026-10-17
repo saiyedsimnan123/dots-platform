@@ -20,22 +20,59 @@
  *    passive text or structured JSON validated against rigid schemas.
  * 2. Any tool execution or code execution requested by agents must occur in sandboxed,
  *    isolated environments (e.g. separate processes, Docker/WASM sandboxes) outside the host Node.js runtime.
- * 3. Within the host application architecture, this module establishes a strict encapsulation
- *    boundary: ordinary application code and agent-facing services only receive the unprivileged
- *    MemoryAuthorizer, preventing accidental capability escalation or unauthorized task creation.
+ * 3. Within the host application architecture, this module encapsulates the host authority factory
+ *    and privileged operations (createTask, authorizeSystem, attestTaskScope). Ordinary application code
+ *    and agent-facing services only receive the unprivileged MemoryAuthorizer, preventing accidental
+ *    capability escalation.
  */
 
-import type { CallerContext, ScopeIdentifier, Task } from '../domain/types.ts';
+import { createHmac, randomBytes } from 'node:crypto';
+import type {
+  CallerContext,
+  MemoryPermission,
+  ScopeIdentifier,
+  Task
+} from '../domain/types.ts';
+import { ValidationError, SecurityViolationError } from '../domain/errors.ts';
 import type { TaskRepository } from '../storage/task-repository.ts';
 import {
-  createHostAuthorizerPair,
-  type HostPrivilegedOperations,
-  type MemoryAuthorizer,
+  MemoryAuthorizer,
+  validateScope,
   type MemoryAuthorizerOptions,
   type AuthorizeSystemInput,
   type CreateTaskWithScopeInput,
   type TaskScopeAttestation
 } from './memory-authorizer.ts';
+
+const SYSTEM_PERMISSIONS: ReadonlySet<MemoryPermission> = new Set(['READ', 'WRITE', 'DELETE']);
+
+/**
+ * Internal host-bound authorizer subclass.
+ * Only constructible within host-authority.ts; never exported.
+ * Restricts context registration and secret access to callers holding the private #capabilityKey.
+ */
+class HostBoundAuthorizer extends MemoryAuthorizer {
+  readonly #capabilityKey: symbol;
+
+  constructor(options: MemoryAuthorizerOptions, capabilityKey: symbol) {
+    super(options);
+    this.#capabilityKey = capabilityKey;
+  }
+
+  public registerSystemContext(key: symbol, context: CallerContext): void {
+    if (key !== this.#capabilityKey) {
+      throw new SecurityViolationError('Unauthorized context registration.', 'HOST_TOKEN_REQUIRED');
+    }
+    this.issuedContexts.add(context);
+  }
+
+  public getHostSecret(key: symbol): Buffer {
+    if (key !== this.#capabilityKey) {
+      throw new SecurityViolationError('Unauthorized secret access.', 'HOST_TOKEN_REQUIRED');
+    }
+    return this.hostSecret;
+  }
+}
 
 export interface HostMemoryAuthorityOptions extends MemoryAuthorizerOptions {}
 
@@ -43,7 +80,7 @@ export interface HostMemoryAuthorityOptions extends MemoryAuthorizerOptions {}
  * Privileged Host Authorization Control Plane.
  * 
  * Held strictly by trusted host initialization and orchestration bootstrap code.
- * Encapsulates the module-private host capability closure and exposes privileged operations:
+ * Encapsulates the host capability key and exposes privileged operations:
  * - createTask: creates tasks with verified cryptographic host scope attestations
  * - authorizeSystem: issues system-level CallerContext
  * - attestTaskScope: generates cryptographic scope attestations
@@ -52,10 +89,13 @@ export interface HostMemoryAuthorityOptions extends MemoryAuthorizerOptions {}
  * suitable for distribution to services, callers, and context verifiers.
  */
 export class HostMemoryAuthority {
-  readonly #ops: HostPrivilegedOperations;
+  readonly #authorizer: HostBoundAuthorizer;
+  readonly #capabilityKey: symbol;
 
   constructor(options: HostMemoryAuthorityOptions = {}) {
-    this.#ops = createHostAuthorizerPair(options);
+    const capabilityKey = Symbol('host.capability');
+    this.#capabilityKey = capabilityKey;
+    this.#authorizer = new HostBoundAuthorizer(options, capabilityKey);
   }
 
   /**
@@ -63,28 +103,82 @@ export class HostMemoryAuthority {
    * This instance cannot mint system authority or create tasks.
    */
   public get authorizer(): MemoryAuthorizer {
-    return this.#ops.authorizer;
+    return this.#authorizer;
   }
 
   /**
    * Privileged host operation: creates an attested task in designated workspace.
    */
   public createTask(taskRepo: TaskRepository, input: CreateTaskWithScopeInput): Task {
-    return this.#ops.createTask(taskRepo, input);
+    if (!input.goal || input.goal.trim() === '') {
+      throw new ValidationError('Task goal must not be empty.');
+    }
+    validateScope(input.scope.scopeType, input.scope.scopeId);
+
+    const id = input.id ?? randomBytes(16).toString('hex');
+    const attestation = this.attestTaskScope(id, input.scope);
+
+    const metadata = {
+      ...(input.metadata ?? {}),
+      _scopeAttestation: attestation
+    };
+
+    return taskRepo.createTask({
+      id,
+      goal: input.goal.trim(),
+      metadata
+    });
   }
 
   /**
    * Privileged host operation: authorizes an internal system operation.
    */
   public authorizeSystem(input: AuthorizeSystemInput): CallerContext {
-    return this.#ops.authorizeSystem(input);
+    if (!input || typeof input !== 'object') {
+      throw new ValidationError('AuthorizeSystemInput must be an object.');
+    }
+    validateScope(input.scope.scopeType, input.scope.scopeId);
+
+    const secret = this.#authorizer.getHostSecret(this.#capabilityKey);
+    const nonce = randomBytes(16).toString('hex');
+    const sortedPerms = Array.from(SYSTEM_PERMISSIONS).sort().join(',');
+    const payload = `SYSTEM|${input.scope.scopeType}|${input.scope.scopeId}|${sortedPerms}|${input.taskId ?? ''}|${nonce}`;
+    const signature = createHmac('sha256', secret).update(payload, 'utf8').digest('hex');
+
+    const context: CallerContext = Object.freeze({
+      actor: 'SYSTEM',
+      scope: Object.freeze({
+        scopeType: input.scope.scopeType,
+        scopeId: input.scope.scopeId
+      }),
+      permissions: Object.freeze(new Set(SYSTEM_PERMISSIONS)),
+      taskId: input.taskId,
+      _proof: Object.freeze({
+        signature,
+        nonce
+      })
+    });
+
+    this.#authorizer.registerSystemContext(this.#capabilityKey, context);
+    return context;
   }
 
   /**
    * Privileged host operation: generates a scope attestation.
    */
   public attestTaskScope(taskId: string, scope: ScopeIdentifier): TaskScopeAttestation {
-    return this.#ops.attestTaskScope(taskId, scope);
+    validateScope(scope.scopeType, scope.scopeId);
+    const secret = this.#authorizer.getHostSecret(this.#capabilityKey);
+    const timestamp = new Date().toISOString();
+    const payload = `TASK_SCOPE|${taskId}|${scope.scopeType}|${scope.scopeId}|${timestamp}`;
+    const signature = createHmac('sha256', secret).update(payload, 'utf8').digest('hex');
+
+    return {
+      scopeType: scope.scopeType,
+      scopeId: scope.scopeId,
+      signature,
+      timestamp
+    };
   }
 }
 
