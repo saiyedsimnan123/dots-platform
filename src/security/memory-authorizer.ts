@@ -7,6 +7,24 @@
  * Permissions, identities, and scopes are derived strictly from trusted identity providers
  * and process-private host policies, NOT accepted from untrusted caller claims.
  * 
+ * In-Heap Security Model & Threat Boundary:
+ * In a JavaScript runtime (Node.js/V8), code executing in the same heap with unrestricted
+ * module resolution cannot be isolated solely by TypeScript visibility modifiers (private/protected)
+ * or naming conventions. If untrusted code could execute arbitrary JavaScript within the host heap,
+ * it could import internal modules or inspect process memory.
+ * 
+ * Consequently:
+ * 1. Untrusted agent content, task instructions, and user-supplied prompts MUST NEVER be
+ *    evaluated as executable JavaScript in the host heap. They are treated strictly as DATA:
+ *    passive text or structured JSON validated against rigid schemas.
+ * 2. Any tool execution or code execution requested by agents must occur in sandboxed,
+ *    isolated environments (e.g. separate processes, Docker/WASM sandboxes) outside the host Node.js runtime.
+ * 3. Privileged host authority construction (HostMemoryAuthority) is isolated to the internal
+ *    host bootstrap module (src/security/host-authority.ts) and is NOT exported from the public package
+ *    entry point (src/index.ts). Ordinary callers and agents importing the package receive only the
+ *    unprivileged MemoryAuthorizer, which cannot mint system authority or create tasks without an
+ *    internal HostToken held exclusively by host initialization code.
+ * 
  * Core Security Guarantees:
  * 1. Trusted Identity Provider Resolution:
  *    - Human user authorization requires a configured TrustedIdentityProvider.
@@ -19,7 +37,7 @@
  *    - Privileged host operations (authorizeSystem, createTask, attestTaskScope) require
  *      a process-private HostToken held exclusively by HostMemoryAuthority during host bootstrap.
  *    - Untrusted callers, agents, and task payloads cannot mint system authority or create
- *      arbitrary tasks in unauthorized workspaces.
+ *      arbitrary tasks in unauthorized workspaces. Unprivileged authorizer instances fail closed.
  * 3. Automated Agent Scope & Permission Binding:
  *    - Agents must present an authoritative taskId. An agent's scope is derived strictly from
  *      the task's verified host cryptographic scope attestation.
@@ -292,10 +310,11 @@ export class MemoryAuthorizer {
   }
 
   /**
-   * Authorizes an internal system operation.
-   * Requires a verified HostToken held only by trusted host initialization code.
+   * Internal host capability for system authorization.
+   * Requires a valid HostToken held strictly by HostMemoryAuthority during host bootstrap.
+   * @internal
    */
-  public authorizeSystem(input: AuthorizeSystemInput, hostToken?: HostToken): CallerContext {
+  public _authorizeSystem(input: AuthorizeSystemInput, hostToken?: HostToken): CallerContext {
     this.assertHostToken(hostToken, 'authorizeSystem');
     if (!input || typeof input !== 'object') {
       throw new ValidationError('AuthorizeSystemInput must be an object.');
@@ -310,14 +329,25 @@ export class MemoryAuthorizer {
     });
   }
 
+  /**
+   * Fail-closed trap for unauthorized direct calls to authorizeSystem on unprivileged authorizers.
+   * Unprivileged MemoryAuthorizer instances cannot mint system authority.
+   */
+  public authorizeSystem(input?: unknown, hostToken?: unknown): never {
+    throw new SecurityViolationError(
+      'Privileged host operation \'authorizeSystem\' requires a valid HostToken from trusted host initialization code.',
+      'HOST_TOKEN_REQUIRED'
+    );
+  }
+
   // --- Task Scope Attestation & Verification ---
 
   /**
-   * Creates a new task with a cryptographically signed host scope attestation.
-   * Establishes a verified scope origin at task creation time.
-   * Requires a verified HostToken held only by trusted host initialization code.
+   * Internal host capability for creating a task with cryptographic scope attestation.
+   * Requires a valid HostToken held strictly by HostMemoryAuthority during host bootstrap.
+   * @internal
    */
-  public createTask(taskRepo: TaskRepository, input: CreateTaskWithScopeInput, hostToken?: HostToken): Task {
+  public _createTask(taskRepo: TaskRepository, input: CreateTaskWithScopeInput, hostToken?: HostToken): Task {
     this.assertHostToken(hostToken, 'createTask');
     if (!input.goal || input.goal.trim() === '') {
       throw new ValidationError('Task goal must not be empty.');
@@ -326,7 +356,7 @@ export class MemoryAuthorizer {
 
     // If an ID is provided, use it; otherwise generate a UUID
     const id = input.id ?? randomBytes(16).toString('hex');
-    const attestation = this.attestTaskScope(id, input.scope, hostToken);
+    const attestation = this._attestTaskScope(id, input.scope, hostToken);
 
     const metadata = {
       ...(input.metadata ?? {}),
@@ -341,10 +371,22 @@ export class MemoryAuthorizer {
   }
 
   /**
-   * Generates a cryptographic host scope attestation for a task ID.
-   * Requires a verified HostToken held only by trusted host initialization code.
+   * Fail-closed trap for unauthorized direct calls to createTask on unprivileged authorizers.
+   * Unprivileged MemoryAuthorizer instances cannot create tasks.
    */
-  public attestTaskScope(taskId: string, scope: ScopeIdentifier, hostToken?: HostToken): TaskScopeAttestation {
+  public createTask(taskRepo?: unknown, input?: unknown, hostToken?: unknown): never {
+    throw new SecurityViolationError(
+      'Privileged host operation \'createTask\' requires a valid HostToken from trusted host initialization code.',
+      'HOST_TOKEN_REQUIRED'
+    );
+  }
+
+  /**
+   * Internal host capability for generating a cryptographic host scope attestation for a task ID.
+   * Requires a valid HostToken held strictly by HostMemoryAuthority during host bootstrap.
+   * @internal
+   */
+  public _attestTaskScope(taskId: string, scope: ScopeIdentifier, hostToken?: HostToken): TaskScopeAttestation {
     this.assertHostToken(hostToken, 'attestTaskScope');
     this.validateScope(scope.scopeType, scope.scopeId);
     const timestamp = new Date().toISOString();
@@ -357,6 +399,17 @@ export class MemoryAuthorizer {
       signature,
       timestamp
     };
+  }
+
+  /**
+   * Fail-closed trap for unauthorized direct calls to attestTaskScope on unprivileged authorizers.
+   * Unprivileged MemoryAuthorizer instances cannot generate host scope attestations.
+   */
+  public attestTaskScope(taskId?: unknown, scope?: unknown, hostToken?: unknown): never {
+    throw new SecurityViolationError(
+      'Privileged host operation \'attestTaskScope\' requires a valid HostToken from trusted host initialization code.',
+      'HOST_TOKEN_REQUIRED'
+    );
   }
 
   /**
@@ -543,55 +596,3 @@ export class MemoryAuthorizer {
   }
 }
 
-export interface HostMemoryAuthorityOptions extends Omit<MemoryAuthorizerOptions, 'hostToken'> {}
-
-/**
- * Privileged Host Authorization Control Plane.
- * 
- * Held strictly by trusted host initialization and orchestration bootstrap code.
- * Encapsulates the process-private HostToken and exposes privileged operations:
- * - createTask (creates tasks with verified host scope attestations)
- * - authorizeSystem (issues system-level CallerContext)
- * - attestTaskScope (generates cryptographic scope attestations)
- * 
- * The unprivileged authorizer property may be passed safely to untrusted callers,
- * services, and agents without granting them access to privileged operations.
- */
-export class HostMemoryAuthority {
-  readonly #authorizer: MemoryAuthorizer;
-  readonly #hostToken: HostToken;
-
-  constructor(options: HostMemoryAuthorityOptions = {}) {
-    const hostToken = new HostToken(Symbol('host.capability'));
-    this.#hostToken = hostToken;
-    this.#authorizer = new MemoryAuthorizer({ ...options, hostToken });
-  }
-
-  /**
-   * Returns the unprivileged MemoryAuthorizer instance for caller/agent context verification.
-   */
-  public get authorizer(): MemoryAuthorizer {
-    return this.#authorizer;
-  }
-
-  /**
-   * Privileged host operation: creates an attested task in designated workspace.
-   */
-  public createTask(taskRepo: TaskRepository, input: CreateTaskWithScopeInput): Task {
-    return this.#authorizer.createTask(taskRepo, input, this.#hostToken);
-  }
-
-  /**
-   * Privileged host operation: authorizes an internal system operation.
-   */
-  public authorizeSystem(input: AuthorizeSystemInput): CallerContext {
-    return this.#authorizer.authorizeSystem(input, this.#hostToken);
-  }
-
-  /**
-   * Privileged host operation: generates a scope attestation.
-   */
-  public attestTaskScope(taskId: string, scope: ScopeIdentifier): TaskScopeAttestation {
-    return this.#authorizer.attestTaskScope(taskId, scope, this.#hostToken);
-  }
-}

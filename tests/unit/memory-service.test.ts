@@ -14,10 +14,10 @@ import { MemoryContextBuilder } from '../../src/memory/context-builder.ts';
 import { MemoryService } from '../../src/memory/memory-service.ts';
 import {
   MemoryAuthorizer,
-  HostMemoryAuthority,
   type TrustedIdentityProvider,
   type AuthenticatedPrincipal
 } from '../../src/security/memory-authorizer.ts';
+import { HostMemoryAuthority } from '../../src/security/host-authority.ts';
 import type { ScopeIdentifier, AppendAuditEventInput, AuditEvent } from '../../src/domain/types.ts';
 import {
   ValidationError,
@@ -1183,9 +1183,29 @@ test('MemoryAuthorizer - Untrusted caller cannot obtain ADMIN permissions, imper
       }
     );
 
+    // Internal _authorizeSystem with fake token is also rejected
+    assert.throws(
+      () => (authorizer as any)._authorizeSystem({ scope: workspaceA }, {} as any),
+      (err: unknown) => {
+        assert.ok(err instanceof SecurityViolationError);
+        assert.equal(err.violationType, 'HOST_TOKEN_REQUIRED');
+        return true;
+      }
+    );
+
     // 5. Untrusted caller CANNOT create a task without a valid HostToken
     assert.throws(
       () => authorizer.createTask(taskRepo, { goal: 'unauthorized task', scope: workspaceA }),
+      (err: unknown) => {
+        assert.ok(err instanceof SecurityViolationError);
+        assert.equal(err.violationType, 'HOST_TOKEN_REQUIRED');
+        return true;
+      }
+    );
+
+    // Untrusted caller CANNOT attest a task scope without a valid HostToken
+    assert.throws(
+      () => authorizer.attestTaskScope('some-task-id', workspaceA),
       (err: unknown) => {
         assert.ok(err instanceof SecurityViolationError);
         assert.equal(err.violationType, 'HOST_TOKEN_REQUIRED');

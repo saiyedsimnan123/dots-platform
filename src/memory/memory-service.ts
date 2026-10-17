@@ -63,7 +63,8 @@ import type { AuditRepository } from '../storage/audit-repository.ts';
 import type { TaskRepository } from '../storage/task-repository.ts';
 import { RelevanceMatcher } from './relevance-matcher.ts';
 import { MemoryContextBuilder } from './context-builder.ts';
-import { MemoryAuthorizer, HostMemoryAuthority } from '../security/memory-authorizer.ts';
+import { MemoryAuthorizer } from '../security/memory-authorizer.ts';
+import type { HostMemoryAuthority } from '../security/host-authority.ts';
 
 const VALID_SCOPES: ReadonlySet<MemoryScopeType> = new Set([
   'GLOBAL',

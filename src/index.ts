@@ -23,10 +23,21 @@ export * from './model/mock-provider.ts';
 export * from './model/gemini-provider.ts';
 export * from './model/budget-tracker.ts';
 
-// Security & Policy Layer
+// Security & Policy Layer (Unprivileged Public Surface)
+// Note: Privileged host authority construction (HostMemoryAuthority) is internal to the host bootstrap
+// module (./security/host-authority.ts) and is intentionally not exported from this public package entry point.
 export * from './security/policy-engine.ts';
 export * from './security/approval-broker.ts';
-export * from './security/memory-authorizer.ts';
+export {
+  MemoryAuthorizer,
+  type MemoryAuthorizerOptions,
+  type UserRole,
+  type AuthenticatedPrincipal,
+  type TrustedIdentityProvider,
+  type AuthorizeUserInput,
+  type AuthorizeAgentInput,
+  type TaskScopeAttestation
+} from './security/memory-authorizer.ts';
 
 // Tool Capabilities & Sandboxing
 export type * from './tools/types.ts';
