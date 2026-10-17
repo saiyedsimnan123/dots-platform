@@ -35,6 +35,7 @@
  */
 
 import type { Memory, ScoredMemory, RelevanceBreakdown } from '../domain/types.ts';
+import { ValidationError } from '../domain/errors.ts';
 
 /**
  * Standard basic English stop-word list.
@@ -80,6 +81,34 @@ export function tokenizeText(
   return rawTokens.filter((token) => token.length > 0 && !stopWords.has(token));
 }
 
+/**
+ * Escapes characters with special meaning in regular expressions.
+ */
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Checks whether phrase appears in text as a properly bounded phrase.
+ * Prevents partial-word false positives (e.g. "database" matching inside "databases",
+ * or "docker.build.target" matching inside "mydocker.build.target").
+ * 
+ * Uses lookaround assertions:
+ * - Lookbehind (?<![a-z0-9]): not preceded by an alphanumeric character
+ * - Lookahead (?![a-z0-9]): not followed by an alphanumeric character
+ */
+export function isBoundedPhraseMatch(text: string, phrase: string): boolean {
+  if (!text || !phrase) {
+    return false;
+  }
+  const trimmedPhrase = phrase.trim();
+  if (trimmedPhrase.length === 0) {
+    return false;
+  }
+  const pattern = new RegExp(`(?<![a-z0-9])${escapeRegExp(trimmedPhrase)}(?![a-z0-9])`, 'i');
+  return pattern.test(text);
+}
+
 export interface RelevanceMatcherOptions {
   readonly keyWeight?: number;
   readonly tagWeight?: number;
@@ -91,6 +120,7 @@ export class RelevanceMatcher {
   public static readonly DEFAULT_KEY_WEIGHT = 0.50;
   public static readonly DEFAULT_TAG_WEIGHT = 0.30;
   public static readonly DEFAULT_WORD_WEIGHT = 0.20;
+  public static readonly WEIGHT_TOLERANCE = 0.0001;
 
   public readonly keyWeight: number;
   public readonly tagWeight: number;
@@ -98,10 +128,39 @@ export class RelevanceMatcher {
   public readonly stopWords: ReadonlySet<string>;
 
   constructor(options: RelevanceMatcherOptions = {}) {
-    this.keyWeight = options.keyWeight ?? RelevanceMatcher.DEFAULT_KEY_WEIGHT;
-    this.tagWeight = options.tagWeight ?? RelevanceMatcher.DEFAULT_TAG_WEIGHT;
-    this.wordWeight = options.wordWeight ?? RelevanceMatcher.DEFAULT_WORD_WEIGHT;
+    const keyWeight = options.keyWeight ?? RelevanceMatcher.DEFAULT_KEY_WEIGHT;
+    const tagWeight = options.tagWeight ?? RelevanceMatcher.DEFAULT_TAG_WEIGHT;
+    const wordWeight = options.wordWeight ?? RelevanceMatcher.DEFAULT_WORD_WEIGHT;
+
+    this.validateWeight('keyWeight', keyWeight);
+    this.validateWeight('tagWeight', tagWeight);
+    this.validateWeight('wordWeight', wordWeight);
+
+    const totalWeight = keyWeight + tagWeight + wordWeight;
+    if (Math.abs(totalWeight - 1.0) > RelevanceMatcher.WEIGHT_TOLERANCE) {
+      throw new ValidationError(
+        `Scoring weights must sum to 1.0 within tolerance of ${RelevanceMatcher.WEIGHT_TOLERANCE} ` +
+        `(received total of ${totalWeight.toFixed(4)} with keyWeight=${keyWeight}, tagWeight=${tagWeight}, wordWeight=${wordWeight}).`
+      );
+    }
+
+    this.keyWeight = keyWeight;
+    this.tagWeight = tagWeight;
+    this.wordWeight = wordWeight;
     this.stopWords = options.stopWords ?? BASIC_ENGLISH_STOP_WORDS;
+  }
+
+  private validateWeight(name: string, value: unknown): void {
+    if (
+      typeof value !== 'number' ||
+      !Number.isFinite(value) ||
+      Number.isNaN(value) ||
+      value < 0
+    ) {
+      throw new ValidationError(
+        `Scoring weight '${name}' must be a finite, non-negative number, received: ${String(value)}`
+      );
+    }
   }
 
   /**
@@ -212,8 +271,8 @@ export class RelevanceMatcher {
       return { score: 1.0, matched: true };
     }
 
-    // Substring containment of the full key (e.g. query mentions "docker.build.tag")
-    if (normalizedQuery.includes(normalizedKey)) {
+    // Bounded phrase match of the full key (e.g. query mentions "docker.build.target" as a distinct phrase)
+    if (isBoundedPhraseMatch(normalizedQuery, normalizedKey)) {
       return { score: 1.0, matched: true };
     }
 
@@ -262,7 +321,7 @@ export class RelevanceMatcher {
 
     const matchedTags: string[] = [];
     for (const tag of candidateTags) {
-      if (queryTokenSet.has(tag) || normalizedQuery.includes(tag)) {
+      if (queryTokenSet.has(tag) || isBoundedPhraseMatch(normalizedQuery, tag)) {
         matchedTags.push(tag);
       }
     }

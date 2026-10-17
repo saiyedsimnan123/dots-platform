@@ -15,9 +15,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { Memory } from '../../src/domain/types.ts';
+import { ValidationError } from '../../src/domain/errors.ts';
 import {
   RelevanceMatcher,
   tokenizeText,
+  isBoundedPhraseMatch,
   BASIC_ENGLISH_STOP_WORDS
 } from '../../src/memory/relevance-matcher.ts';
 
@@ -255,3 +257,203 @@ test('RelevanceMatcher - handles empty queries, empty candidate lists, and malfo
   const scoredCorrupted = matcher.score('test query', corruptedMem);
   assert.equal(scoredCorrupted.breakdown.tagMatch, 0.0);
 });
+
+test('RelevanceMatcher - regression: bounded phrase matching prevents partial-word false positives for keys', () => {
+  const matcher = new RelevanceMatcher();
+
+  const candidateKey = 'docker.build.target';
+  const candidate = createMockMemory({
+    key: candidateKey,
+    tagsJson: '[]',
+    content: 'Unrelated content payload here.'
+  });
+
+  // 1. Valid bounded phrase match in query -> keyMatch === 1.0
+  const validQueries = [
+    'Inspect the docker.build.target configuration',
+    'docker.build.target',
+    'Please run (docker.build.target) right now',
+    'Check "docker.build.target" value',
+    'Use docker.build.target:latest image',
+    'docker.build.target.'
+  ];
+
+  for (const q of validQueries) {
+    const scored = matcher.score(q, candidate);
+    assert.equal(
+      scored.breakdown.keyMatch,
+      1.0,
+      `Expected keyMatch 1.0 for valid phrase in query: "${q}"`
+    );
+    assert.equal(scored.breakdown.keyMatched, true);
+  }
+
+  // 2. Embedded in longer alphanumeric words -> MUST NOT match as full key phrase
+  const embeddedQueries = [
+    'run mydocker.build.target now',       // preceded by 'm' in longer alphanumeric word 'mydocker'
+    'run docker.build.targets now',         // followed by 's' in longer alphanumeric word 'targets'
+    'run mydocker.build.targets now',       // both sides embedded in longer alphanumeric words
+    'run querywithdocker.build.targetembedded' // completely embedded in longer alphanumeric words
+  ];
+
+  for (const q of embeddedQueries) {
+    const scored = matcher.score(q, candidate);
+    assert.notEqual(
+      scored.breakdown.keyMatch,
+      1.0,
+      `Expected keyMatch < 1.0 (not a full bounded match) for embedded query: "${q}"`
+    );
+  }
+
+  // 3. Single-token key test (e.g. key: 'target')
+  const singleTokenMem = createMockMemory({
+    key: 'target',
+    tagsJson: '[]',
+    content: 'Unrelated body text.'
+  });
+
+  // "targets" must NOT match "target"
+  const scoredEmbeddedWord = matcher.score('Check the multiple targets in production', singleTokenMem);
+  assert.equal(scoredEmbeddedWord.breakdown.keyMatch, 0.0);
+  assert.equal(scoredEmbeddedWord.breakdown.keyMatched, false);
+
+  // Exact word "target" must match "target"
+  const scoredExactWord = matcher.score('Check the single target in production', singleTokenMem);
+  assert.equal(scoredExactWord.breakdown.keyMatch, 1.0);
+  assert.equal(scoredExactWord.breakdown.keyMatched, true);
+});
+
+test('RelevanceMatcher - regression: bounded phrase matching prevents partial-word false positives for tags (database vs databases)', () => {
+  const matcher = new RelevanceMatcher();
+
+  const memSingular = createMockMemory({
+    key: 'unrelated.key.1',
+    tagsJson: '["database"]',
+    content: 'Unrelated text here.'
+  });
+
+  const memPlural = createMockMemory({
+    key: 'unrelated.key.2',
+    tagsJson: '["databases"]',
+    content: 'Unrelated text here.'
+  });
+
+  // Query: "we need multiple databases"
+  // Must match memPlural ('databases') with tagMatch 1.0
+  // Must NOT match memSingular ('database') merely because "database" is a substring of "databases"
+  const scoredPluralQueryOnSingular = matcher.score('we need multiple databases', memSingular);
+  assert.equal(
+    scoredPluralQueryOnSingular.breakdown.tagMatch,
+    0.0,
+    'Tag "database" must not match query "we need multiple databases"'
+  );
+  assert.deepEqual(scoredPluralQueryOnSingular.breakdown.matchedTags, []);
+
+  const scoredPluralQueryOnPlural = matcher.score('we need multiple databases', memPlural);
+  assert.equal(scoredPluralQueryOnPlural.breakdown.tagMatch, 1.0);
+  assert.deepEqual(scoredPluralQueryOnPlural.breakdown.matchedTags, ['databases']);
+
+  // Query: "connect to database"
+  // Must match memSingular ('database') with tagMatch 1.0
+  // Must NOT match memPlural ('databases')
+  const scoredSingularQueryOnSingular = matcher.score('connect to database', memSingular);
+  assert.equal(scoredSingularQueryOnSingular.breakdown.tagMatch, 1.0);
+  assert.deepEqual(scoredSingularQueryOnSingular.breakdown.matchedTags, ['database']);
+
+  const scoredSingularQueryOnPlural = matcher.score('connect to database', memPlural);
+  assert.equal(scoredSingularQueryOnPlural.breakdown.tagMatch, 0.0);
+  assert.deepEqual(scoredSingularQueryOnPlural.breakdown.matchedTags, []);
+});
+
+test('RelevanceMatcher - preserves legitimate multiword and punctuation-separated tag matches', () => {
+  const matcher = new RelevanceMatcher();
+
+  const memMultiword = createMockMemory({
+    key: 'unrelated.key.3',
+    tagsJson: '["cloud infra", "postgres-db"]',
+    content: 'Unrelated text here.'
+  });
+
+  // Multiword tag "cloud infra" matches when present as bounded phrase
+  const scoredMultiword = matcher.score('deploy services on cloud infra today', memMultiword);
+  assert.ok(scoredMultiword.breakdown.matchedTags.includes('cloud infra'));
+
+  // Multiword tag "cloud infra" does NOT match inside "cloud infrastructure"
+  const scoredEmbeddedMultiword = matcher.score('deploy services on cloud infrastructure today', memMultiword);
+  assert.ok(!scoredEmbeddedMultiword.breakdown.matchedTags.includes('cloud infra'));
+
+  // Punctuation-separated tag "postgres-db" matches when properly bounded
+  const scoredPunct = matcher.score('connect to (postgres-db); now', memMultiword);
+  assert.ok(scoredPunct.breakdown.matchedTags.includes('postgres-db'));
+
+  // Punctuation-separated tag does not match when prefixed with alphanumeric
+  const scoredPrefixed = matcher.score('connect to mypostgres-db now', memMultiword);
+  assert.ok(!scoredPrefixed.breakdown.matchedTags.includes('postgres-db'));
+});
+
+test('RelevanceMatcher - validates scoring configuration and rejects invalid weights', () => {
+  // 1. Valid custom configurations summing to 1.0
+  const valid1 = new RelevanceMatcher({ keyWeight: 0.40, tagWeight: 0.40, wordWeight: 0.20 });
+  assert.equal(valid1.keyWeight, 0.40);
+  assert.equal(valid1.tagWeight, 0.40);
+  assert.equal(valid1.wordWeight, 0.20);
+
+  const valid2 = new RelevanceMatcher({ keyWeight: 1.0, tagWeight: 0.0, wordWeight: 0.0 });
+  assert.equal(valid2.keyWeight, 1.0);
+  assert.equal(valid2.tagWeight, 0.0);
+  assert.equal(valid2.wordWeight, 0.0);
+
+  // Minor floating point tolerance test
+  const valid3 = new RelevanceMatcher({ keyWeight: 0.33333, tagWeight: 0.33333, wordWeight: 0.33334 });
+  assert.ok(valid3);
+
+  // 2. Negative weight rejection
+  assert.throws(
+    () => new RelevanceMatcher({ keyWeight: -0.1, tagWeight: 0.6, wordWeight: 0.5 }),
+    (err: unknown) => err instanceof ValidationError && /finite, non-negative/.test((err as Error).message)
+  );
+
+  assert.throws(
+    () => new RelevanceMatcher({ keyWeight: 0.5, tagWeight: -0.2, wordWeight: 0.7 }),
+    (err: unknown) => err instanceof ValidationError && /finite, non-negative/.test((err as Error).message)
+  );
+
+  assert.throws(
+    () => new RelevanceMatcher({ keyWeight: 0.5, tagWeight: 0.6, wordWeight: -0.1 }),
+    (err: unknown) => err instanceof ValidationError && /finite, non-negative/.test((err as Error).message)
+  );
+
+  // 3. NaN weight rejection
+  assert.throws(
+    () => new RelevanceMatcher({ keyWeight: NaN, tagWeight: 0.5, wordWeight: 0.5 }),
+    (err: unknown) => err instanceof ValidationError && /finite, non-negative/.test((err as Error).message)
+  );
+
+  // 4. Infinite weight rejection
+  assert.throws(
+    () => new RelevanceMatcher({ keyWeight: Infinity, tagWeight: 0.5, wordWeight: 0.5 }),
+    (err: unknown) => err instanceof ValidationError && /finite, non-negative/.test((err as Error).message)
+  );
+
+  assert.throws(
+    () => new RelevanceMatcher({ keyWeight: 0.5, tagWeight: -Infinity, wordWeight: 0.5 }),
+    (err: unknown) => err instanceof ValidationError && /finite, non-negative/.test((err as Error).message)
+  );
+
+  // 5. Non-normalized weights rejection (sum != 1.0)
+  assert.throws(
+    () => new RelevanceMatcher({ keyWeight: 0.8, tagWeight: 0.5, wordWeight: 0.2 }),
+    (err: unknown) => err instanceof ValidationError && /must sum to 1.0/.test((err as Error).message)
+  );
+
+  assert.throws(
+    () => new RelevanceMatcher({ keyWeight: 0.1, tagWeight: 0.1, wordWeight: 0.1 }),
+    (err: unknown) => err instanceof ValidationError && /must sum to 1.0/.test((err as Error).message)
+  );
+
+  assert.throws(
+    () => new RelevanceMatcher({ keyWeight: 0.0, tagWeight: 0.0, wordWeight: 0.0 }),
+    (err: unknown) => err instanceof ValidationError && /must sum to 1.0/.test((err as Error).message)
+  );
+});
+
