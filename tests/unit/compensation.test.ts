@@ -645,12 +645,14 @@ test('CompensationManager - is idempotent across repeated compensation runs', as
     const result1 = await compensationManager.compensate(task.id);
     assert.equal(result1.totalReverted, 1);
     assert.equal(result1.totalSkipped, 0);
+    assert.equal(result1.isComplete, true);
     assert.equal(existsSync(filePath), false);
 
     // Run 2: idempotent skip, no crash
     const result2 = await compensationManager.compensate(task.id);
     assert.equal(result2.totalReverted, 0);
     assert.equal(result2.totalSkipped, 1);
+    assert.equal(result2.isComplete, false);
     assert.equal(result2.actions[0]!.status, 'SKIPPED');
     assert.ok(result2.actions[0]!.details?.includes('does not exist'));
   } finally {
@@ -658,3 +660,181 @@ test('CompensationManager - is idempotent across repeated compensation runs', as
     cleanupTest();
   }
 });
+
+test('CompensationManager - does not recreate missing overwritten pre-existing file, reports SKIPPED, and marks isComplete: false with audit event', async () => {
+  const { db, taskRepo, auditRepo, compensationManager } = setupTest();
+
+  try {
+    const filePath = resolve(testWorkspace, 'missing_overwritten_config.json');
+    const originalV0 = '{"initial": "v0"}';
+    const workflowV1 = '{"workflow": "v1"}';
+
+    // File existed before workflow
+    writeFileSync(filePath, originalV0, 'utf8');
+
+    const task = taskRepo.createTask({ goal: 'Task that overwrote config and then file was removed' });
+    const step = taskRepo.createStep({
+      taskId: task.id,
+      stepOrder: 1,
+      description: 'Overwrite config',
+      toolName: 'file_write',
+      toolArguments: { path: filePath, content: workflowV1 }
+    });
+
+    taskRepo.recordToolExecution({
+      stepId: step.id,
+      toolName: 'file_write',
+      input: { path: filePath, content: workflowV1 },
+      output: {
+        path: filePath,
+        bytesWritten: workflowV1.length,
+        writtenHash: sha256(workflowV1),
+        existedBefore: true,
+        previousContent: originalV0,
+        previousHash: sha256(originalV0)
+      },
+      exitCode: 0,
+      durationMs: 5
+    });
+
+    // File was deleted/missing before compensation runs
+    if (existsSync(filePath)) rmSync(filePath, { force: true });
+    assert.equal(existsSync(filePath), false);
+
+    const result = await compensationManager.compensate(task.id);
+
+    // Rollback MUST NOT be marked complete because an action was skipped
+    assert.equal(result.isComplete, false);
+    assert.equal(result.totalReverted, 0);
+    assert.equal(result.totalSkipped, 1);
+    assert.equal(result.totalFailed, 0);
+    assert.equal(result.actions.length, 1);
+    assert.equal(result.actions[0]!.action, 'file_restore');
+    assert.equal(result.actions[0]!.status, 'SKIPPED');
+    assert.ok(result.actions[0]!.details?.includes('missing on disk'));
+    assert.ok(result.actions[0]!.details?.includes('differs from expected post-write state'));
+
+    // File MUST NOT have been recreated!
+    assert.equal(existsSync(filePath), false);
+
+    // Audit-event accuracy
+    const events = auditRepo.getEventsByTaskId(task.id);
+    const compEvents = events.filter((e) => e.eventType === 'COMPENSATION_EXECUTED');
+    assert.equal(compEvents.length, 1);
+    const eventDetails = JSON.parse(compEvents[0]!.detailsJson) as {
+      totalReverted: number;
+      totalSkipped: number;
+      totalFailed: number;
+      isComplete: boolean;
+      actions: Array<{ status: string; action: string; details?: string }>;
+    };
+    assert.equal(eventDetails.isComplete, false);
+    assert.equal(eventDetails.totalReverted, 0);
+    assert.equal(eventDetails.totalSkipped, 1);
+    assert.equal(eventDetails.totalFailed, 0);
+    assert.equal(eventDetails.actions[0]!.status, 'SKIPPED');
+    assert.ok(eventDetails.actions[0]!.details?.includes('differs from expected post-write state'));
+  } finally {
+    db.close();
+    cleanupTest();
+  }
+});
+
+test('CompensationManager - correctly reports isComplete: false when actions are SKIPPED or FAILED, and isComplete: true only when fully reverted', async () => {
+  const { db, taskRepo, auditRepo, compensationManager } = setupTest();
+
+  try {
+    // 1. Fully reverted case
+    const taskSuccess = taskRepo.createTask({ goal: 'Successful rollback task' });
+    const stepSuccess = taskRepo.createStep({
+      taskId: taskSuccess.id,
+      stepOrder: 1,
+      description: 'Write file',
+      toolName: 'file_write',
+      toolArguments: { path: 'clean.txt', content: 'temp' }
+    });
+    const cleanPath = resolve(testWorkspace, 'clean.txt');
+    writeFileSync(cleanPath, 'temp', 'utf8');
+    taskRepo.recordToolExecution({
+      stepId: stepSuccess.id,
+      toolName: 'file_write',
+      input: { path: cleanPath, content: 'temp' },
+      output: { path: cleanPath, bytesWritten: 4, writtenHash: sha256('temp'), existedBefore: false },
+      exitCode: 0,
+      durationMs: 5
+    });
+
+    const resSuccess = await compensationManager.compensate(taskSuccess.id);
+    assert.equal(resSuccess.totalReverted, 1);
+    assert.equal(resSuccess.totalSkipped, 0);
+    assert.equal(resSuccess.totalFailed, 0);
+    assert.equal(resSuccess.isComplete, true);
+
+    const auditSuccess = auditRepo.getEventsByTaskId(taskSuccess.id).find((e) => e.eventType === 'COMPENSATION_EXECUTED');
+    assert.ok(auditSuccess);
+    const successDetails = JSON.parse(auditSuccess.detailsJson) as { isComplete: boolean };
+    assert.equal(successDetails.isComplete, true);
+
+    // 2. Skipped action case (e.g. modified post-write)
+    const taskSkipped = taskRepo.createTask({ goal: 'Skipped rollback task' });
+    const stepSkipped = taskRepo.createStep({
+      taskId: taskSkipped.id,
+      stepOrder: 1,
+      description: 'Write scratch',
+      toolName: 'file_write',
+      toolArguments: { path: 'post_mod.txt', content: 'agent' }
+    });
+    const modPath = resolve(testWorkspace, 'post_mod.txt');
+    writeFileSync(modPath, 'agent modified externally', 'utf8');
+    taskRepo.recordToolExecution({
+      stepId: stepSkipped.id,
+      toolName: 'file_write',
+      input: { path: modPath, content: 'agent' },
+      output: { path: modPath, bytesWritten: 5, writtenHash: sha256('agent'), existedBefore: false },
+      exitCode: 0,
+      durationMs: 5
+    });
+
+    const resSkipped = await compensationManager.compensate(taskSkipped.id);
+    assert.equal(resSkipped.totalReverted, 0);
+    assert.equal(resSkipped.totalSkipped, 1);
+    assert.equal(resSkipped.totalFailed, 0);
+    assert.equal(resSkipped.isComplete, false); // Must NOT be true!
+
+    const auditSkipped = auditRepo.getEventsByTaskId(taskSkipped.id).find((e) => e.eventType === 'COMPENSATION_EXECUTED');
+    assert.ok(auditSkipped);
+    const skippedDetails = JSON.parse(auditSkipped.detailsJson) as { isComplete: boolean; totalSkipped: number };
+    assert.equal(skippedDetails.isComplete, false);
+    assert.equal(skippedDetails.totalSkipped, 1);
+
+    // 3. Failed action case (e.g. corrupted payload)
+    const taskFailed = taskRepo.createTask({ goal: 'Failed rollback task' });
+    const stepFailed = taskRepo.createStep({
+      taskId: taskFailed.id,
+      stepOrder: 1,
+      description: 'Bad JSON execution',
+      toolName: 'file_write',
+      toolArguments: {}
+    });
+    db.prepare(`
+      INSERT INTO tool_executions (id, step_id, tool_name, input_json, output_json, exit_code, duration_ms, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run('exec-corrupt', stepFailed.id, 'file_write', '{ malformed json', '{ malformed json', 0, 5, new Date().toISOString());
+
+    const resFailed = await compensationManager.compensate(taskFailed.id);
+    assert.equal(resFailed.totalReverted, 0);
+    assert.equal(resFailed.totalSkipped, 0);
+    assert.equal(resFailed.totalFailed, 1);
+    assert.equal(resFailed.isComplete, false); // Must NOT be true!
+
+    const auditFailed = auditRepo.getEventsByTaskId(taskFailed.id).find((e) => e.eventType === 'COMPENSATION_EXECUTED');
+    assert.ok(auditFailed);
+    const failedDetails = JSON.parse(auditFailed.detailsJson) as { isComplete: boolean; totalFailed: number };
+    assert.equal(failedDetails.isComplete, false);
+    assert.equal(failedDetails.totalFailed, 1);
+  } finally {
+    db.close();
+    cleanupTest();
+  }
+});
+

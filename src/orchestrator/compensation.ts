@@ -7,10 +7,12 @@
  * 1. Reverse execution order: compensates mutations from latest to oldest, unwinding multi-write chains.
  * 2. Rejects path traversal, sibling prefix spoofing, and symlink escapes via PathValidator.
  * 3. Never deletes pre-existing files that were overwritten during the task.
- * 4. Explicit missing-value checks allowing empty files ("") to be safely restored.
- * 5. Protects post-write edits: verifies file on disk matches expected written hash before reverting or deleting.
- * 6. Idempotent across repeated compensation runs.
- * 7. Records detailed audit events for every reverted, skipped, or failed action.
+ * 4. Never recreates missing pre-existing files; reports SKIPPED when state differs from expected post-write state.
+ * 5. Explicit missing-value checks allowing empty files ("") to be safely restored.
+ * 6. Protects post-write edits: verifies file on disk matches expected written hash before reverting or deleting.
+ * 7. Correct isComplete semantics: marks complete only when zero actions were SKIPPED or FAILED.
+ * 8. Idempotent across repeated compensation runs.
+ * 9. Records detailed audit events for every reverted, skipped, or failed action.
  */
 
 import { existsSync, unlinkSync, writeFileSync, readFileSync } from 'node:fs';
@@ -93,7 +95,7 @@ export class CompensationManager {
     const totalReverted = actions.filter((a) => a.status === 'REVERTED').length;
     const totalSkipped = actions.filter((a) => a.status === 'SKIPPED').length;
     const totalFailed = actions.filter((a) => a.status === 'FAILED').length;
-    const isComplete = totalFailed === 0;
+    const isComplete = totalFailed === 0 && totalSkipped === 0;
 
     this.auditRepo.appendEvent({
       taskId,
@@ -192,31 +194,40 @@ export class CompensationManager {
         return;
       }
 
-      // If file exists on disk, check if it was modified after workflow wrote it
-      if (existsSync(canonicalPath)) {
-        try {
-          const currentContent = readFileSync(canonicalPath, 'utf8');
-          const currentHash = createHash('sha256').update(currentContent).digest('hex');
+      // If file is missing during compensation, do not recreate it automatically
+      if (!existsSync(canonicalPath)) {
+        actions.push({
+          action: 'file_restore',
+          resource: rawPath,
+          status: 'SKIPPED',
+          details: 'Pre-existing file is missing on disk; current state differs from expected post-write state, not recreating.'
+        });
+        return;
+      }
 
-          // If current hash doesn't match what this execution wrote, external/post-write modifications occurred!
-          if (expectedWrittenHash && currentHash !== expectedWrittenHash) {
-            actions.push({
-              action: 'file_restore',
-              resource: rawPath,
-              status: 'SKIPPED',
-              details: 'Pre-existing file was modified after workflow execution; left untouched to prevent overwriting external changes.'
-            });
-            return;
-          }
-        } catch (err) {
+      // File exists on disk: verify if it was modified after workflow wrote it
+      try {
+        const currentContent = readFileSync(canonicalPath, 'utf8');
+        const currentHash = createHash('sha256').update(currentContent).digest('hex');
+
+        // If current hash doesn't match what this execution wrote, external/post-write modifications occurred!
+        if (expectedWrittenHash && currentHash !== expectedWrittenHash) {
           actions.push({
             action: 'file_restore',
             resource: rawPath,
-            status: 'FAILED',
-            details: `Failed to inspect current file state on disk: ${err instanceof Error ? err.message : String(err)}`
+            status: 'SKIPPED',
+            details: 'Pre-existing file was modified after workflow execution; left untouched to prevent overwriting external changes.'
           });
           return;
         }
+      } catch (err) {
+        actions.push({
+          action: 'file_restore',
+          resource: rawPath,
+          status: 'FAILED',
+          details: `Failed to inspect current file state on disk: ${err instanceof Error ? err.message : String(err)}`
+        });
+        return;
       }
 
       // Verify backup integrity
