@@ -26,6 +26,7 @@ export * from './model/budget-tracker.ts';
 // Security & Policy Layer
 export * from './security/policy-engine.ts';
 export * from './security/approval-broker.ts';
+export * from './security/memory-authorizer.ts';
 
 // Tool Capabilities & Sandboxing
 export type * from './tools/types.ts';

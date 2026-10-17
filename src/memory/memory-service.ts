@@ -1,33 +1,34 @@
 /**
  * Next-Generation Dots AI Platform - Permission-Controlled Memory Service
- * Phase 7.3: Memory Subsystem
+ * Phase 7.3: Security Hardening
  * 
  * Architectural Mandate:
  * Implements a trusted service layer over MemoryRepository, RelevanceMatcher,
  * and MemoryContextBuilder. Enforces host-derived caller context, explicit permission
  * gating (READ, WRITE, DELETE, APPROVE), strict scope isolation across workspaces
  * and global boundaries, human approval gating for agent memory proposals,
- * and privacy-conscious tamper-evident audit logging.
+ * fail-closed injection provenance, and privacy-conscious tamper-evident audit logging.
  * 
- * Guarantees:
- * 1. Scope Derivation: Memory scope is strictly derived from trusted host context.
- *    Any scope parameters supplied in untrusted agent or caller input are validated
- *    against the trusted scope; spoofing attempts are rejected immediately.
- * 2. Distinct Permissions: Explicitly validates READ, WRITE, DELETE, and APPROVE
- *    permissions on every operation. Missing or insufficient permissions throw
- *    SecurityViolationError and log MEMORY_ACCESS_DENIED audit events.
- * 3. Scope Isolation: Prevents cross-workspace access, workspace-to-global bleed,
- *    and global-to-workspace leakage across all CRUD and context-building operations.
- * 4. Human Approval Gating: Agent-created memories are strictly persisted as proposals
- *    with status 'PENDING_APPROVAL'. Agents cannot approve proposals, activate memories,
- *    or modify active memories. Only human USER callers with APPROVE permission can
- *    approve or reject proposals.
- * 5. Injection Provenance Integrity: Memory injections verify that task scope and
- *    memory scope match identically before recording provenance.
- * 6. Audit Privacy & Tamper Resistance: Emits immutable audit events via AuditRepository
- *    (or system task fallback) for all operations and denials. Raw memory content is
- *    NEVER recorded in audit event details or diagnostic payloads.
- * 7. Bounded Context: Memory context building strictly honors the 4,000-character ceiling
+ * Hardening & Security Guarantees:
+ * 1. Host-Controlled Caller Authorization Boundary:
+ *    CallerContext is verified by MemoryAuthorizer using process-private cryptographic
+ *    HMAC-SHA256 signatures and host WeakSet containment. Handcrafted object literals,
+ *    tampered properties, and forged permissions/scopes are rejected immediately.
+ * 2. Strict Approval Path (Zero Approval Bypasses):
+ *    updateMemory() strictly forbids status mutations. Proposals can ONLY be activated
+ *    through the dedicated decideProposal() path, requiring a verified human USER actor
+ *    and explicit APPROVE permission. A caller with WRITE alone cannot approve proposals.
+ * 3. Fail-Closed Injection Provenance:
+ *    Provenance recording requires authoritative task lookup and trusted task scope derived
+ *    strictly from task metadata assigned upon task creation. Never falls back to caller scope.
+ *    If task metadata is missing, malformed, or untrusted, or if the memory is inactive
+ *    (status !== 'ACTIVE'), provenance recording fails closed. Batch injection uses database
+ *    transactions to guarantee zero partial writes.
+ * 4. Fail-Closed Audit Logging for State Mutations:
+ *    All state-mutating operations (create, update, archive, delete, approve) enforce
+ *    mandatory audit logging. If audit persistence fails, the mutation fails closed.
+ *    Read telemetry audit remains best-effort. Raw memory content is NEVER recorded in audit.
+ * 5. Bounded Context: Memory context building strictly honors the 4,000-character ceiling
  *    and untrusted-data boundary framing from Phase 7.2.
  */
 
@@ -37,9 +38,7 @@ import type {
   MemoryScopeType,
   MemoryStatus,
   MemoryPermission,
-  MemoryActor,
   CallerContext,
-  ProposalDecision,
   ProposalDecisionInput,
   BuildTaskMemoryContextOptions,
   BuiltMemoryContext,
@@ -64,20 +63,7 @@ import type { AuditRepository } from '../storage/audit-repository.ts';
 import type { TaskRepository } from '../storage/task-repository.ts';
 import { RelevanceMatcher } from './relevance-matcher.ts';
 import { MemoryContextBuilder } from './context-builder.ts';
-
-const VALID_PERMISSIONS: ReadonlySet<MemoryPermission> = new Set([
-  'READ',
-  'WRITE',
-  'DELETE',
-  'APPROVE'
-]);
-
-const VALID_ACTORS: ReadonlySet<MemoryActor> = new Set([
-  'USER',
-  'AGENT',
-  'SYSTEM',
-  'POLICY_ENGINE'
-]);
+import { MemoryAuthorizer, type IssueCallerContextInput } from '../security/memory-authorizer.ts';
 
 const VALID_SCOPES: ReadonlySet<MemoryScopeType> = new Set([
   'GLOBAL',
@@ -88,6 +74,7 @@ export interface MemoryServiceOptions {
   readonly memoryRepo: MemoryRepository;
   readonly auditRepo?: AuditRepository;
   readonly taskRepo?: TaskRepository;
+  readonly authorizer?: MemoryAuthorizer;
   readonly relevanceMatcher?: RelevanceMatcher;
   readonly contextBuilder?: MemoryContextBuilder;
 }
@@ -96,6 +83,7 @@ export class MemoryService {
   private readonly memoryRepo: MemoryRepository;
   private readonly auditRepo?: AuditRepository;
   private readonly taskRepo?: TaskRepository;
+  public readonly authorizer: MemoryAuthorizer;
   private readonly relevanceMatcher: RelevanceMatcher;
   private readonly contextBuilder: MemoryContextBuilder;
   private systemTaskId?: string;
@@ -111,14 +99,22 @@ export class MemoryService {
     this.memoryRepo = options.memoryRepo;
     this.auditRepo = options.auditRepo;
     this.taskRepo = options.taskRepo;
+    this.authorizer = options.authorizer ?? new MemoryAuthorizer();
     this.relevanceMatcher = options.relevanceMatcher ?? new RelevanceMatcher();
     this.contextBuilder = options.contextBuilder ?? new MemoryContextBuilder({ matcher: this.relevanceMatcher });
+  }
+
+  /**
+   * Helper to issue an authentic, host-sealed CallerContext via the service's authorizer.
+   */
+  public issueContext(input: IssueCallerContextInput): CallerContext {
+    return this.authorizer.issueContext(input);
   }
 
   // --- Public Operations ---
 
   /**
-   * Retrieves a memory by ID, enforcing scope containment and READ permission.
+   * Retrieves a memory by ID, enforcing scope containment, host verification, and READ permission.
    */
   public getMemoryById(caller: CallerContext, id: string): Memory | null {
     this.validateCaller(caller, 'READ');
@@ -135,7 +131,7 @@ export class MemoryService {
           category: memory.category,
           scopeType: memory.scopeType,
           scopeId: memory.scopeId
-        });
+        }, false);
       }
       return memory;
     } catch (err) {
@@ -144,7 +140,7 @@ export class MemoryService {
           reason: 'CROSS_SCOPE_READ_ATTEMPT',
           memoryId: id,
           expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
-        });
+        }, false);
       }
       throw err;
     }
@@ -167,7 +163,7 @@ export class MemoryService {
         category: memory.category,
         scopeType: memory.scopeType,
         scopeId: memory.scopeId
-      });
+      }, false);
     }
     return memory;
   }
@@ -197,6 +193,7 @@ export class MemoryService {
   /**
    * Creates a memory within the caller's scope.
    * Agent callers are strictly restricted to submitting proposals with status 'PENDING_APPROVAL'.
+   * State mutation audit logging is mandatory (fail-closed).
    */
   public createMemory(caller: CallerContext, input: CreateMemoryInput): Memory {
     this.validateCaller(caller, 'WRITE');
@@ -215,7 +212,7 @@ export class MemoryService {
           reason: 'AGENT_DIRECT_ACTIVE_CREATION_DENIED',
           operation: 'createMemory',
           attemptedKey: input.key
-        });
+        }, false);
         throw new SecurityViolationError(
           'Agents cannot directly create active memories; proposals must be created with status PENDING_APPROVAL.',
           'AGENT_PROPOSAL_REQUIRED',
@@ -234,6 +231,7 @@ export class MemoryService {
       status
     });
 
+    // Mandatory audit write for state creation
     if (status === 'ACTIVE') {
       this.audit(caller, 'MEMORY_CREATED', {
         memoryId: memory.id,
@@ -242,7 +240,7 @@ export class MemoryService {
         scopeType: memory.scopeType,
         scopeId: memory.scopeId,
         status: 'ACTIVE'
-      });
+      }, true);
     } else {
       this.audit(caller, 'MEMORY_PROPOSAL_SUBMITTED', {
         memoryId: memory.id,
@@ -252,7 +250,7 @@ export class MemoryService {
         scopeId: memory.scopeId,
         status: 'PENDING_APPROVAL',
         proposedBy: caller.actor
-      });
+      }, true);
     }
 
     return memory;
@@ -260,7 +258,12 @@ export class MemoryService {
 
   /**
    * Updates an existing memory within the caller's scope.
-   * Agents cannot directly modify active memories or elevate status to ACTIVE.
+   * 
+   * Strict Security Gates:
+   * 1. Status mutations are strictly forbidden via updateMemory.
+   *    Proposals can ONLY be activated through decideProposal with APPROVE permission.
+   * 2. Agents cannot directly modify active memories or change status.
+   * 3. State mutation audit logging is mandatory (fail-closed).
    */
   public updateMemory(caller: CallerContext, id: string, input: UpdateMemoryInput): Memory {
     this.validateCaller(caller, 'WRITE');
@@ -280,7 +283,7 @@ export class MemoryService {
           reason: 'CROSS_SCOPE_UPDATE_ATTEMPT',
           memoryId: id,
           expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
-        });
+        }, false);
       }
       throw err;
     }
@@ -289,28 +292,44 @@ export class MemoryService {
       throw new MemoryNotFoundError(id);
     }
 
-    if (caller.actor === 'AGENT') {
-      // Agents cannot activate proposals or approve memories
-      if (input.status === 'ACTIVE') {
+    // STRICT APPROVAL GATE: updateMemory must never perform status lifecycle transitions
+    if (input.status !== undefined && input.status !== existing.status) {
+      if (existing.status === 'PENDING_APPROVAL') {
         this.audit(caller, 'MEMORY_ACCESS_DENIED', {
-          reason: 'AGENT_DIRECT_ACTIVATION_DENIED',
+          reason: 'APPROVAL_BYPASS_ATTEMPT',
           operation: 'updateMemory',
-          memoryId: id
-        });
+          memoryId: id,
+          attemptedStatus: input.status
+        }, false);
         throw new SecurityViolationError(
-          'Agents cannot approve proposals or activate memories.',
+          'Cannot transition status of a pending proposal via updateMemory. Only the trusted decideProposal path with APPROVE permission may decide proposals.',
           'UNAUTHORIZED_APPROVAL',
-          { memoryId: id }
+          { memoryId: id, attemptedStatus: input.status }
         );
       }
 
+      this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+        reason: 'UNAUTHORIZED_STATUS_TRANSITION',
+        operation: 'updateMemory',
+        memoryId: id,
+        currentStatus: existing.status,
+        attemptedStatus: input.status
+      }, false);
+      throw new SecurityViolationError(
+        `Direct status transitions from '${existing.status}' to '${input.status}' cannot be performed via updateMemory. Use decideProposal for proposals, or archiveMemory to archive.`,
+        'UNAUTHORIZED_STATUS_TRANSITION',
+        { memoryId: id, currentStatus: existing.status, attemptedStatus: input.status }
+      );
+    }
+
+    if (caller.actor === 'AGENT') {
       // Agents cannot directly modify already ACTIVE memories
       if (existing.status === 'ACTIVE') {
         this.audit(caller, 'MEMORY_ACCESS_DENIED', {
           reason: 'AGENT_ACTIVE_MUTATION_DENIED',
           operation: 'updateMemory',
           memoryId: id
-        });
+        }, false);
         throw new SecurityViolationError(
           'Agents cannot directly modify active memories.',
           'AGENT_MUTATION_RESTRICTED',
@@ -321,19 +340,21 @@ export class MemoryService {
 
     const updated = this.memoryRepo.updateMemory(id, caller.scope, input);
 
+    // Mandatory audit write for state update
     this.audit(caller, 'MEMORY_UPDATED', {
       memoryId: updated.id,
       key: updated.key,
       scopeType: updated.scopeType,
       scopeId: updated.scopeId,
       updatedFields: Object.keys(input)
-    });
+    }, true);
 
     return updated;
   }
 
   /**
    * Archives a memory within the caller's scope, requiring DELETE permission.
+   * State mutation audit logging is mandatory (fail-closed).
    */
   public archiveMemory(caller: CallerContext, id: string): Memory {
     this.validateCaller(caller, 'DELETE');
@@ -348,7 +369,7 @@ export class MemoryService {
         key: archived.key,
         scopeType: archived.scopeType,
         scopeId: archived.scopeId
-      });
+      }, true);
       return archived;
     } catch (err) {
       if (err instanceof MemoryScopeViolationError) {
@@ -356,7 +377,7 @@ export class MemoryService {
           reason: 'CROSS_SCOPE_ARCHIVE_ATTEMPT',
           memoryId: id,
           expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
-        });
+        }, false);
       }
       throw err;
     }
@@ -364,7 +385,8 @@ export class MemoryService {
 
   /**
    * Hard-deletes a memory record permanently, physically erasing content and nulling
-   * foreign keys in injection provenance records.
+   * foreign keys in injection provenance records. Requires DELETE permission.
+   * State mutation audit logging is mandatory (fail-closed).
    */
   public deleteMemory(caller: CallerContext, id: string): boolean {
     this.validateCaller(caller, 'DELETE');
@@ -381,7 +403,7 @@ export class MemoryService {
           reason: 'CROSS_SCOPE_DELETE_ATTEMPT',
           memoryId: id,
           expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
-        });
+        }, false);
       }
       throw err;
     }
@@ -392,19 +414,25 @@ export class MemoryService {
 
     const deleted = this.memoryRepo.deleteMemory(id, caller.scope);
 
+    // Mandatory audit write for hard deletion
     this.audit(caller, 'MEMORY_DELETED', {
       memoryId: existing.id,
       key: existing.key,
       scopeType: existing.scopeType,
       scopeId: existing.scopeId
-    });
+    }, true);
 
     return deleted;
   }
 
   /**
    * Submits a human decision (APPROVED or REJECTED) on a pending memory proposal.
-   * Strictly requires human USER actor and APPROVE permission.
+   * 
+   * Strict Security Gates:
+   * 1. Requires verified human USER actor.
+   * 2. Requires explicit APPROVE permission.
+   * 3. Target memory must be in status 'PENDING_APPROVAL'.
+   * 4. State mutation audit logging is mandatory (fail-closed).
    */
   public decideProposal(caller: CallerContext, input: ProposalDecisionInput): Memory {
     if (!input || typeof input !== 'object') {
@@ -419,13 +447,16 @@ export class MemoryService {
       );
     }
 
-    // 1. Verify caller actor: agents and automated engines are strictly forbidden
-    if (caller?.actor === 'AGENT') {
+    // 1. Verify caller authenticity
+    this.validateCaller(caller);
+
+    // 2. Verify caller actor: agents and automated engines are strictly forbidden
+    if (caller.actor === 'AGENT') {
       this.audit(caller, 'MEMORY_ACCESS_DENIED', {
         reason: 'AGENT_SELF_APPROVAL_ATTEMPT',
         operation: 'decideProposal',
         memoryId: input.memoryId
-      });
+      }, false);
       throw new SecurityViolationError(
         'Agents are strictly forbidden from approving memory proposals.',
         'UNAUTHORIZED_APPROVAL',
@@ -433,20 +464,20 @@ export class MemoryService {
       );
     }
 
-    if (caller?.actor !== 'USER') {
+    if (caller.actor !== 'USER') {
       this.audit(caller, 'MEMORY_ACCESS_DENIED', {
         reason: 'NON_USER_APPROVAL_ATTEMPT',
         operation: 'decideProposal',
         memoryId: input.memoryId
-      });
+      }, false);
       throw new SecurityViolationError(
         'Only human users can decide memory proposals.',
         'UNAUTHORIZED_APPROVAL',
-        { actor: caller?.actor, memoryId: input.memoryId }
+        { actor: caller.actor, memoryId: input.memoryId }
       );
     }
 
-    // 2. Verify APPROVE permission
+    // 3. Verify APPROVE permission
     this.validateCaller(caller, 'APPROVE');
 
     // 3. Lookup existing proposal within caller scope
@@ -459,7 +490,7 @@ export class MemoryService {
           reason: 'CROSS_SCOPE_DECISION_ATTEMPT',
           memoryId: input.memoryId,
           expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
-        });
+        }, false);
       }
       throw err;
     }
@@ -477,6 +508,7 @@ export class MemoryService {
     const newStatus: MemoryStatus = input.decision === 'APPROVED' ? 'ACTIVE' : 'ARCHIVED';
     const updated = this.memoryRepo.updateMemory(input.memoryId, caller.scope, { status: newStatus });
 
+    // Mandatory audit write for proposal decision
     this.audit(caller, 'MEMORY_PROPOSAL_DECIDED', {
       memoryId: updated.id,
       key: updated.key,
@@ -487,14 +519,20 @@ export class MemoryService {
       scopeId: updated.scopeId,
       previousStatus: 'PENDING_APPROVAL',
       newStatus
-    });
+    }, true);
 
     return updated;
   }
 
   /**
    * Records memory injection provenance for an executed workflow task.
-   * Verifies that the task's scope and the memory's scope are strictly compatible.
+   * 
+   * Fail-Closed Guarantees:
+   * 1. Requires TaskRepository for authoritative task lookup.
+   * 2. Authoritative task scope is derived strictly from immutable task metadata assigned
+   *    upon task creation. If task metadata is missing, malformed, or untrusted, fails closed.
+   * 3. Memory must exist, reside in the exact same scope as the task, and have status 'ACTIVE'.
+   * 4. Inactive memories (proposals, archived) are strictly rejected.
    */
   public recordTaskInjection(
     caller: CallerContext,
@@ -508,36 +546,37 @@ export class MemoryService {
       throw new ValidationError('Task ID must be a non-empty string.');
     }
 
-    // 1. If taskRepo is configured, verify task exists and validate its scope
-    let taskScope: ScopeIdentifier = caller.scope;
-    if (this.taskRepo) {
-      const task = this.taskRepo.getTaskById(input.taskId);
-      if (!task) {
-        throw new TaskNotFoundError(input.taskId);
-      }
-      taskScope = this.extractTaskScope(task, caller.scope);
-
-      // Verify task scope matches caller scope
-      if (
-        taskScope.scopeType !== caller.scope.scopeType ||
-        taskScope.scopeId !== caller.scope.scopeId
-      ) {
-        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
-          reason: 'TASK_CALLER_SCOPE_MISMATCH',
-          taskId: input.taskId,
-          callerScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`,
-          taskScope: `${taskScope.scopeType}:${taskScope.scopeId}`
-        });
-        throw new MemoryScopeViolationError(
-          `${caller.scope.scopeType}:${caller.scope.scopeId}`,
-          `${taskScope.scopeType}:${taskScope.scopeId}`,
-          undefined,
-          { taskId: input.taskId }
-        );
-      }
+    if (!this.taskRepo) {
+      throw new ValidationError('TaskRepository is required for authoritative task lookup and injection provenance.');
     }
 
-    // 2. If memoryId is provided, verify memory exists and scope matches task scope exactly
+    // 1. Authoritative task lookup and scope validation
+    const task = this.taskRepo.getTaskById(input.taskId);
+    if (!task) {
+      throw new TaskNotFoundError(input.taskId);
+    }
+    const taskScope = this.extractAuthoritativeTaskScope(task);
+
+    // Verify task scope matches caller scope
+    if (
+      taskScope.scopeType !== caller.scope.scopeType ||
+      taskScope.scopeId !== caller.scope.scopeId
+    ) {
+      this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+        reason: 'TASK_CALLER_SCOPE_MISMATCH',
+        taskId: input.taskId,
+        callerScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`,
+        taskScope: `${taskScope.scopeType}:${taskScope.scopeId}`
+      }, false);
+      throw new MemoryScopeViolationError(
+        `${caller.scope.scopeType}:${caller.scope.scopeId}`,
+        `${taskScope.scopeType}:${taskScope.scopeId}`,
+        undefined,
+        { taskId: input.taskId }
+      );
+    }
+
+    // 2. Validate memory existence, scope, and ACTIVE status
     if (input.memoryId) {
       let memory: Memory | null;
       try {
@@ -549,13 +588,20 @@ export class MemoryService {
             taskId: input.taskId,
             memoryId: input.memoryId,
             callerScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
-          });
+          }, false);
         }
         throw err;
       }
 
       if (!memory) {
         throw new MemoryNotFoundError(input.memoryId);
+      }
+
+      // Memory must be ACTIVE to be injected
+      if (memory.status !== 'ACTIVE') {
+        throw new ValidationError(
+          `Cannot record injection provenance for inactive memory '${input.memoryId}' (status: '${memory.status}').`
+        );
       }
 
       if (
@@ -568,7 +614,7 @@ export class MemoryService {
           memoryId: input.memoryId,
           taskScope: `${taskScope.scopeType}:${taskScope.scopeId}`,
           memoryScope: `${memory.scopeType}:${memory.scopeId}`
-        });
+        }, false);
         throw new MemoryScopeViolationError(
           `${taskScope.scopeType}:${taskScope.scopeId}`,
           `${memory.scopeType}:${memory.scopeId}`,
@@ -582,7 +628,38 @@ export class MemoryService {
   }
 
   /**
-   * Retrieves injection provenance records for a given task.
+   * Records a batch of injection provenance records atomically.
+   * Uses an immediate database transaction to guarantee zero partial writes if any
+   * memory record fails validation.
+   */
+  public recordTaskInjectionsBatch(
+    caller: CallerContext,
+    inputs: readonly RecordMemoryInjectionInput[]
+  ): MemoryTaskInjection[] {
+    this.validateCaller(caller, 'WRITE');
+    if (!Array.isArray(inputs)) {
+      throw new ValidationError('Inputs must be an array of RecordMemoryInjectionInput.');
+    }
+    if (inputs.length === 0) {
+      return [];
+    }
+
+    if (!this.taskRepo) {
+      throw new ValidationError('TaskRepository is required for authoritative task lookup and injection provenance.');
+    }
+
+    // Pre-validate all inputs and execute atomically within transaction
+    return this.memoryRepo.transaction(() => {
+      const results: MemoryTaskInjection[] = [];
+      for (const input of inputs) {
+        results.push(this.recordTaskInjection(caller, input));
+      }
+      return results;
+    });
+  }
+
+  /**
+   * Retrieves injection provenance records for a given task, enforcing authoritative task scope.
    */
   public getInjectionsByTaskId(caller: CallerContext, taskId: string): MemoryTaskInjection[] {
     this.validateCaller(caller, 'READ');
@@ -590,29 +667,31 @@ export class MemoryService {
       throw new ValidationError('Task ID must be a non-empty string.');
     }
 
-    if (this.taskRepo) {
-      const task = this.taskRepo.getTaskById(taskId);
-      if (!task) {
-        throw new TaskNotFoundError(taskId);
-      }
-      const taskScope = this.extractTaskScope(task, caller.scope);
-      if (
-        taskScope.scopeType !== caller.scope.scopeType ||
-        taskScope.scopeId !== caller.scope.scopeId
-      ) {
-        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
-          reason: 'TASK_CALLER_SCOPE_MISMATCH',
-          taskId,
-          callerScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`,
-          taskScope: `${taskScope.scopeType}:${taskScope.scopeId}`
-        });
-        throw new MemoryScopeViolationError(
-          `${caller.scope.scopeType}:${caller.scope.scopeId}`,
-          `${taskScope.scopeType}:${taskScope.scopeId}`,
-          undefined,
-          { taskId }
-        );
-      }
+    if (!this.taskRepo) {
+      throw new ValidationError('TaskRepository is required for authoritative task lookup.');
+    }
+
+    const task = this.taskRepo.getTaskById(taskId);
+    if (!task) {
+      throw new TaskNotFoundError(taskId);
+    }
+    const taskScope = this.extractAuthoritativeTaskScope(task);
+    if (
+      taskScope.scopeType !== caller.scope.scopeType ||
+      taskScope.scopeId !== caller.scope.scopeId
+    ) {
+      this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+        reason: 'TASK_CALLER_SCOPE_MISMATCH',
+        taskId,
+        callerScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`,
+        taskScope: `${taskScope.scopeType}:${taskScope.scopeId}`
+      }, false);
+      throw new MemoryScopeViolationError(
+        `${caller.scope.scopeType}:${caller.scope.scopeId}`,
+        `${taskScope.scopeType}:${taskScope.scopeId}`,
+        undefined,
+        { taskId }
+      );
     }
 
     return this.memoryRepo.getInjectionsByTaskId(taskId);
@@ -628,7 +707,7 @@ export class MemoryService {
         reason: 'INSUFFICIENT_PERMISSIONS',
         operation: 'recordAccess',
         actor: caller.actor
-      });
+      }, false);
       throw new SecurityViolationError(
         `Caller '${caller.actor}' lacks READ or WRITE permission to record memory access.`,
         'INSUFFICIENT_PERMISSIONS',
@@ -646,6 +725,7 @@ export class MemoryService {
   /**
    * Builds a safe, bounded memory context block for task execution.
    * Only ACTIVE memories within the caller's scope are considered.
+   * Batch injection recording uses a database transaction to prevent partial writes.
    */
   public buildTaskMemoryContext(
     caller: CallerContext,
@@ -659,13 +739,16 @@ export class MemoryService {
       throw new ValidationError('Query must be a string.');
     }
 
-    // If taskId is provided, verify task exists and scope is compatible
-    if (options.taskId && this.taskRepo) {
+    // If taskId is provided, verify task exists and authoritative scope is compatible
+    if (options.taskId) {
+      if (!this.taskRepo) {
+        throw new ValidationError('TaskRepository is required for authoritative task lookup.');
+      }
       const task = this.taskRepo.getTaskById(options.taskId);
       if (!task) {
         throw new TaskNotFoundError(options.taskId);
       }
-      const taskScope = this.extractTaskScope(task, caller.scope);
+      const taskScope = this.extractAuthoritativeTaskScope(task);
       if (
         taskScope.scopeType !== caller.scope.scopeType ||
         taskScope.scopeId !== caller.scope.scopeId
@@ -675,7 +758,7 @@ export class MemoryService {
           taskId: options.taskId,
           callerScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`,
           taskScope: `${taskScope.scopeType}:${taskScope.scopeId}`
-        });
+        }, false);
         throw new MemoryScopeViolationError(
           `${caller.scope.scopeType}:${caller.scope.scopeId}`,
           `${taskScope.scopeType}:${taskScope.scopeId}`,
@@ -705,16 +788,25 @@ export class MemoryService {
 
     const context = builder.buildContext(options.query, candidates);
 
-    // Record provenance if requested and taskId is present
+    // Record provenance atomically if requested and taskId is present
     if (options.recordInjections && options.taskId) {
-      for (const inc of context.included) {
-        this.memoryRepo.recordInjection({
-          taskId: options.taskId,
-          memoryId: inc.id,
-          charCount: context.totalChars,
-          estimatedTokens: context.estimatedTokens
-        });
-      }
+      const taskId = options.taskId;
+      this.memoryRepo.transaction(() => {
+        for (const inc of context.included) {
+          const memory = this.memoryRepo.getMemoryById(inc.id, caller.scope);
+          if (!memory || memory.status !== 'ACTIVE') {
+            throw new ValidationError(
+              `Cannot record injection provenance: memory '${inc.id}' is not active.`
+            );
+          }
+          this.memoryRepo.recordInjection({
+            taskId,
+            memoryId: inc.id,
+            charCount: context.totalChars,
+            estimatedTokens: context.estimatedTokens
+          });
+        }
+      });
     }
 
     if (context.included.length > 0) {
@@ -724,7 +816,7 @@ export class MemoryService {
         scopeType: caller.scope.scopeType,
         scopeId: caller.scope.scopeId,
         taskId: options.taskId
-      });
+      }, false);
     }
 
     return context;
@@ -733,79 +825,44 @@ export class MemoryService {
   // --- Private Helpers ---
 
   /**
-   * Validates caller context and enforces required permission if specified.
+   * Validates caller context via host authorizer and enforces required permission if specified.
    */
   private validateCaller(
     caller: CallerContext,
     requiredPermission?: MemoryPermission
   ): Set<MemoryPermission> {
-    if (!caller || typeof caller !== 'object') {
-      throw new ValidationError('CallerContext must be provided.');
-    }
+    // 1. Authoritative verification: caller must be issued and un-tampered by host boundary
+    const verified = this.authorizer.verify(caller);
 
-    if (!caller.actor || !VALID_ACTORS.has(caller.actor)) {
-      throw new ValidationError(`Invalid or missing caller actor: ${String(caller.actor)}`);
-    }
+    this.validateScope(verified.scope.scopeType, verified.scope.scopeId);
 
-    if (!caller.scope || typeof caller.scope !== 'object') {
-      throw new ValidationError('Caller scope must be provided.');
-    }
-
-    this.validateScope(caller.scope.scopeType, caller.scope.scopeId);
-
-    const permissions = this.normalizePermissions(caller.permissions);
+    const permissions = verified.permissions instanceof Set
+      ? (verified.permissions as Set<MemoryPermission>)
+      : new Set(verified.permissions);
 
     if (requiredPermission && !permissions.has(requiredPermission)) {
-      this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+      this.audit(verified, 'MEMORY_ACCESS_DENIED', {
         reason: 'INSUFFICIENT_PERMISSIONS',
         requiredPermission,
-        actor: caller.actor,
-        scopeType: caller.scope.scopeType,
-        scopeId: caller.scope.scopeId
-      });
+        actor: verified.actor,
+        scopeType: verified.scope.scopeType,
+        scopeId: verified.scope.scopeId
+      }, false);
       throw new SecurityViolationError(
-        `Caller '${caller.actor}' lacks required '${requiredPermission}' permission.`,
+        `Caller '${verified.actor}' lacks required '${requiredPermission}' permission.`,
         'INSUFFICIENT_PERMISSIONS',
-        { actor: caller.actor, requiredPermission, scope: caller.scope }
+        { actor: verified.actor, requiredPermission, scope: verified.scope }
       );
     }
 
-    if (this.taskRepo && caller.taskId) {
-      const task = this.taskRepo.getTaskById(caller.taskId);
+    if (this.taskRepo && verified.taskId) {
+      const task = this.taskRepo.getTaskById(verified.taskId);
       if (!task) {
-        throw new TaskNotFoundError(caller.taskId);
+        throw new TaskNotFoundError(verified.taskId);
       }
     }
 
     return permissions;
-  }
-
-  /**
-   * Normalizes and validates caller permissions array/set.
-   */
-  private normalizePermissions(perms: unknown): Set<MemoryPermission> {
-    if (!perms) {
-      throw new ValidationError('Caller permissions must be provided.');
-    }
-
-    let items: Iterable<unknown>;
-    if (perms instanceof Set) {
-      items = perms;
-    } else if (Array.isArray(perms)) {
-      items = perms;
-    } else {
-      throw new ValidationError('Caller permissions must be an Array or Set.');
-    }
-
-    const result = new Set<MemoryPermission>();
-    for (const item of items) {
-      if (typeof item !== 'string' || !VALID_PERMISSIONS.has(item as MemoryPermission)) {
-        throw new ValidationError(`Invalid permission value: ${String(item)}`);
-      }
-      result.add(item as MemoryPermission);
-    }
-
-    return result;
   }
 
   /**
@@ -849,7 +906,7 @@ export class MemoryService {
         operation,
         attemptedScope,
         callerScope
-      });
+      }, false);
       throw new MemoryScopeViolationError(
         callerScope,
         attemptedScope,
@@ -860,54 +917,90 @@ export class MemoryService {
   }
 
   /**
-   * Derives task scope from Task metadata.
+   * Extracts authoritative task scope strictly from trusted task metadata.
+   * Fails closed if metadata is missing, malformed, or lacks valid scope fields.
+   * NEVER falls back to caller scope.
    */
-  private extractTaskScope(task: Task, fallback: ScopeIdentifier): ScopeIdentifier {
+  private extractAuthoritativeTaskScope(task: Task): ScopeIdentifier {
     if (!task.metadataJson) {
-      return fallback;
+      throw new ValidationError(
+        `Task '${task.id}' lacks metadata required to establish authoritative scope.`
+      );
     }
+
+    let meta: Record<string, unknown>;
     try {
-      const meta = JSON.parse(task.metadataJson);
-      if (meta && typeof meta === 'object') {
-        if (meta.scopeType && meta.scopeId) {
-          return {
-            scopeType: meta.scopeType as MemoryScopeType,
-            scopeId: String(meta.scopeId)
-          };
-        }
-        if (meta.workspaceId) {
-          return {
-            scopeType: 'WORKSPACE',
-            scopeId: String(meta.workspaceId)
-          };
-        }
-        if (meta.scope && typeof meta.scope === 'object') {
-          return {
-            scopeType: meta.scope.scopeType as MemoryScopeType,
-            scopeId: String(meta.scope.scopeId)
-          };
-        }
-      }
+      meta = JSON.parse(task.metadataJson);
     } catch {
-      // Fallback on JSON parse error
+      throw new ValidationError(
+        `Task '${task.id}' metadata is malformed JSON; cannot establish authoritative scope.`
+      );
     }
-    return fallback;
+
+    if (!meta || typeof meta !== 'object') {
+      throw new ValidationError(
+        `Task '${task.id}' metadata is not an object; cannot establish authoritative scope.`
+      );
+    }
+
+    if (meta.scopeType && meta.scopeId) {
+      const scopeType = meta.scopeType as MemoryScopeType;
+      const scopeId = String(meta.scopeId);
+      this.validateScope(scopeType, scopeId);
+      return { scopeType, scopeId };
+    }
+
+    if (meta.workspaceId && typeof meta.workspaceId === 'string' && meta.workspaceId.trim() !== '') {
+      return {
+        scopeType: 'WORKSPACE',
+        scopeId: meta.workspaceId.trim()
+      };
+    }
+
+    if (meta.scope && typeof meta.scope === 'object') {
+      const s = meta.scope as Record<string, unknown>;
+      if (s.scopeType && s.scopeId) {
+        const scopeType = s.scopeType as MemoryScopeType;
+        const scopeId = String(s.scopeId);
+        this.validateScope(scopeType, scopeId);
+        return { scopeType, scopeId };
+      }
+    }
+
+    throw new ValidationError(
+      `Task '${task.id}' metadata does not contain valid scope information (workspaceId or scopeType/scopeId).`
+    );
   }
 
   /**
    * Emits privacy-conscious, tamper-evident audit events via AuditRepository.
+   * 
+   * Policy:
+   * - Mandatory (fail-closed) for state mutations and decisions (create, update, archive, delete, approve).
+   * - Best-effort for read telemetry.
    */
   private audit(
     caller: CallerContext,
     eventType: AuditEventType,
-    details: Record<string, unknown>
+    details: Record<string, unknown>,
+    mandatory: boolean = false
   ): void {
     if (!this.auditRepo) {
+      if (mandatory) {
+        throw new ValidationError(
+          `Audit repository is required to record mandatory audit event '${eventType}'.`
+        );
+      }
       return;
     }
 
     const taskId = caller.taskId ?? this.getOrCreateSystemTaskId();
     if (!taskId) {
+      if (mandatory) {
+        throw new ValidationError(
+          `Task ID or system task is required to record mandatory audit event '${eventType}'.`
+        );
+      }
       return;
     }
 
@@ -918,8 +1011,10 @@ export class MemoryService {
         actor: caller.actor,
         details
       });
-    } catch {
-      // Prevent audit secondary failures from masking primary operations
+    } catch (err) {
+      if (mandatory) {
+        throw err;
+      }
     }
   }
 
@@ -941,7 +1036,8 @@ export class MemoryService {
       }
       const created = this.taskRepo.createTask({
         id: '__system_memory__',
-        goal: 'System long-term memory operations'
+        goal: 'System long-term memory operations',
+        metadata: { scopeType: 'GLOBAL', scopeId: 'default' }
       });
       this.systemTaskId = created.id;
       return this.systemTaskId;

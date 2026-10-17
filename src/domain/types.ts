@@ -400,6 +400,10 @@ export interface CallerContext {
   readonly scope: ScopeIdentifier;
   readonly permissions: ReadonlySet<MemoryPermission> | readonly MemoryPermission[];
   readonly taskId?: string;
+  readonly _proof?: {
+    readonly signature: string;
+    readonly nonce: string;
+  };
 }
 
 export type ProposalDecision = 'APPROVED' | 'REJECTED';

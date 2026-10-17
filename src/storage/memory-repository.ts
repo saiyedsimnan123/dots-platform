@@ -85,6 +85,13 @@ export class MemoryRepository {
   }
 
   /**
+   * Executes a callback within an immediate database transaction.
+   */
+  public transaction<T>(callback: () => T): T {
+    return this.db.transaction(callback);
+  }
+
+  /**
    * Persists a new memory entity within the designated scope.
    */
   public createMemory(input: CreateMemoryInput): Memory {

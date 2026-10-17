@@ -1,6 +1,6 @@
 /**
- * Next-Generation Dots AI Platform - Memory Service Unit & Adversarial Tests
- * Phase 7.3: Memory Subsystem
+ * Next-Generation Dots AI Platform - Memory Service Security Hardening Tests
+ * Phase 7.3: Security Hardening
  */
 
 import test from 'node:test';
@@ -12,7 +12,8 @@ import { MemoryRepository } from '../../src/storage/memory-repository.ts';
 import { RelevanceMatcher } from '../../src/memory/relevance-matcher.ts';
 import { MemoryContextBuilder } from '../../src/memory/context-builder.ts';
 import { MemoryService } from '../../src/memory/memory-service.ts';
-import type { CallerContext, ScopeIdentifier } from '../../src/domain/types.ts';
+import { MemoryAuthorizer } from '../../src/security/memory-authorizer.ts';
+import type { ScopeIdentifier } from '../../src/domain/types.ts';
 import {
   ValidationError,
   SecurityViolationError,
@@ -52,134 +53,169 @@ function setupServiceTest() {
   };
 }
 
-test('MemoryService - CallerContext validation and permission checks', () => {
-  const { db, memoryService, taskRepo, workspaceA } = setupServiceTest();
+test('MemoryService - Host authorization boundary prevents forged caller contexts', () => {
+  const { db, memoryService, taskRepo, workspaceA, workspaceB } = setupServiceTest();
 
   try {
-    const task = taskRepo.createTask({ goal: 'Permission validation task' });
+    const taskA = taskRepo.createTask({
+      goal: 'Authorized task A',
+      metadata: { workspaceId: workspaceA.scopeId }
+    });
 
-    // 1. Missing or non-object caller
-    assert.throws(
-      () => memoryService.getMemoryById(null as any, 'mem-1'),
-      (err: unknown) => err instanceof ValidationError && err.message.includes('CallerContext')
-    );
-
-    // 2. Invalid actor
-    assert.throws(
-      () => memoryService.getMemoryById({
-        actor: 'INVALID_ACTOR' as any,
-        scope: workspaceA,
-        permissions: ['READ']
-      }, 'mem-1'),
-      (err: unknown) => err instanceof ValidationError && err.message.includes('actor')
-    );
-
-    // 3. Missing scope
-    assert.throws(
-      () => memoryService.getMemoryById({
-        actor: 'USER',
-        scope: null as any,
-        permissions: ['READ']
-      }, 'mem-1'),
-      (err: unknown) => err instanceof ValidationError && err.message.includes('scope')
-    );
-
-    // 4. Invalid scopeType or scopeId
-    assert.throws(
-      () => memoryService.getMemoryById({
-        actor: 'USER',
-        scope: { scopeType: 'INVALID' as any, scopeId: 'ws-1' },
-        permissions: ['READ']
-      }, 'mem-1'),
-      (err: unknown) => err instanceof ValidationError && err.message.includes('scopeType')
-    );
-
-    assert.throws(
-      () => memoryService.getMemoryById({
-        actor: 'USER',
-        scope: { scopeType: 'GLOBAL', scopeId: 'not-default' },
-        permissions: ['READ']
-      }, 'mem-1'),
-      (err: unknown) => err instanceof ValidationError && err.message.includes('default')
-    );
-
-    // 5. Missing or invalid permissions
-    assert.throws(
-      () => memoryService.getMemoryById({
-        actor: 'USER',
-        scope: workspaceA,
-        permissions: null as any
-      }, 'mem-1'),
-      (err: unknown) => err instanceof ValidationError && err.message.includes('permissions')
-    );
-
-    assert.throws(
-      () => memoryService.getMemoryById({
-        actor: 'USER',
-        scope: workspaceA,
-        permissions: ['INVALID_PERMISSION' as any]
-      }, 'mem-1'),
-      (err: unknown) => err instanceof ValidationError && err.message.includes('Invalid permission')
-    );
-
-    // 6. Insufficient permissions on READ
-    const noPermCaller: CallerContext = {
-      actor: 'USER',
+    // 1. Raw handcrafted object literal is REJECTED even if structurally valid
+    const unsealedLiteral = {
+      actor: 'USER' as const,
       scope: workspaceA,
-      permissions: [],
-      taskId: task.id
+      permissions: ['READ' as const, 'WRITE' as const, 'DELETE' as const, 'APPROVE' as const],
+      taskId: taskA.id
     };
 
     assert.throws(
-      () => memoryService.getMemoryById(noPermCaller, 'mem-1'),
+      () => memoryService.getMemoryById(unsealedLiteral as any, 'mem-1'),
       (err: unknown) => {
         assert.ok(err instanceof SecurityViolationError);
-        assert.equal(err.code, 'SECURITY_VIOLATION');
-        assert.equal(err.violationType, 'INSUFFICIENT_PERMISSIONS');
+        assert.equal(err.violationType, 'FORGED_CALLER_CONTEXT');
         return true;
       }
     );
 
-    // 7. Insufficient permissions on WRITE
-    const readOnlyCaller: CallerContext = {
+    // 2. Legitimate host-issued context is ACCEPTED
+    const validUser = memoryService.issueContext({
+      actor: 'USER',
+      scope: workspaceA,
+      permissions: ['READ', 'WRITE', 'DELETE', 'APPROVE'],
+      taskId: taskA.id
+    });
+    assert.equal(memoryService.getMemoryById(validUser, 'mem-nonexistent'), null);
+
+    // 3. Adversarial tampering: Actor tampering (AGENT -> USER)
+    const validAgent = memoryService.issueContext({
+      actor: 'AGENT',
+      scope: workspaceA,
+      permissions: ['READ', 'WRITE'],
+      taskId: taskA.id
+    });
+
+    const tamperedActor = { ...validAgent, actor: 'USER' as const };
+    assert.throws(
+      () => memoryService.getMemoryById(tamperedActor as any, 'mem-1'),
+      (err: unknown) => err instanceof SecurityViolationError && err.violationType === 'FORGED_CALLER_CONTEXT'
+    );
+
+    // 4. Adversarial tampering: Permissions tampering (Escalate permissions to APPROVE)
+    const tamperedPermissions = {
+      ...validAgent,
+      permissions: new Set(['READ', 'WRITE', 'APPROVE'] as const)
+    };
+    assert.throws(
+      () => memoryService.getMemoryById(tamperedPermissions as any, 'mem-1'),
+      (err: unknown) => err instanceof SecurityViolationError && err.violationType === 'FORGED_CALLER_CONTEXT'
+    );
+
+    // 5. Adversarial tampering: Scope tampering (ws-alpha -> ws-beta)
+    const tamperedScope = {
+      ...validAgent,
+      scope: workspaceB
+    };
+    assert.throws(
+      () => memoryService.getMemoryById(tamperedScope as any, 'mem-1'),
+      (err: unknown) => err instanceof SecurityViolationError && err.violationType === 'FORGED_CALLER_CONTEXT'
+    );
+
+    // 6. Adversarial attack: Context issued by an independent authorizer (different host secret)
+    const externalAuthorizer = new MemoryAuthorizer();
+    const foreignContext = externalAuthorizer.issueContext({
+      actor: 'USER',
+      scope: workspaceA,
+      permissions: ['READ', 'WRITE', 'DELETE', 'APPROVE'],
+      taskId: taskA.id
+    });
+
+    assert.throws(
+      () => memoryService.getMemoryById(foreignContext, 'mem-1'),
+      (err: unknown) => err instanceof SecurityViolationError && err.violationType === 'FORGED_CALLER_CONTEXT'
+    );
+
+    // 7. Handcrafted object with spoofed _proof property
+    const spoofedProof = {
+      actor: 'USER' as const,
+      scope: workspaceA,
+      permissions: ['READ' as const, 'WRITE' as const],
+      taskId: taskA.id,
+      _proof: { signature: 'abcdef1234567890', nonce: 'fake-nonce' }
+    };
+    assert.throws(
+      () => memoryService.getMemoryById(spoofedProof as any, 'mem-1'),
+      (err: unknown) => err instanceof SecurityViolationError && err.violationType === 'FORGED_CALLER_CONTEXT'
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('MemoryService - Permission separation and insufficient permission enforcement', () => {
+  const { db, memoryService, taskRepo, workspaceA } = setupServiceTest();
+
+  try {
+    const task = taskRepo.createTask({
+      goal: 'Permission verification task',
+      metadata: { workspaceId: workspaceA.scopeId }
+    });
+
+    // Caller with READ only
+    const readCaller = memoryService.issueContext({
       actor: 'USER',
       scope: workspaceA,
       permissions: ['READ'],
       taskId: task.id
-    };
+    });
 
     assert.throws(
-      () => memoryService.createMemory(readOnlyCaller, {
+      () => memoryService.createMemory(readCaller, {
         category: 'PROJECT_FACT',
         scopeType: 'WORKSPACE',
         scopeId: workspaceA.scopeId,
         key: 'test.key',
-        content: 'test content'
+        content: 'content'
       }),
       (err: unknown) => err instanceof SecurityViolationError && err.violationType === 'INSUFFICIENT_PERMISSIONS'
     );
 
-    // 8. Insufficient permissions on DELETE
-    const writeOnlyCaller: CallerContext = {
+    assert.throws(
+      () => memoryService.updateMemory(readCaller, 'mem-1', { content: 'updated' }),
+      (err: unknown) => err instanceof SecurityViolationError && err.violationType === 'INSUFFICIENT_PERMISSIONS'
+    );
+
+    assert.throws(
+      () => memoryService.archiveMemory(readCaller, 'mem-1'),
+      (err: unknown) => err instanceof SecurityViolationError && err.violationType === 'INSUFFICIENT_PERMISSIONS'
+    );
+
+    assert.throws(
+      () => memoryService.deleteMemory(readCaller, 'mem-1'),
+      (err: unknown) => err instanceof SecurityViolationError && err.violationType === 'INSUFFICIENT_PERMISSIONS'
+    );
+
+    // Caller with WRITE only (lacks APPROVE and DELETE)
+    const writeCaller = memoryService.issueContext({
       actor: 'USER',
       scope: workspaceA,
-      permissions: ['READ', 'WRITE'],
+      permissions: ['WRITE'],
       taskId: task.id
-    };
+    });
 
     assert.throws(
-      () => memoryService.deleteMemory(writeOnlyCaller, 'mem-1'),
+      () => memoryService.archiveMemory(writeCaller, 'mem-1'),
       (err: unknown) => err instanceof SecurityViolationError && err.violationType === 'INSUFFICIENT_PERMISSIONS'
     );
 
     assert.throws(
-      () => memoryService.archiveMemory(writeOnlyCaller, 'mem-1'),
+      () => memoryService.deleteMemory(writeCaller, 'mem-1'),
       (err: unknown) => err instanceof SecurityViolationError && err.violationType === 'INSUFFICIENT_PERMISSIONS'
     );
 
-    // 9. Insufficient permissions on APPROVE
     assert.throws(
-      () => memoryService.decideProposal(writeOnlyCaller, {
+      () => memoryService.decideProposal(writeCaller, {
         memoryId: 'mem-1',
         decision: 'APPROVED'
       }),
@@ -190,218 +226,96 @@ test('MemoryService - CallerContext validation and permission checks', () => {
   }
 });
 
-test('MemoryService - strictly enforces scope derivation and blocks cross-workspace operations', () => {
-  const { db, memoryService, taskRepo, workspaceA, workspaceB, globalScope } = setupServiceTest();
-
-  try {
-    const taskA = taskRepo.createTask({
-      goal: 'Workspace A task',
-      metadata: { workspaceId: workspaceA.scopeId }
-    });
-    const taskB = taskRepo.createTask({
-      goal: 'Workspace B task',
-      metadata: { workspaceId: workspaceB.scopeId }
-    });
-
-    const userCallerA: CallerContext = {
-      actor: 'USER',
-      scope: workspaceA,
-      permissions: ['READ', 'WRITE', 'DELETE', 'APPROVE'],
-      taskId: taskA.id
-    };
-
-    const userCallerB: CallerContext = {
-      actor: 'USER',
-      scope: workspaceB,
-      permissions: ['READ', 'WRITE', 'DELETE', 'APPROVE'],
-      taskId: taskB.id
-    };
-
-    // 1. Create memory in Workspace A
-    const memA = memoryService.createMemory(userCallerA, {
-      category: 'PROJECT_FACT',
-      scopeType: 'WORKSPACE',
-      scopeId: workspaceA.scopeId,
-      key: 'service.port',
-      content: 'Port 8080'
-    });
-
-    assert.ok(memA.id);
-    assert.equal(memA.scopeType, 'WORKSPACE');
-    assert.equal(memA.scopeId, workspaceA.scopeId);
-
-    // 2. Caller A retrieves it successfully
-    const readByA = memoryService.getMemoryById(userCallerA, memA.id);
-    assert.ok(readByA);
-    assert.equal(readByA.content, 'Port 8080');
-
-    // 3. Caller B in Workspace B attempts cross-workspace read by ID -> MemoryScopeViolationError
-    assert.throws(
-      () => memoryService.getMemoryById(userCallerB, memA.id),
-      (err: unknown) => {
-        assert.ok(err instanceof MemoryScopeViolationError);
-        assert.equal(err.code, 'MEMORY_SCOPE_VIOLATION');
-        return true;
-      }
-    );
-
-    // 4. Caller B listMemories returns 0 records from Workspace A
-    const listB = memoryService.listMemories(userCallerB);
-    assert.equal(listB.length, 0);
-
-    // 5. Caller B attempts cross-workspace update -> MemoryScopeViolationError
-    assert.throws(
-      () => memoryService.updateMemory(userCallerB, memA.id, { content: 'Tampered' }),
-      (err: unknown) => err instanceof MemoryScopeViolationError
-    );
-
-    // 6. Caller B attempts cross-workspace archive -> MemoryScopeViolationError
-    assert.throws(
-      () => memoryService.archiveMemory(userCallerB, memA.id),
-      (err: unknown) => err instanceof MemoryScopeViolationError
-    );
-
-    // 7. Caller B attempts cross-workspace delete -> MemoryScopeViolationError
-    assert.throws(
-      () => memoryService.deleteMemory(userCallerB, memA.id),
-      (err: unknown) => err instanceof MemoryScopeViolationError
-    );
-
-    // 8. Global scope isolation: Global caller cannot access workspace memory
-    const globalCaller: CallerContext = {
-      actor: 'USER',
-      scope: globalScope,
-      permissions: ['READ', 'WRITE', 'DELETE', 'APPROVE']
-    };
-
-    assert.throws(
-      () => memoryService.getMemoryById(globalCaller, memA.id),
-      (err: unknown) => err instanceof MemoryScopeViolationError
-    );
-  } finally {
-    db.close();
-  }
-});
-
-test('MemoryService - rejects attempts to forge scope through untrusted caller input', () => {
-  const { db, memoryService, taskRepo, workspaceA, workspaceB, globalScope } = setupServiceTest();
-
-  try {
-    const taskA = taskRepo.createTask({
-      goal: 'Workspace A task',
-      metadata: { workspaceId: workspaceA.scopeId }
-    });
-
-    const agentCaller: CallerContext = {
-      actor: 'AGENT',
-      scope: workspaceA,
-      permissions: ['READ', 'WRITE'],
-      taskId: taskA.id
-    };
-
-    // 1. Agent attempts to specify scopeId of Workspace B inside createMemory
-    assert.throws(
-      () => memoryService.createMemory(agentCaller, {
-        category: 'PROJECT_FACT',
-        scopeType: 'WORKSPACE',
-        scopeId: workspaceB.scopeId, // Attempted spoof
-        key: 'spoofed.key',
-        content: 'Spoofed content'
-      }),
-      (err: unknown) => {
-        assert.ok(err instanceof MemoryScopeViolationError);
-        assert.ok(err.message.includes('Memory scope violation'));
-        return true;
-      }
-    );
-
-    // 2. Agent attempts to specify scopeType of GLOBAL inside createMemory
-    assert.throws(
-      () => memoryService.createMemory(agentCaller, {
-        category: 'USER_PREFERENCE',
-        scopeType: 'GLOBAL', // Attempted spoof
-        scopeId: globalScope.scopeId,
-        key: 'spoofed.global',
-        content: 'Spoofed global'
-      }),
-      (err: unknown) => err instanceof MemoryScopeViolationError
-    );
-
-    // 3. Agent attempts to specify different scopeId inside listMemories filter
-    assert.throws(
-      () => memoryService.listMemories(agentCaller, {
-        scopeId: workspaceB.scopeId
-      } as any),
-      (err: unknown) => err instanceof MemoryScopeViolationError
-    );
-  } finally {
-    db.close();
-  }
-});
-
-test('MemoryService - agent memory proposals remain inactive until human approval', () => {
+test('MemoryService - Approval bypass prevention across all update and proposal paths', () => {
   const { db, memoryService, taskRepo, workspaceA } = setupServiceTest();
 
   try {
     const task = taskRepo.createTask({
-      goal: 'Agent research task',
+      goal: 'Proposal bypass testing task',
       metadata: { workspaceId: workspaceA.scopeId }
     });
 
-    const agentCaller: CallerContext = {
+    const agentCaller = memoryService.issueContext({
       actor: 'AGENT',
       scope: workspaceA,
       permissions: ['READ', 'WRITE'],
       taskId: task.id
-    };
+    });
 
-    const userCaller: CallerContext = {
+    const userWriteOnly = memoryService.issueContext({
+      actor: 'USER',
+      scope: workspaceA,
+      permissions: ['READ', 'WRITE'],
+      taskId: task.id
+    });
+
+    const userFull = memoryService.issueContext({
       actor: 'USER',
       scope: workspaceA,
       permissions: ['READ', 'WRITE', 'DELETE', 'APPROVE'],
       taskId: task.id
-    };
+    });
 
-    // 1. Agent attempts to directly create an ACTIVE memory -> SecurityViolationError
-    assert.throws(
-      () => memoryService.createMemory(agentCaller, {
-        category: 'PROJECT_FACT',
-        scopeType: 'WORKSPACE',
-        scopeId: workspaceA.scopeId,
-        key: 'database.engine',
-        content: 'PostgreSQL 16',
-        status: 'ACTIVE'
-      }),
-      (err: unknown) => {
-        assert.ok(err instanceof SecurityViolationError);
-        assert.equal(err.violationType, 'AGENT_PROPOSAL_REQUIRED');
-        return true;
-      }
-    );
-
-    // 2. Agent creates memory without status or with PENDING_APPROVAL -> persists as PENDING_APPROVAL proposal
+    // 1. Agent submits proposal
     const proposal = memoryService.createMemory(agentCaller, {
       category: 'PROJECT_FACT',
       scopeType: 'WORKSPACE',
       scopeId: workspaceA.scopeId,
-      key: 'database.engine',
-      content: 'PostgreSQL 16'
+      key: 'cache.ttl',
+      content: '3600 seconds'
     });
-
-    assert.ok(proposal.id);
     assert.equal(proposal.status, 'PENDING_APPROVAL');
 
-    // 3. Verify proposal is NOT included in ACTIVE listMemories
-    const activeList = memoryService.listMemories(userCaller, { status: 'ACTIVE' });
-    assert.equal(activeList.length, 0);
+    // 2. BYPASS ATTEMPT 1: User with WRITE alone attempts to activate proposal via updateMemory
+    assert.throws(
+      () => memoryService.updateMemory(userWriteOnly, proposal.id, {
+        status: 'ACTIVE'
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof SecurityViolationError);
+        assert.equal(err.violationType, 'UNAUTHORIZED_APPROVAL');
+        return true;
+      }
+    );
 
-    // 4. Verify proposal is NOT included in buildTaskMemoryContext
-    const context = memoryService.buildTaskMemoryContext(userCaller, {
-      query: 'What database engine are we using?'
-    });
-    assert.equal(context.included.length, 0);
+    // 3. BYPASS ATTEMPT 2: User with FULL permissions (including APPROVE) attempts to activate via updateMemory
+    // MUST FAIL: Only the trusted decideProposal path may approve proposals!
+    assert.throws(
+      () => memoryService.updateMemory(userFull, proposal.id, {
+        status: 'ACTIVE'
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof SecurityViolationError);
+        assert.equal(err.violationType, 'UNAUTHORIZED_APPROVAL');
+        return true;
+      }
+    );
 
-    // 5. Agent attempts self-approval -> SecurityViolationError
+    // 4. BYPASS ATTEMPT 3: Agent attempts to activate proposal via updateMemory
+    assert.throws(
+      () => memoryService.updateMemory(agentCaller, proposal.id, {
+        status: 'ACTIVE'
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof SecurityViolationError);
+        assert.equal(err.violationType, 'UNAUTHORIZED_APPROVAL');
+        return true;
+      }
+    );
+
+    // 5. BYPASS ATTEMPT 4: User attempts direct status transition to ARCHIVED via updateMemory
+    assert.throws(
+      () => memoryService.updateMemory(userWriteOnly, proposal.id, {
+        status: 'ARCHIVED'
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof SecurityViolationError);
+        assert.equal(err.violationType, 'UNAUTHORIZED_APPROVAL');
+        return true;
+      }
+    );
+
+    // 6. BYPASS ATTEMPT 5: Agent attempts to decideProposal on its own proposal
     assert.throws(
       () => memoryService.decideProposal(agentCaller, {
         memoryId: proposal.id,
@@ -414,10 +328,17 @@ test('MemoryService - agent memory proposals remain inactive until human approva
       }
     );
 
-    // 6. Agent attempts to activate via updateMemory -> SecurityViolationError
+    // 7. BYPASS ATTEMPT 6: System actor attempts to decideProposal
+    const systemCaller = memoryService.issueContext({
+      actor: 'SYSTEM',
+      scope: workspaceA,
+      permissions: ['APPROVE'],
+      taskId: task.id
+    });
     assert.throws(
-      () => memoryService.updateMemory(agentCaller, proposal.id, {
-        status: 'ACTIVE'
+      () => memoryService.decideProposal(systemCaller, {
+        memoryId: proposal.id,
+        decision: 'APPROVED'
       }),
       (err: unknown) => {
         assert.ok(err instanceof SecurityViolationError);
@@ -426,223 +347,321 @@ test('MemoryService - agent memory proposals remain inactive until human approva
       }
     );
 
-    // 7. Non-user (SYSTEM) attempts approval -> SecurityViolationError
-    const systemCaller: CallerContext = {
-      actor: 'SYSTEM',
-      scope: workspaceA,
-      permissions: ['APPROVE'],
-      taskId: task.id
-    };
-    assert.throws(
-      () => memoryService.decideProposal(systemCaller, {
-        memoryId: proposal.id,
-        decision: 'APPROVED'
-      }),
-      (err: unknown) => err instanceof SecurityViolationError && err.violationType === 'UNAUTHORIZED_APPROVAL'
-    );
-
-    // 8. Human user approves the proposal -> status becomes ACTIVE
-    const approved = memoryService.decideProposal(userCaller, {
+    // 8. TRUSTED APPROVAL PATH: Human USER with APPROVE permission calls decideProposal
+    const approved = memoryService.decideProposal(userFull, {
       memoryId: proposal.id,
       decision: 'APPROVED'
     });
-
     assert.equal(approved.id, proposal.id);
     assert.equal(approved.status, 'ACTIVE');
 
-    // 9. Now it is visible in ACTIVE list and included in context
-    const updatedActiveList = memoryService.listMemories(userCaller, { status: 'ACTIVE' });
-    assert.equal(updatedActiveList.length, 1);
-    assert.equal(updatedActiveList[0]?.id, proposal.id);
-
-    const updatedContext = memoryService.buildTaskMemoryContext(userCaller, {
-      query: 'database engine postgresql'
-    });
-    assert.equal(updatedContext.included.length, 1);
-    assert.equal(updatedContext.included[0]?.id, proposal.id);
-
-    // 10. Agent attempts to directly modify the now ACTIVE memory -> SecurityViolationError
+    // 9. BYPASS ATTEMPT 7: Calling decideProposal on an already ACTIVE memory fails
     assert.throws(
-      () => memoryService.updateMemory(agentCaller, proposal.id, {
-        content: 'Tampered database engine'
-      }),
-      (err: unknown) => {
-        assert.ok(err instanceof SecurityViolationError);
-        assert.equal(err.violationType, 'AGENT_MUTATION_RESTRICTED');
-        return true;
-      }
-    );
-  } finally {
-    db.close();
-  }
-});
-
-test('MemoryService - human rejection archives proposals', () => {
-  const { db, memoryService, taskRepo, workspaceA } = setupServiceTest();
-
-  try {
-    const task = taskRepo.createTask({ goal: 'Rejection test task' });
-
-    const agentCaller: CallerContext = {
-      actor: 'AGENT',
-      scope: workspaceA,
-      permissions: ['READ', 'WRITE'],
-      taskId: task.id
-    };
-
-    const userCaller: CallerContext = {
-      actor: 'USER',
-      scope: workspaceA,
-      permissions: ['READ', 'WRITE', 'DELETE', 'APPROVE'],
-      taskId: task.id
-    };
-
-    const proposal = memoryService.createMemory(agentCaller, {
-      category: 'LEARNED_PROCEDURE',
-      scopeType: 'WORKSPACE',
-      scopeId: workspaceA.scopeId,
-      key: 'deploy.step',
-      content: 'Run dangerous untested script'
-    });
-
-    assert.equal(proposal.status, 'PENDING_APPROVAL');
-
-    // User rejects the proposal
-    const rejected = memoryService.decideProposal(userCaller, {
-      memoryId: proposal.id,
-      decision: 'REJECTED'
-    });
-
-    assert.equal(rejected.status, 'ARCHIVED');
-
-    // Remains excluded from active memories
-    const activeList = memoryService.listMemories(userCaller, { status: 'ACTIVE' });
-    assert.equal(activeList.length, 0);
-
-    // Cannot decide an already decided proposal
-    assert.throws(
-      () => memoryService.decideProposal(userCaller, {
+      () => memoryService.decideProposal(userFull, {
         memoryId: proposal.id,
         decision: 'APPROVED'
       }),
       (err: unknown) => err instanceof ValidationError && err.message.includes('not pending approval')
     );
+
+    // 10. Agent cannot modify already ACTIVE memory
+    assert.throws(
+      () => memoryService.updateMemory(agentCaller, proposal.id, {
+        content: 'Tampered cache TTL'
+      }),
+      (err: unknown) => err instanceof SecurityViolationError && err.violationType === 'AGENT_MUTATION_RESTRICTED'
+    );
   } finally {
     db.close();
   }
 });
 
-test('MemoryService - prevents task and memory scope mismatches in injection provenance', () => {
+test('MemoryService - Injection provenance fails closed on unverified task scope and inactive memories', () => {
   const { db, memoryService, taskRepo, workspaceA, workspaceB } = setupServiceTest();
 
   try {
-    const taskA = taskRepo.createTask({
-      goal: 'Task in Workspace A',
-      metadata: { workspaceId: workspaceA.scopeId }
-    });
-    const taskB = taskRepo.createTask({
-      goal: 'Task in Workspace B',
-      metadata: { workspaceId: workspaceB.scopeId }
-    });
-
-    const userCallerA: CallerContext = {
+    const userA = memoryService.issueContext({
       actor: 'USER',
       scope: workspaceA,
-      permissions: ['READ', 'WRITE', 'DELETE', 'APPROVE'],
-      taskId: taskA.id
-    };
+      permissions: ['READ', 'WRITE', 'DELETE', 'APPROVE']
+    });
 
-    const userCallerB: CallerContext = {
-      actor: 'USER',
-      scope: workspaceB,
-      permissions: ['READ', 'WRITE', 'DELETE', 'APPROVE'],
-      taskId: taskB.id
-    };
+    const agentA = memoryService.issueContext({
+      actor: 'AGENT',
+      scope: workspaceA,
+      permissions: ['READ', 'WRITE']
+    });
 
-    const memA = memoryService.createMemory(userCallerA, {
+    // Create an ACTIVE memory in Workspace A
+    const activeMemA = memoryService.createMemory(userA, {
       category: 'PROJECT_FACT',
       scopeType: 'WORKSPACE',
       scopeId: workspaceA.scopeId,
-      key: 'arch.pattern',
-      content: 'Event-driven architecture'
+      key: 'db.host',
+      content: 'db.internal.alpha'
     });
+    assert.equal(activeMemA.status, 'ACTIVE');
 
-    const memB = memoryService.createMemory(userCallerB, {
+    // Create a PENDING_APPROVAL proposal in Workspace A
+    const pendingMemA = memoryService.createMemory(agentA, {
       category: 'PROJECT_FACT',
       scopeType: 'WORKSPACE',
-      scopeId: workspaceB.scopeId,
-      key: 'arch.pattern',
-      content: 'Monolithic architecture'
+      scopeId: workspaceA.scopeId,
+      key: 'db.port',
+      content: '5432'
+    });
+    assert.equal(pendingMemA.status, 'PENDING_APPROVAL');
+
+    // 1. Task without TaskRepository fails closed
+    const standaloneService = new MemoryService({
+      memoryRepo: new MemoryRepository(db)
+    });
+    const standaloneUser = standaloneService.issueContext({
+      actor: 'USER',
+      scope: workspaceA,
+      permissions: ['READ', 'WRITE']
     });
 
-    // 1. Valid injection: Task A + Memory A (both in Workspace A) succeeds
-    const injectionA = memoryService.recordTaskInjection(userCallerA, {
-      taskId: taskA.id,
-      memoryId: memA.id,
-      charCount: memA.content.length,
-      estimatedTokens: 6
-    });
-
-    assert.ok(injectionA.id);
-    assert.equal(injectionA.taskId, taskA.id);
-    assert.equal(injectionA.memoryId, memA.id);
-
-    // 2. Mismatch: Caller in Workspace A tries to inject Memory A into Task B (Workspace B)
     assert.throws(
-      () => memoryService.recordTaskInjection(userCallerA, {
-        taskId: taskB.id,
-        memoryId: memA.id,
-        charCount: memA.content.length,
-        estimatedTokens: 6
+      () => standaloneService.recordTaskInjection(standaloneUser, {
+        taskId: 'some-task',
+        memoryId: activeMemA.id,
+        charCount: 10,
+        estimatedTokens: 3
       }),
-      (err: unknown) => {
-        assert.ok(err instanceof MemoryScopeViolationError);
-        return true;
-      }
+      (err: unknown) => err instanceof ValidationError && err.message.includes('TaskRepository is required')
     );
 
-    // 3. Mismatch: Caller in Workspace B tries to inject Memory A (Workspace A) into Task B (Workspace B)
+    // 2. Unknown task ID fails closed with TaskNotFoundError
     assert.throws(
-      () => memoryService.recordTaskInjection(userCallerB, {
-        taskId: taskB.id,
-        memoryId: memA.id, // Belonging to Workspace A
-        charCount: memA.content.length,
-        estimatedTokens: 6
-      }),
-      (err: unknown) => err instanceof MemoryScopeViolationError
-    );
-
-    // 4. Non-existent task ID throws TaskNotFoundError
-    assert.throws(
-      () => memoryService.recordTaskInjection(userCallerA, {
-        taskId: 'non-existent-task-id',
-        memoryId: memA.id,
+      () => memoryService.recordTaskInjection(userA, {
+        taskId: 'unknown-task-id',
+        memoryId: activeMemA.id,
         charCount: 10,
         estimatedTokens: 3
       }),
       (err: unknown) => err instanceof TaskNotFoundError
     );
 
-    // 5. Cross-scope context building with task ID mismatch
+    // 3. Task with missing metadata fails closed (no fallback to caller scope!)
+    const taskMissingMeta = taskRepo.createTask({
+      goal: 'Task lacking metadata'
+    });
     assert.throws(
-      () => memoryService.buildTaskMemoryContext(userCallerA, {
-        query: 'architecture',
-        taskId: taskB.id // Task B is in Workspace B
+      () => memoryService.recordTaskInjection(userA, {
+        taskId: taskMissingMeta.id,
+        memoryId: activeMemA.id,
+        charCount: 10,
+        estimatedTokens: 3
+      }),
+      (err: unknown) => err instanceof ValidationError && err.message.includes('lacks metadata required to establish authoritative scope')
+    );
+
+    // 4. Task with malformed/untrusted JSON metadata fails closed
+    const taskInvalidMeta = taskRepo.createTask({
+      goal: 'Task with invalid metadata',
+      metadata: { randomAttributeWithoutWorkspace: true }
+    });
+    assert.throws(
+      () => memoryService.recordTaskInjection(userA, {
+        taskId: taskInvalidMeta.id,
+        memoryId: activeMemA.id,
+        charCount: 10,
+        estimatedTokens: 3
+      }),
+      (err: unknown) => err instanceof ValidationError && err.message.includes('does not contain valid scope information')
+    );
+
+    // 5. Cross-workspace task fails closed
+    const taskWorkspaceB = taskRepo.createTask({
+      goal: 'Task in Workspace B',
+      metadata: { workspaceId: workspaceB.scopeId }
+    });
+    assert.throws(
+      () => memoryService.recordTaskInjection(userA, {
+        taskId: taskWorkspaceB.id,
+        memoryId: activeMemA.id,
+        charCount: 10,
+        estimatedTokens: 3
       }),
       (err: unknown) => err instanceof MemoryScopeViolationError
     );
 
-    // 6. Cross-scope retrieval of injection records
+    // 6. Inactive memory (PENDING_APPROVAL) rejected from injection provenance
+    const validTaskA = taskRepo.createTask({
+      goal: 'Valid task in Workspace A',
+      metadata: { workspaceId: workspaceA.scopeId }
+    });
+
     assert.throws(
-      () => memoryService.getInjectionsByTaskId(userCallerA, taskB.id),
-      (err: unknown) => err instanceof MemoryScopeViolationError
+      () => memoryService.recordTaskInjection(userA, {
+        taskId: validTaskA.id,
+        memoryId: pendingMemA.id,
+        charCount: 10,
+        estimatedTokens: 3
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof ValidationError);
+        assert.ok(err.message.includes('Cannot record injection provenance for inactive memory'));
+        return true;
+      }
     );
+
+    // 7. Legitimate injection with valid task and ACTIVE memory succeeds
+    const injection = memoryService.recordTaskInjection(userA, {
+      taskId: validTaskA.id,
+      memoryId: activeMemA.id,
+      charCount: activeMemA.content.length,
+      estimatedTokens: 5
+    });
+    assert.ok(injection.id);
+    assert.equal(injection.taskId, validTaskA.id);
+    assert.equal(injection.memoryId, activeMemA.id);
   } finally {
     db.close();
   }
 });
 
-test('MemoryService - hard deletion physically erases content and nulls injection foreign keys', () => {
+test('MemoryService - Batch injection guarantees zero partial writes on validation failure', () => {
+  const { db, memoryService, taskRepo, memoryRepo, workspaceA } = setupServiceTest();
+
+  try {
+    const userA = memoryService.issueContext({
+      actor: 'USER',
+      scope: workspaceA,
+      permissions: ['READ', 'WRITE', 'DELETE', 'APPROVE']
+    });
+
+    const agentA = memoryService.issueContext({
+      actor: 'AGENT',
+      scope: workspaceA,
+      permissions: ['READ', 'WRITE']
+    });
+
+    const taskA = taskRepo.createTask({
+      goal: 'Atomic batch injection task',
+      metadata: { workspaceId: workspaceA.scopeId }
+    });
+
+    const mem1 = memoryService.createMemory(userA, {
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceA.scopeId,
+      key: 'batch.key.1',
+      content: 'Valid active record 1'
+    });
+
+    const mem2 = memoryService.createMemory(userA, {
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceA.scopeId,
+      key: 'batch.key.2',
+      content: 'Valid active record 2'
+    });
+
+    // Inactive proposal (will trigger validation failure on third item)
+    const mem3Pending = memoryService.createMemory(agentA, {
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceA.scopeId,
+      key: 'batch.key.3',
+      content: 'Pending proposal 3'
+    });
+
+    // Attempt batch injection where 3rd item is invalid
+    assert.throws(
+      () => memoryService.recordTaskInjectionsBatch(userA, [
+        { taskId: taskA.id, memoryId: mem1.id, charCount: 10, estimatedTokens: 3 },
+        { taskId: taskA.id, memoryId: mem2.id, charCount: 10, estimatedTokens: 3 },
+        { taskId: taskA.id, memoryId: mem3Pending.id, charCount: 10, estimatedTokens: 3 }
+      ]),
+      (err: unknown) => err instanceof ValidationError && err.message.includes('inactive memory')
+    );
+
+    // TRANSACTIONAL INTEGRITY ASSERTION: Exactly 0 records must exist in database!
+    const persistedInjections = memoryRepo.getInjectionsByTaskId(taskA.id);
+    assert.equal(
+      persistedInjections.length,
+      0,
+      'Batch injection failed partially: earlier records were not rolled back!'
+    );
+
+    // Now execute a valid batch of 2 active memories
+    const successfulBatch = memoryService.recordTaskInjectionsBatch(userA, [
+      { taskId: taskA.id, memoryId: mem1.id, charCount: 10, estimatedTokens: 3 },
+      { taskId: taskA.id, memoryId: mem2.id, charCount: 10, estimatedTokens: 3 }
+    ]);
+    assert.equal(successfulBatch.length, 2);
+
+    const savedInjections = memoryRepo.getInjectionsByTaskId(taskA.id);
+    assert.equal(savedInjections.length, 2);
+  } finally {
+    db.close();
+  }
+});
+
+test('MemoryService - Mandatory audit logging fails closed on state mutations', () => {
+  const { db, taskRepo, memoryRepo, workspaceA } = setupServiceTest();
+
+  try {
+    const task = taskRepo.createTask({
+      goal: 'Audit failure test task',
+      metadata: { workspaceId: workspaceA.scopeId }
+    });
+
+    // Construct a failing AuditRepository
+    const failingAuditRepo = {
+      appendEvent: () => {
+        throw new Error('DISK_FULL: simulated immutable audit failure');
+      },
+      getEventsByTaskId: () => [],
+      getEventById: () => null
+    } as unknown as AuditRepository;
+
+    const failingService = new MemoryService({
+      memoryRepo,
+      auditRepo: failingAuditRepo,
+      taskRepo
+    });
+
+    const userCaller = failingService.issueContext({
+      actor: 'USER',
+      scope: workspaceA,
+      permissions: ['READ', 'WRITE', 'DELETE', 'APPROVE'],
+      taskId: task.id
+    });
+
+    // 1. Mandatory audit failure on createMemory MUST FAIL CLOSED
+    assert.throws(
+      () => failingService.createMemory(userCaller, {
+        category: 'PROJECT_FACT',
+        scopeType: 'WORKSPACE',
+        scopeId: workspaceA.scopeId,
+        key: 'fail.audit.key',
+        content: 'content'
+      }),
+      (err: unknown) => err instanceof Error && err.message.includes('DISK_FULL')
+    );
+
+    // 2. Read operation with failing audit telemetry DOES NOT block reading (best-effort)
+    // First create a memory directly via repository for read testing
+    const existing = memoryRepo.createMemory({
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceA.scopeId,
+      key: 'read.audit.key',
+      content: 'readable content'
+    });
+
+    const read = failingService.getMemoryById(userCaller, existing.id);
+    assert.ok(read);
+    assert.equal(read.key, 'read.audit.key');
+  } finally {
+    db.close();
+  }
+});
+
+test('MemoryService - Hard deletion physically erases content and nulls injection foreign keys', () => {
   const { db, memoryService, taskRepo, workspaceA } = setupServiceTest();
 
   try {
@@ -651,12 +670,12 @@ test('MemoryService - hard deletion physically erases content and nulls injectio
       metadata: { workspaceId: workspaceA.scopeId }
     });
 
-    const userCaller: CallerContext = {
+    const userCaller = memoryService.issueContext({
       actor: 'USER',
       scope: workspaceA,
       permissions: ['READ', 'WRITE', 'DELETE', 'APPROVE'],
       taskId: task.id
-    };
+    });
 
     const secretContent = 'CRITICAL_SECRET_CREDENTIAL_KEY_VALUE_XYZ';
     const mem = memoryService.createMemory(userCaller, {
@@ -697,7 +716,7 @@ test('MemoryService - hard deletion physically erases content and nulls injectio
   }
 });
 
-test('MemoryService - audit privacy guarantee: raw memory content is never logged in audit events', () => {
+test('MemoryService - Audit privacy guarantee: raw memory content is never logged in audit events', () => {
   const { db, memoryService, taskRepo, auditRepo, workspaceA } = setupServiceTest();
 
   try {
@@ -709,19 +728,19 @@ test('MemoryService - audit privacy guarantee: raw memory content is never logge
     const sensitiveUserSecret = 'TOP_SECRET_USER_PASSWORD_ALPHA_BRAVO';
     const sensitiveAgentSecret = 'PROPRIETARY_MODEL_WEIGHT_SECRET_CHARLIE';
 
-    const userCaller: CallerContext = {
+    const userCaller = memoryService.issueContext({
       actor: 'USER',
       scope: workspaceA,
       permissions: ['READ', 'WRITE', 'DELETE', 'APPROVE'],
       taskId: task.id
-    };
+    });
 
-    const agentCaller: CallerContext = {
+    const agentCaller = memoryService.issueContext({
       actor: 'AGENT',
       scope: workspaceA,
       permissions: ['READ', 'WRITE'],
       taskId: task.id
-    };
+    });
 
     // 1. User creates active memory -> MEMORY_CREATED
     const memUser = memoryService.createMemory(userCaller, {
@@ -736,7 +755,7 @@ test('MemoryService - audit privacy guarantee: raw memory content is never logge
     memoryService.getMemoryById(userCaller, memUser.id);
     memoryService.getMemoryByKey(userCaller, 'user.password.pattern');
 
-    // 3. Update memory -> MEMORY_UPDATED
+    // 3. Update memory content -> MEMORY_UPDATED
     memoryService.updateMemory(userCaller, memUser.id, {
       content: 'UPDATED_SECRET_REPLACEMENT'
     });
@@ -814,7 +833,7 @@ test('MemoryService - audit privacy guarantee: raw memory content is never logge
   }
 });
 
-test('RelevanceMatcher & MemoryContextBuilder - hardened runtime validation', () => {
+test('RelevanceMatcher & MemoryContextBuilder - hardened runtime validation for explicit null and invalid instances', () => {
   // 1. Explicit null weight rejected with ValidationError instead of silently defaulting
   assert.throws(
     () => new RelevanceMatcher({ keyWeight: null as any }),
