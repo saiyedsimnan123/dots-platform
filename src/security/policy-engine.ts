@@ -11,6 +11,7 @@
 import { resolve, relative, normalize } from 'node:path';
 import type { RiskTier } from '../domain/types.ts';
 import { SecurityViolationError } from '../domain/errors.ts';
+import { PathValidator } from './path-validator.ts';
 
 export type PolicyDecision = 'ALLOWED' | 'REQUIRES_APPROVAL' | 'DENIED';
 
@@ -113,31 +114,12 @@ export class PolicyEngine {
   }
 
   /**
+
    * Canonicalizes an input file path and verifies that it resides strictly within the workspaceRoot.
-   * Throws SecurityViolationError if path attempts directory traversal outside the jail.
+   * Throws SecurityViolationError if path attempts directory traversal or symlink escapes outside the jail.
    */
   public sanitizePath(inputPath: string): string {
-    if (!inputPath || typeof inputPath !== 'string') {
-      throw new SecurityViolationError(
-        'File path argument must be a non-empty string.',
-        'INVALID_PATH_ARGUMENT',
-        { inputPath }
-      );
-    }
-
-    // Resolve path against workspace root
-    const resolvedPath = resolve(this.workspaceRoot, normalize(inputPath));
-    const rel = relative(this.workspaceRoot, resolvedPath);
-
-    // If relative path starts with '..' or is root drive traversal, reject
-    if (rel.startsWith('..') || rel === '..' || resolvedPath.toLowerCase() === resolve(this.workspaceRoot, '..').toLowerCase()) {
-      throw new SecurityViolationError(
-        `Security Violation: Path traversal outside jailed sandbox detected ('${inputPath}').`,
-        'PATH_TRAVERSAL_DETECTED',
-        { inputPath, resolvedPath, workspaceRoot: this.workspaceRoot }
-      );
-    }
-
-    return resolvedPath;
+    return PathValidator.assertContained(inputPath, this.workspaceRoot);
   }
 }
+

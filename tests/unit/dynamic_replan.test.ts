@@ -195,3 +195,56 @@ test('Rollback Compensation - cleans up scratch files on task failure when enabl
     if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
   }
 });
+
+test('Workflow Controls - dynamic replanning strictly enforces Tier 3 human approval and security policies', async () => {
+  const harness = setupHarness(true);
+
+  // Register a failing step 1 tool and a Tier 3 recovery tool
+  harness.toolRegistry.register({
+    definition: { name: 'failing_step', description: 'Fails', parameters: {} },
+    riskTier: 'TIER_1',
+    handler: async () => { throw new Error('First step failure'); }
+  });
+
+  harness.toolRegistry.register({
+    definition: { name: 'high_risk_recovery', description: 'Requires human approval', parameters: { target: { type: 'string', description: 't' } } },
+    riskTier: 'TIER_3',
+    handler: async () => ({ output: { recovered: true }, exitCode: 0, durationMs: 5 })
+  });
+
+  try {
+    const task = await harness.coordinator.submitTask('Test approval gating on replan');
+
+    // 1. Initial failing plan
+    harness.modelProvider.enqueuePlan([
+      { stepOrder: 1, description: 'Doomed step', toolName: 'failing_step', arguments: {}, expectedOutcome: 'Fail' }
+    ]);
+
+    // 2. Recovery plan proposes Tier 3 tool
+    harness.modelProvider.enqueuePlan([
+      { stepOrder: 1, description: 'High risk fallback', toolName: 'high_risk_recovery', arguments: { target: 'prod' }, expectedOutcome: 'Recover' }
+    ]);
+
+    // Step 1 fails, triggers replan, but replanned step requires approval!
+    // runToCompletion must pause at AWAITING_APPROVAL and NOT execute the tool
+    const paused = await harness.coordinator.runToCompletion(task.id, 25);
+    assert.equal(paused.status, 'AWAITING_APPROVAL');
+
+    // Verify approval request was generated for the replanned step
+    const approvals = harness.taskRepo.getApprovalRequestsByTaskId(task.id);
+    assert.equal(approvals.length, 1);
+    assert.equal(approvals[0]!.riskTier, 'TIER_3');
+    assert.equal(approvals[0]!.decision, 'PENDING');
+
+    // Approve the token
+    harness.approvalBroker.submitDecision(approvals[0]!.approvalToken, 'APPROVED', 'security-admin');
+
+    // Resume execution to completion
+    const completed = await harness.coordinator.runToCompletion(task.id, 25);
+    assert.equal(completed.status, 'COMPLETED');
+  } finally {
+    harness.db.close();
+    if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
+  }
+});
+

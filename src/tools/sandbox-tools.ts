@@ -6,11 +6,13 @@
  * Pure computation tools (Tier 0), read-only tools (Tier 1), and sandboxed mutation tools (Tier 2).
  */
 
-import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, mkdirSync, lstatSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import type { RegisteredTool } from './types.ts';
-import { ToolExecutionError } from '../domain/errors.ts';
+import { ToolExecutionError, SecurityViolationError } from '../domain/errors.ts';
+import { PathValidator } from '../security/path-validator.ts';
+
 
 /**
  * Tier 0: Pure compute calculator tool
@@ -79,9 +81,12 @@ export const fileReadTool: RegisteredTool = {
     required: ['path']
   },
   riskTier: 'TIER_1',
-  handler: async (args) => {
+  handler: async (args, context) => {
     const start = Date.now();
-    const filePath = String(args.path || '');
+    const rawPath = String(args.path || '');
+    const filePath = context?.workspaceRoot
+      ? PathValidator.assertContained(rawPath, context.workspaceRoot)
+      : rawPath;
 
     if (!existsSync(filePath)) {
       throw new ToolExecutionError('file_read', `File not found: '${filePath}'`);
@@ -121,7 +126,10 @@ export const fileListTool: RegisteredTool = {
   riskTier: 'TIER_1',
   handler: async (args, context) => {
     const start = Date.now();
-    const dirPath = String(args.path || context.workspaceRoot);
+    const rawPath = String(args.path || context.workspaceRoot);
+    const dirPath = context?.workspaceRoot
+      ? PathValidator.assertContained(rawPath, context.workspaceRoot)
+      : rawPath;
 
     if (!existsSync(dirPath)) {
       throw new ToolExecutionError('file_list', `Directory not found: '${dirPath}'`);
@@ -163,13 +171,41 @@ export const fileWriteTool: RegisteredTool = {
     required: ['path', 'content']
   },
   riskTier: 'TIER_2',
-  handler: async (args) => {
+  handler: async (args, context) => {
     const start = Date.now();
-    const filePath = String(args.path || '');
+    const rawPath = String(args.path || '');
     const content = String(args.content ?? '');
 
+    const filePath = context?.workspaceRoot
+      ? PathValidator.assertContained(rawPath, context.workspaceRoot)
+      : rawPath;
+
+    // Reject direct writes to symbolic links (prevent symlink target overwrites)
+    const lstat = lstatSync(filePath, { throwIfNoEntry: false });
+    if (lstat && lstat.isSymbolicLink()) {
+      throw new SecurityViolationError(
+        `Security Violation: Direct writes to symbolic links are forbidden ('${rawPath}').`,
+        'SYMLINK_WRITE_FORBIDDEN',
+        { path: rawPath, canonicalPath: filePath }
+      );
+    }
+
     try {
+      const existedBefore = existsSync(filePath);
+      let previousContent: string | undefined;
+      let previousHash: string | undefined;
+      let previousByteSize: number | undefined;
+
+      if (existedBefore) {
+        previousContent = readFileSync(filePath, 'utf8');
+        previousHash = createHash('sha256').update(previousContent).digest('hex');
+        previousByteSize = Buffer.byteLength(previousContent, 'utf8');
+      }
+
       const parentDir = dirname(filePath);
+      if (context?.workspaceRoot) {
+        PathValidator.assertContained(parentDir, context.workspaceRoot);
+      }
       if (!existsSync(parentDir)) {
         mkdirSync(parentDir, { recursive: true });
       }
@@ -178,11 +214,17 @@ export const fileWriteTool: RegisteredTool = {
       const bytesWritten = Buffer.byteLength(content, 'utf8');
 
       return {
-        output: { path: filePath, bytesWritten },
+        output: {
+          path: filePath,
+          bytesWritten,
+          existedBefore,
+          ...(existedBefore ? { previousContent, previousHash, previousByteSize } : {})
+        },
         exitCode: 0,
         durationMs: Date.now() - start
       };
     } catch (err) {
+      if (err instanceof SecurityViolationError) throw err;
       throw new ToolExecutionError(
         'file_write',
         `Failed to write file: ${err instanceof Error ? err.message : String(err)}`
@@ -211,9 +253,12 @@ export const hashFileTool: RegisteredTool = {
     required: ['path']
   },
   riskTier: 'TIER_1',
-  handler: async (args) => {
+  handler: async (args, context) => {
     const start = Date.now();
-    const filePath = String(args.path || '');
+    const rawPath = String(args.path || '');
+    const filePath = context?.workspaceRoot
+      ? PathValidator.assertContained(rawPath, context.workspaceRoot)
+      : rawPath;
     const algo = String(args.algorithm || 'sha256').toLowerCase();
 
     if (!existsSync(filePath)) {
@@ -242,6 +287,7 @@ export const hashFileTool: RegisteredTool = {
     }
   }
 };
+
 
 /**
  * Tier 0: Pure in-memory text transformation tool

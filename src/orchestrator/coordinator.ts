@@ -579,7 +579,21 @@ Please generate an alternative plan to complete the goal without repeating the f
     const shouldCompensate = Boolean(meta.compensateOnFailure ?? meta.enableCompensation ?? this.enableCompensation);
 
     if (shouldCompensate) {
-      await this.compensationManager.compensate(task.id);
+      try {
+        await this.compensationManager.compensate(task.id);
+      } catch (err) {
+        // Safe guard: compensation error must never hide the original workflow failure
+        this.auditRepo.appendEvent({
+          taskId: task.id,
+          eventType: 'COMPENSATION_EXECUTED',
+          actor: 'SYSTEM',
+          details: {
+            status: 'FAILED',
+            error: err instanceof Error ? err.message : String(err)
+          }
+        });
+      }
     }
   }
 }
+
