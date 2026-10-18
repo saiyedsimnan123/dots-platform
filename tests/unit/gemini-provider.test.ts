@@ -152,3 +152,38 @@ test('GeminiProvider - generatePlan preserves legacy call paths without pre-comp
     globalThis.fetch = originalFetch;
   }
 });
+
+test('GeminiProvider - generatePlan ignores legacy context argument when pre-compiled prompt is provided', async () => {
+  const originalFetch = globalThis.fetch;
+  let interceptedBody: any;
+
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    interceptedBody = JSON.parse(init?.body as string);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        candidates: [{ content: { parts: [{ text: JSON.stringify({ steps: [] }) }] } }],
+        usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 10, totalTokenCount: 20 }
+      })
+    } as Response;
+  }) as typeof globalThis.fetch;
+
+  try {
+    const provider = new GeminiProvider({ apiKey: 'test-api-key' });
+    const compiledPrompt = {
+      systemInstruction: 'Compiled instruction',
+      userPrompt: 'TASK GOAL:\nGoal with compiled prompt',
+      contextOmitted: false
+    };
+
+    // Even if raw context string was passed as 3rd arg alongside compiledPrompt
+    await provider.generatePlan('Goal with compiled prompt', [], 'raw-unscrubbed-context' as any, compiledPrompt);
+
+    assert.equal(interceptedBody.systemInstruction.parts[0].text, 'Compiled instruction');
+    assert.equal(interceptedBody.contents[0].parts[0].text, 'TASK GOAL:\nGoal with compiled prompt');
+    assert.ok(!JSON.stringify(interceptedBody).includes('raw-unscrubbed-context'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

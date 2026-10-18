@@ -86,7 +86,7 @@ export class MockModelProvider implements IModelProvider {
 
     if (compiledPrompt) {
       effectiveCompiled = compiledPrompt;
-      effectiveContext = typeof contextOrCompiledPrompt === 'string' ? contextOrCompiledPrompt : undefined;
+      effectiveContext = undefined;
     } else if (
       contextOrCompiledPrompt &&
       typeof contextOrCompiledPrompt === 'object' &&

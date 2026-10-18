@@ -484,7 +484,6 @@ export class TaskCoordinator {
       const availableTools = this.toolRegistry.listDefinitions();
 
       let compiled: CompiledPlanPrompt;
-      let planningContext: string | undefined;
 
       if (this.memoryService && this.authorizer) {
         const taskScope = this.verifyTaskScope(task);
@@ -512,10 +511,6 @@ export class TaskCoordinator {
             availableTools,
             memoryContext.serializedContext
           );
-
-          if (!compiled.contextOmitted) {
-            planningContext = memoryContext.serializedContext;
-          }
         } else {
           compiled = this.promptCompiler.compilePlanPrompt(task.goal, availableTools);
         }
@@ -526,7 +521,7 @@ export class TaskCoordinator {
       const planResult = await this.modelProvider.generatePlan(
         task.goal,
         availableTools,
-        planningContext,
+        undefined,
         compiled
       );
 

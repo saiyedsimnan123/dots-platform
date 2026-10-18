@@ -1142,12 +1142,8 @@ test('TaskCoordinator - Phase 7.4 Substep 4A: valid scoped task retrieves and pa
     assert.ok(userPrompt.includes('db.schema.version'));
     assert.ok(userPrompt.includes('Database schema is v2.4 with UUID primary keys.'));
 
-    const receivedContext = calls[0]!.args.context as string;
-    assert.equal(typeof receivedContext, 'string');
-    assert.ok(receivedContext.includes(MEMORY_CONTEXT_SECURITY_BOUNDARY));
-    assert.ok(receivedContext.includes(MEMORY_CONTEXT_SECURITY_BOUNDARY_END));
-    assert.ok(receivedContext.includes('db.schema.version'));
-    assert.ok(receivedContext.includes('Database schema is v2.4 with UUID primary keys.'));
+    // Verify raw memory context is NOT separately passed through legacy context argument
+    assert.equal(calls[0]!.args.context, undefined, 'Raw memory context must not be passed via legacy context argument');
 
     // 6. Verify MemoryService logged read audit event
     const auditEvents = harness.auditRepo.getEventsByTaskId(task.id);

@@ -114,6 +114,7 @@ test('MockModelProvider - generatePlan records pre-compiled prompt and updates t
   assert.equal(calls.length, 1);
   assert.equal(calls[0]!.method, 'generatePlan');
   assert.equal(calls[0]!.args.goal, 'Build artifact');
+  assert.equal(calls[0]!.args.context, undefined, 'context argument must be undefined when compiledPrompt is provided');
   assert.equal(calls[0]!.args.compiledPrompt, compiledPrompt);
   assert.equal(calls[0]!.args.systemInstruction, compiledPrompt.systemInstruction);
   assert.equal(calls[0]!.args.userPrompt, compiledPrompt.userPrompt);
@@ -142,6 +143,7 @@ test('MockModelProvider - generatePlan supports 3-arg compiledPrompt path and le
 
   // Call 1
   assert.equal(calls[0]!.args.goal, 'Goal 1');
+  assert.equal(calls[0]!.args.context, undefined);
   assert.equal(calls[0]!.args.compiledPrompt, compiled);
   assert.equal(calls[0]!.args.systemInstruction, 'System instructions');
   assert.equal(calls[0]!.args.userPrompt, 'TASK GOAL:\nGoal 1');
@@ -150,4 +152,22 @@ test('MockModelProvider - generatePlan supports 3-arg compiledPrompt path and le
   assert.equal(calls[1]!.args.goal, 'Goal 2');
   assert.equal(calls[1]!.args.context, 'Legacy context body');
   assert.equal(calls[1]!.args.compiledPrompt, undefined);
+});
+
+test('MockModelProvider - generatePlan ignores legacy context argument when compiledPrompt is provided', async () => {
+  const provider = new MockModelProvider();
+  const compiledPrompt = {
+    systemInstruction: 'Compiled instructions',
+    userPrompt: 'TASK GOAL:\nGoal with prompt',
+    contextOmitted: false
+  };
+
+  await provider.generatePlan('Goal with prompt', tools, 'raw-unscrubbed-context' as any, compiledPrompt);
+
+  const calls = provider.getRecordedCalls();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.args.context, undefined, 'Legacy context must be undefined when compiledPrompt is provided');
+  assert.equal(calls[0]!.args.compiledPrompt, compiledPrompt);
+  assert.equal(calls[0]!.args.systemInstruction, compiledPrompt.systemInstruction);
+  assert.equal(calls[0]!.args.userPrompt, compiledPrompt.userPrompt);
 });
