@@ -19,6 +19,8 @@ export class DatabaseManager {
   public readonly dbPath: string;
   private readonly db: DatabaseSync;
   private isClosed: boolean = false;
+  private isPoisoned: boolean = false;
+  private transactionDepth: number = 0;
 
   constructor(dbPath: string = ':memory:') {
     this.dbPath = dbPath;
@@ -260,19 +262,62 @@ export class DatabaseManager {
   }
 
   /**
-   * Executes a callback within an immediate SQLite transaction.
-   * Commits if successful, rolls back on error.
+   * Executes a callback within a transaction.
+   * Supports nested transactions using SQLite savepoints.
+   * Commits/releases on success, rolls back on error.
+   * If rollback or savepoint cleanup fails, the connection is poisoned to prevent corrupt state.
    */
   public transaction<T>(callback: () => T): T {
     this.assertOpen();
-    this.db.exec('BEGIN IMMEDIATE;');
+    const depth = this.transactionDepth;
+    const isTopLevel = depth === 0;
+    const savepointName = `sp_${depth}`;
+
+    if (isTopLevel) {
+      this.db.exec('BEGIN IMMEDIATE;');
+    } else {
+      this.db.exec(`SAVEPOINT ${savepointName};`);
+    }
+    this.transactionDepth = depth + 1;
+
     try {
       const result = callback();
-      this.db.exec('COMMIT;');
+      if (isTopLevel) {
+        this.db.exec('COMMIT;');
+      } else {
+        this.db.exec(`RELEASE SAVEPOINT ${savepointName};`);
+      }
       return result;
-    } catch (err) {
-      this.db.exec('ROLLBACK;');
-      throw err;
+    } catch (callbackErr) {
+      if (this.isPoisoned || this.isClosed) {
+        throw callbackErr;
+      }
+      try {
+        if (isTopLevel) {
+          this.db.exec('ROLLBACK;');
+        } else {
+          this.db.exec(`ROLLBACK TO SAVEPOINT ${savepointName};`);
+          this.db.exec(`RELEASE SAVEPOINT ${savepointName};`);
+        }
+      } catch (cleanupErr) {
+        this.isPoisoned = true;
+        try {
+          this.db.close();
+        } catch {
+          // Ignore secondary close error during emergency close
+        }
+        this.isClosed = true;
+        throw new DatabaseError(
+          `Fatal database rollback failure: ${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`,
+          {
+            cleanupError: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+            originalError: callbackErr instanceof Error ? callbackErr.message : String(callbackErr)
+          }
+        );
+      }
+      throw callbackErr;
+    } finally {
+      this.transactionDepth = depth;
     }
   }
 
@@ -297,16 +342,30 @@ export class DatabaseManager {
    */
   public close(): void {
     if (!this.isClosed) {
-      this.db.close();
-      this.isClosed = true;
+      try {
+        this.db.close();
+      } finally {
+        this.isClosed = true;
+      }
     }
   }
 
   public get isOpen(): boolean {
-    return !this.isClosed;
+    return !this.isClosed && !this.isPoisoned;
+  }
+
+  public get poisoned(): boolean {
+    return this.isPoisoned;
+  }
+
+  public get currentTransactionDepth(): number {
+    return this.transactionDepth;
   }
 
   private assertOpen(): void {
+    if (this.isPoisoned) {
+      throw new DatabaseError('Cannot execute operation: database connection is poisoned due to a fatal transaction failure.');
+    }
     if (this.isClosed) {
       throw new DatabaseError('Cannot execute operation on closed database connection.');
     }
