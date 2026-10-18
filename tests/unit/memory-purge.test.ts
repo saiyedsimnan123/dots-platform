@@ -319,6 +319,147 @@ test('purgeArchivedMemories - ID list: missing ID or non-archived (ACTIVE / PEND
   assert.ok(env.memoryRepo.getMemoryById(proposalMem.id, env.scopeAlpha), 'Proposal memory must remain intact');
 });
 
+test('purgeArchivedMemories - atomic ID list: missing or non-archived ID anywhere in list aborts entire purge without partial deletion of preceding or following valid items', () => {
+  const env = setupTestEnvironment();
+
+  // Test case A: [valid1, missing, valid2]
+  const a1 = createArchivedMemory(env, env.adminAlpha, 'case_a_1');
+  const a2 = createArchivedMemory(env, env.adminAlpha, 'case_a_2');
+
+  assert.throws(
+    () => env.memoryService.purgeArchivedMemories(env.adminAlpha, {
+      memoryIds: [a1.id, 'completely-missing-memory-id', a2.id]
+    }),
+    (err: unknown) => err instanceof MemoryNotFoundError
+  );
+  // Both preceding and following must remain intact (no partial deletion)
+  assert.ok(env.memoryRepo.getMemoryById(a1.id, env.scopeAlpha), 'a1 (preceding) must not be deleted');
+  assert.ok(env.memoryRepo.getMemoryById(a2.id, env.scopeAlpha), 'a2 (following) must not be deleted');
+
+  // Test case B: [valid1, active, valid2]
+  const b1 = createArchivedMemory(env, env.adminAlpha, 'case_b_1');
+  const b2 = createArchivedMemory(env, env.adminAlpha, 'case_b_2');
+  const bActive = env.memoryService.createMemory(env.adminAlpha, {
+    key: 'case_b_active',
+    content: 'active content',
+    category: 'PROJECT_FACT',
+    scopeType: env.scopeAlpha.scopeType,
+    scopeId: env.scopeAlpha.scopeId
+  });
+
+  assert.throws(
+    () => env.memoryService.purgeArchivedMemories(env.adminAlpha, {
+      memoryIds: [b1.id, bActive.id, b2.id]
+    }),
+    (err: unknown) => err instanceof ValidationError && err.message.includes("status is 'ACTIVE'")
+  );
+  assert.ok(env.memoryRepo.getMemoryById(b1.id, env.scopeAlpha), 'b1 (preceding) must not be deleted');
+  assert.ok(env.memoryRepo.getMemoryById(b2.id, env.scopeAlpha), 'b2 (following) must not be deleted');
+  assert.ok(env.memoryRepo.getMemoryById(bActive.id, env.scopeAlpha), 'bActive must not be deleted');
+
+  // Test case C: [valid1, pending_proposal, valid2]
+  const c1 = createArchivedMemory(env, env.adminAlpha, 'case_c_1');
+  const c2 = createArchivedMemory(env, env.adminAlpha, 'case_c_2');
+  const agentTask = env.hostAuthority.createTask(env.taskRepo, {
+    id: 'task-agent-prop-atomic',
+    goal: 'Proposal',
+    scope: env.scopeAlpha
+  });
+  const agentCaller = env.authorizer.authorizeAgent({ taskId: agentTask.id });
+  const cPending = env.memoryService.createMemory(agentCaller, {
+    key: 'case_c_pending',
+    content: 'pending content',
+    category: 'PROJECT_FACT',
+    scopeType: env.scopeAlpha.scopeType,
+    scopeId: env.scopeAlpha.scopeId
+  });
+
+  assert.throws(
+    () => env.memoryService.purgeArchivedMemories(env.adminAlpha, {
+      memoryIds: [c1.id, cPending.id, c2.id]
+    }),
+    (err: unknown) => err instanceof ValidationError && err.message.includes("status is 'PENDING_APPROVAL'")
+  );
+  assert.ok(env.memoryRepo.getMemoryById(c1.id, env.scopeAlpha), 'c1 (preceding) must not be deleted');
+  assert.ok(env.memoryRepo.getMemoryById(c2.id, env.scopeAlpha), 'c2 (following) must not be deleted');
+  assert.ok(env.memoryRepo.getMemoryById(cPending.id, env.scopeAlpha), 'cPending must not be deleted');
+
+  // Test case D: [valid1, foreign_scope, valid2]
+  const d1 = createArchivedMemory(env, env.adminAlpha, 'case_d_1');
+  const d2 = createArchivedMemory(env, env.adminAlpha, 'case_d_2');
+  const dForeign = createArchivedMemory(env, env.adminBeta, 'case_d_foreign');
+
+  assert.throws(
+    () => env.memoryService.purgeArchivedMemories(env.adminAlpha, {
+      memoryIds: [d1.id, dForeign.id, d2.id]
+    }),
+    (err: unknown) => err instanceof MemoryScopeViolationError
+  );
+  assert.ok(env.memoryRepo.getMemoryById(d1.id, env.scopeAlpha), 'd1 (preceding) must not be deleted');
+  assert.ok(env.memoryRepo.getMemoryById(d2.id, env.scopeAlpha), 'd2 (following) must not be deleted');
+  assert.ok(env.memoryRepo.getMemoryById(dForeign.id, env.scopeBeta), 'dForeign must not be deleted');
+
+  // Verify zero MEMORIES_PURGED audit events occurred across any of these failed attempts
+  const auditEvents = env.auditRepo.getEventsByTaskId('__system_memory__');
+  assert.equal(auditEvents.find((e) => e.eventType === 'MEMORIES_PURGED'), undefined);
+});
+
+test('deleteArchivedMemory - repository deletion enforces ARCHIVED status and refuses to delete ACTIVE or PENDING_APPROVAL memories', () => {
+  const env = setupTestEnvironment();
+
+  // 1. Active memory
+  const activeMem = env.memoryService.createMemory(env.adminAlpha, {
+    key: 'active_repo_del_key',
+    content: 'active content',
+    category: 'PROJECT_FACT',
+    scopeType: env.scopeAlpha.scopeType,
+    scopeId: env.scopeAlpha.scopeId
+  });
+
+  // Attempt deleteArchivedMemory on active memory -> must return false and NOT delete row
+  const activeResult = env.memoryRepo.deleteArchivedMemory(activeMem.id, env.scopeAlpha);
+  assert.equal(activeResult, false);
+  assert.ok(env.memoryRepo.getMemoryById(activeMem.id, env.scopeAlpha), 'Active memory must remain in DB');
+
+  // 2. Pending proposal
+  const agentTask = env.hostAuthority.createTask(env.taskRepo, {
+    id: 'task-agent-repo-del',
+    goal: 'Agent proposal',
+    scope: env.scopeAlpha
+  });
+  const agentCaller = env.authorizer.authorizeAgent({ taskId: agentTask.id });
+  const pendingMem = env.memoryService.createMemory(agentCaller, {
+    key: 'pending_repo_del_key',
+    content: 'pending content',
+    category: 'PROJECT_FACT',
+    scopeType: env.scopeAlpha.scopeType,
+    scopeId: env.scopeAlpha.scopeId
+  });
+  assert.equal(pendingMem.status, 'PENDING_APPROVAL');
+
+  // Attempt deleteArchivedMemory on pending memory -> must return false and NOT delete row
+  const pendingResult = env.memoryRepo.deleteArchivedMemory(pendingMem.id, env.scopeAlpha);
+  assert.equal(pendingResult, false);
+  assert.ok(env.memoryRepo.getMemoryById(pendingMem.id, env.scopeAlpha), 'Pending memory must remain in DB');
+
+  // 3. Archived memory
+  const archivedMem = createArchivedMemory(env, env.adminAlpha, 'archived_repo_del_key');
+
+  // Attempt deleteArchivedMemory with wrong scope -> must return false
+  const wrongScopeResult = env.memoryRepo.deleteArchivedMemory(archivedMem.id, env.scopeBeta);
+  assert.equal(wrongScopeResult, false);
+  assert.ok(env.memoryRepo.getMemoryById(archivedMem.id, env.scopeAlpha), 'Memory must remain untouched when scope does not match');
+
+  // Attempt deleteArchivedMemory on archived memory in correct scope -> must return true and delete
+  const archivedResult = env.memoryRepo.deleteArchivedMemory(archivedMem.id, env.scopeAlpha);
+  assert.equal(archivedResult, true);
+  assert.equal(env.memoryRepo.getMemoryById(archivedMem.id, env.scopeAlpha), null, 'Archived memory must be deleted');
+
+  // Calling again on now-deleted memory -> returns false
+  const repeatResult = env.memoryRepo.deleteArchivedMemory(archivedMem.id, env.scopeAlpha);
+  assert.equal(repeatResult, false);
+});
+
 // ============================================================================
 // 4. Cutoff-Based Purging & Boundary Semantics
 // ============================================================================
@@ -439,6 +580,92 @@ test('purgeArchivedMemories - cutoff boundaries and invalid timestamp validation
   assert.equal(env.memoryRepo.getMemoryById(m1.id, env.scopeAlpha), null, 'm1 (before) must be purged');
   assert.equal(env.memoryRepo.getMemoryById(m2.id, env.scopeAlpha), null, 'm2 (exact boundary) must be purged');
   assert.ok(env.memoryRepo.getMemoryById(m3.id, env.scopeAlpha), 'm3 (after cutoff) must NOT be purged');
+
+  // Verify same exact boundary when cutoff is provided without milliseconds (e.g. '2026-10-15T12:00:00Z')
+  const m4 = env.memoryRepo.createMemory({
+    key: 'm4_exact_noms',
+    content: 'c4',
+    category: 'PROJECT_FACT',
+    scopeType: env.scopeAlpha.scopeType,
+    scopeId: env.scopeAlpha.scopeId,
+    status: 'ARCHIVED'
+  });
+  env.db.prepare('UPDATE memories SET updated_at = ? WHERE id = ?').run('2026-10-15T12:00:00.000Z', m4.id);
+
+  const resNoMs = env.memoryService.purgeArchivedMemories(env.adminAlpha, { olderThan: '2026-10-15T12:00:00Z' });
+  assert.equal(resNoMs.purgedCount, 1);
+  assert.equal(resNoMs.cutoffTimestamp, '2026-10-15T12:00:00.000Z');
+  assert.equal(env.memoryRepo.getMemoryById(m4.id, env.scopeAlpha), null, 'm4 must be purged by normalized timestamp');
+  assert.ok(env.memoryRepo.getMemoryById(m3.id, env.scopeAlpha), 'm3 (after cutoff) must still remain');
+});
+
+test('purgeArchivedMemories - strict ISO 8601 UTC format validation on olderThan', () => {
+  const env = setupTestEnvironment();
+
+  // 1. Valid formats that must be accepted
+  const validFormats = [
+    '2026-10-15T12:00:00Z',
+    '2026-10-15T12:00:00.000Z',
+    '2026-10-15T12:00:00.123456Z'
+  ];
+
+  for (const validTs of validFormats) {
+    const res = env.memoryService.purgeArchivedMemories(env.adminAlpha, {
+      olderThan: validTs,
+      dryRun: true
+    });
+    assert.equal(res.isDryRun, true);
+    assert.equal(res.purgeMode, 'CUTOFF');
+    // Ensure normalized to canonical ISO string ending with Z
+    assert.ok(res.cutoffTimestamp);
+    assert.equal(res.cutoffTimestamp?.endsWith('Z'), true);
+    assert.equal(new Date(res.cutoffTimestamp!).getTime(), new Date(validTs).getTime());
+  }
+
+  // 2. Nonconforming strings, date-only values, missing Z, and timezone offsets that must be rejected
+  const invalidInputs = [
+    // Date-only values
+    '2026-10-15',
+    '2026-01-01',
+    // Missing timezone indicator (missing Z)
+    '2026-10-15T12:00:00',
+    '2026-10-15T12:00:00.000',
+    // Timezone offsets (+/-HH:mm)
+    '2026-10-15T12:00:00+05:30',
+    '2026-10-15T12:00:00-04:00',
+    '2026-10-15T12:00:00+00:00',
+    '2026-10-15T12:00:00-00:00',
+    // Untrimmed / spaces
+    ' 2026-10-15T12:00:00Z ',
+    '2026-10-15 12:00:00Z',
+    // Non-conforming / invalid formatting
+    '2026/10/15T12:00:00Z',
+    'not-a-timestamp',
+    '',
+    '   ',
+    // Invalid calendar dates / times (prevent rollover)
+    '2026-02-31T12:00:00Z',     // Feb 31 does not exist
+    '2026-04-31T12:00:00Z',     // April has 30 days
+    '2026-02-29T12:00:00Z',     // 2026 is not a leap year
+    '2026-13-01T12:00:00Z',     // Month 13 does not exist
+    '2026-00-10T12:00:00Z',     // Month 00 does not exist
+    '2026-10-00T12:00:00Z',     // Day 00 does not exist
+    '2026-10-32T12:00:00Z',     // Day 32 does not exist
+    '2026-10-15T25:00:00Z',     // Hour 25 does not exist
+    '2026-10-15T24:00:00Z',     // Hour 24 does not exist in ISO
+    '2026-10-15T12:60:00Z',     // Minute 60 does not exist
+    '2026-10-15T12:00:60Z'      // Second 60 does not exist
+  ];
+
+  for (const invalidTs of invalidInputs) {
+    assert.throws(
+      () => env.memoryService.purgeArchivedMemories(env.adminAlpha, {
+        olderThan: invalidTs
+      }),
+      (err: unknown) => err instanceof ValidationError,
+      `Expected ValidationError for timestamp: '${invalidTs}'`
+    );
+  }
 });
 
 // ============================================================================

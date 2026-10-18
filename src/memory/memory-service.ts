@@ -112,6 +112,61 @@ export interface MemoryServiceOptions {
   readonly _testPostPurgeAuditHook?: () => void;
 }
 
+/**
+ * Strict ISO 8601 UTC format: YYYY-MM-DDTHH:mm:ss[.sss...]Z
+ * Explicit 'Z' required. Timezone offsets (+/-HH:mm), date-only values, and missing timezone indicators are strictly rejected.
+ */
+const STRICT_ISO_8601_UTC_REGEX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+
+function validateAndNormalizeUtcTimestamp(timestamp: unknown, fieldName: string): string {
+  if (typeof timestamp !== 'string' || timestamp.trim() === '') {
+    throw new ValidationError(
+      `${fieldName} must be a non-empty ISO 8601 UTC timestamp string ending with 'Z'.`
+    );
+  }
+
+  if (!STRICT_ISO_8601_UTC_REGEX.test(timestamp)) {
+    throw new ValidationError(
+      `${fieldName} must be a strict ISO 8601 UTC timestamp ending in 'Z' (e.g. '2026-10-15T12:00:00Z' or '2026-10-15T12:00:00.000Z'). Date-only values, timezone offsets, and non-UTC representations are not permitted. Received: '${timestamp}'.`
+    );
+  }
+
+  const parsedDate = new Date(timestamp);
+  if (isNaN(parsedDate.getTime())) {
+    throw new ValidationError(
+      `Invalid calendar date/time for ${fieldName}: '${timestamp}'.`
+    );
+  }
+
+  // Verify that Date parsing did not rollover an invalid calendar date or time
+  const [datePart, timePart] = timestamp.slice(0, -1).split('T');
+  const [yearStr, monthStr, dayStr] = datePart.split('-');
+  const [hourStr, minuteStr, secondPart] = timePart.split(':');
+  const [secondStr] = secondPart.split('.');
+
+  const year = Number(yearStr);
+  const month = Number(monthStr);
+  const day = Number(dayStr);
+  const hour = Number(hourStr);
+  const minute = Number(minuteStr);
+  const second = Number(secondStr);
+
+  if (
+    parsedDate.getUTCFullYear() !== year ||
+    parsedDate.getUTCMonth() + 1 !== month ||
+    parsedDate.getUTCDate() !== day ||
+    parsedDate.getUTCHours() !== hour ||
+    parsedDate.getUTCMinutes() !== minute ||
+    parsedDate.getUTCSeconds() !== second
+  ) {
+    throw new ValidationError(
+      `Invalid calendar date or time values in ${fieldName}: '${timestamp}'.`
+    );
+  }
+
+  return parsedDate.toISOString();
+}
+
 export class MemoryService {
   private readonly memoryRepo: MemoryRepository;
   private readonly auditRepo?: AuditRepository;
@@ -1451,101 +1506,141 @@ export class MemoryService {
         );
       }
 
-      // Pre-flight validation of every requested ID before opening mutation transaction
-      const memoriesToDelete: Memory[] = [];
-      for (const id of uniqueIds) {
-        let memory: Memory | null;
-        try {
-          memory = this.memoryRepo.getMemoryById(id, caller.scope);
-        } catch (err) {
-          if (err instanceof MemoryScopeViolationError) {
-            this.audit(caller, 'MEMORY_ACCESS_DENIED', {
-              reason: 'CROSS_SCOPE_PURGE_ATTEMPT',
-              memoryId: id,
-              expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
-            }, false);
-          }
-          throw err;
-        }
-
-        if (!memory) {
-          throw new MemoryNotFoundError(id);
-        }
-
-        if (memory.status !== 'ARCHIVED') {
-          this.audit(caller, 'MEMORY_ACCESS_DENIED', {
-            reason: 'NON_ARCHIVED_PURGE_DENIED',
-            operation: 'purgeArchivedMemories',
-            memoryId: id,
-            status: memory.status
-          }, false);
-          throw new ValidationError(
-            `Cannot purge memory '${id}': status is '${memory.status}'. Only records with status 'ARCHIVED' can be purged.`,
-            { memoryId: id, status: memory.status }
-          );
-        }
-
-        memoriesToDelete.push(memory);
-      }
-
+      // Dry run: read-only eligibility preview (no transaction, no mutation audit event)
       if (isDryRun) {
+        for (const id of uniqueIds) {
+          let memory: Memory | null;
+          try {
+            memory = this.memoryRepo.getMemoryById(id, caller.scope);
+          } catch (err) {
+            if (err instanceof MemoryScopeViolationError) {
+              this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+                reason: 'CROSS_SCOPE_PURGE_ATTEMPT',
+                memoryId: id,
+                expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+              }, false);
+            }
+            throw err;
+          }
+
+          if (!memory) {
+            throw new MemoryNotFoundError(id);
+          }
+          if (memory.status !== 'ARCHIVED') {
+            this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+              reason: 'NON_ARCHIVED_PURGE_DENIED',
+              operation: 'purgeArchivedMemories',
+              memoryId: id,
+              status: memory.status
+            }, false);
+            throw new ValidationError(
+              `Cannot purge memory '${id}': status is '${memory.status}'. Only records with status 'ARCHIVED' can be purged.`,
+              { memoryId: id, status: memory.status }
+            );
+          }
+        }
         return {
           targetScope: { scopeType: caller.scope.scopeType, scopeId: caller.scope.scopeId },
           purgeMode: 'ID_LIST',
-          eligibleCount: memoriesToDelete.length,
+          eligibleCount: uniqueIds.length,
           purgedCount: 0,
           isDryRun: true,
           ...(options.maxBatchSize !== undefined ? { batchSizeLimit: options.maxBatchSize } : {})
         };
       }
 
-      // Atomic mutation transaction
-      return this.memoryRepo.transaction(() => {
-        let deletedCount = 0;
-        for (const memory of memoriesToDelete) {
-          this.memoryRepo.deleteMemory(memory.id, caller.scope);
-          deletedCount++;
-          if (this._testMidPurgeHook) {
-            this._testMidPurgeHook(deletedCount);
+      // Non-dry-run: ID lookup, existence/scope validation, ARCHIVED status validation,
+      // deletions, and MEMORIES_PURGED audit event all execute within the SAME atomic database transaction.
+      let lastAttemptedId: string | undefined;
+      let nonArchivedStatusCaught: { id: string; status: string } | null = null;
+
+      try {
+        return this.memoryRepo.transaction(() => {
+          // Step 1: Preflight entire ID list before deleting anything.
+          // If any ID is missing, outside scope, or not archived, abort the entire operation without partial deletion.
+          const memoriesToDelete: Memory[] = [];
+          for (const id of uniqueIds) {
+            lastAttemptedId = id;
+            const memory = this.memoryRepo.getMemoryById(id, caller.scope);
+            if (!memory) {
+              throw new MemoryNotFoundError(id);
+            }
+
+            if (memory.status !== 'ARCHIVED') {
+              nonArchivedStatusCaught = { id, status: memory.status };
+              throw new ValidationError(
+                `Cannot purge memory '${id}': status is '${memory.status}'. Only records with status 'ARCHIVED' can be purged.`,
+                { memoryId: id, status: memory.status }
+              );
+            }
+
+            memoriesToDelete.push(memory);
+          }
+
+          // Step 2: Delete every preflighted record using deleteArchivedMemory
+          let deletedCount = 0;
+          for (const memory of memoriesToDelete) {
+            const deleted = this.memoryRepo.deleteArchivedMemory(memory.id, caller.scope);
+            if (!deleted) {
+              throw new ValidationError(
+                `Cannot purge memory '${memory.id}': record is no longer archived or does not exist in scope.`
+              );
+            }
+            deletedCount++;
+            if (this._testMidPurgeHook) {
+              this._testMidPurgeHook(deletedCount);
+            }
+          }
+
+          // Step 3: Mandatory audit event for state mutation
+          const auditDetails: Record<string, unknown> = {
+            scopeType: caller.scope.scopeType,
+            scopeId: caller.scope.scopeId,
+            purgeMode: 'ID_LIST',
+            purgedCount: deletedCount
+          };
+          if (options.maxBatchSize !== undefined) {
+            auditDetails.batchSizeLimit = options.maxBatchSize;
+          }
+
+          this.audit(caller, 'MEMORIES_PURGED', auditDetails, true);
+
+          if (this._testPostPurgeAuditHook) {
+            this._testPostPurgeAuditHook();
+          }
+
+          return {
+            targetScope: { scopeType: caller.scope.scopeType, scopeId: caller.scope.scopeId },
+            purgeMode: 'ID_LIST',
+            eligibleCount: memoriesToDelete.length,
+            purgedCount: deletedCount,
+            isDryRun: false,
+            ...(options.maxBatchSize !== undefined ? { batchSizeLimit: options.maxBatchSize } : {})
+          };
+        });
+      } catch (err) {
+        if (err instanceof MemoryScopeViolationError) {
+          this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+            reason: 'CROSS_SCOPE_PURGE_ATTEMPT',
+            memoryId: lastAttemptedId,
+            expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+          }, false);
+        } else {
+          const nonArchived = nonArchivedStatusCaught as { id: string; status: string } | null;
+          if (nonArchived) {
+            this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+              reason: 'NON_ARCHIVED_PURGE_DENIED',
+              operation: 'purgeArchivedMemories',
+              memoryId: nonArchived.id,
+              status: nonArchived.status
+            }, false);
           }
         }
-
-        const auditDetails: Record<string, unknown> = {
-          scopeType: caller.scope.scopeType,
-          scopeId: caller.scope.scopeId,
-          purgeMode: 'ID_LIST',
-          purgedCount: deletedCount
-        };
-        if (options.maxBatchSize !== undefined) {
-          auditDetails.batchSizeLimit = options.maxBatchSize;
-        }
-
-        this.audit(caller, 'MEMORIES_PURGED', auditDetails, true);
-
-        if (this._testPostPurgeAuditHook) {
-          this._testPostPurgeAuditHook();
-        }
-
-        return {
-          targetScope: { scopeType: caller.scope.scopeType, scopeId: caller.scope.scopeId },
-          purgeMode: 'ID_LIST',
-          eligibleCount: memoriesToDelete.length,
-          purgedCount: deletedCount,
-          isDryRun: false,
-          ...(options.maxBatchSize !== undefined ? { batchSizeLimit: options.maxBatchSize } : {})
-        };
-      });
+        throw err;
+      }
     } else {
       // CUTOFF mode
-      const rawOlderThan = options.olderThan!;
-      if (typeof rawOlderThan !== 'string' || rawOlderThan.trim() === '') {
-        throw new ValidationError('olderThan must be a non-empty ISO 8601 timestamp string.');
-      }
-      const parsedTime = Date.parse(rawOlderThan);
-      if (isNaN(parsedTime)) {
-        throw new ValidationError(`Invalid timestamp for olderThan: '${rawOlderThan}'. Must be a valid ISO 8601 string.`);
-      }
-      const cutoffIso = new Date(rawOlderThan).toISOString();
+      const cutoffIso = validateAndNormalizeUtcTimestamp(options.olderThan, 'olderThan');
 
       if (isDryRun) {
         const eligibleCount = this.memoryRepo.countArchivedMemoriesOlderThan(caller.scope, cutoffIso);
@@ -1571,7 +1666,12 @@ export class MemoryService {
 
         let deletedCount = 0;
         for (const memory of memoriesToDelete) {
-          this.memoryRepo.deleteMemory(memory.id, caller.scope);
+          const deleted = this.memoryRepo.deleteArchivedMemory(memory.id, caller.scope);
+          if (!deleted) {
+            throw new ValidationError(
+              `Cannot purge memory '${memory.id}': record is no longer archived or does not exist in scope.`
+            );
+          }
           deletedCount++;
           if (this._testMidPurgeHook) {
             this._testMidPurgeHook(deletedCount);

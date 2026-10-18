@@ -423,6 +423,30 @@ export class MemoryRepository {
   }
 
   /**
+   * Physically deletes an archived memory from the database.
+   * Strictly enforces status = 'ARCHIVED' in the DELETE statement to prevent deleting
+   * active or pending records even under concurrent status modifications.
+   * Verifies that exactly one eligible row was deleted.
+   * SQLite foreign keys automatically set memory_id = NULL in memory_task_injections.
+   */
+  public deleteArchivedMemory(id: string, scope: ScopeIdentifier): boolean {
+    if (!id || typeof id !== 'string' || id.trim() === '') {
+      throw new ValidationError('Memory ID must be a non-empty string.');
+    }
+    if (!scope || typeof scope !== 'object') {
+      throw new ValidationError('Scope must be provided to deleteArchivedMemory.');
+    }
+    this.validateScope(scope.scopeType, scope.scopeId);
+
+    const stmt = this.db.prepare(`
+      DELETE FROM memories 
+      WHERE id = ? AND scope_type = ? AND scope_id = ? AND status = 'ARCHIVED'
+    `);
+    const result = stmt.run(id, scope.scopeType, scope.scopeId);
+    return result.changes === 1;
+  }
+
+  /**
    * Explicitly updates access timestamp and access count for a memory item.
    * Does NOT run during standard reads.
    */
