@@ -917,7 +917,6 @@ export class MemoryService {
 
     this.audit(caller, 'MEMORY_RETRIEVED', {
       memoryId: memory.id,
-      key: memory.key,
       category: memory.category,
       scopeType: memory.scopeType,
       scopeId: memory.scopeId,

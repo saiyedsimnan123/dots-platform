@@ -241,12 +241,46 @@ test('getMemoryUsageHistory - aggregates usage accurately across multiple task i
   assert.equal(history.injections[0].taskId, task1.id);
   assert.equal(history.injections[1].taskId, task2.id);
 
-  // Check audit telemetry
+  // Check audit telemetry: must not leak memory key or content
   const auditEvents = env.auditRepo.getEventsByTaskId('__system_memory__');
   const retrievedEvent = auditEvents.find(
     (e) => e.eventType === 'MEMORY_RETRIEVED' && e.detailsJson.includes('getMemoryUsageHistory')
   );
   assert.ok(retrievedEvent, 'Expected MEMORY_RETRIEVED audit event for getMemoryUsageHistory');
+  assert.equal(retrievedEvent.detailsJson.includes('coding_convention'), false, 'Audit event must not contain memory key');
+  assert.equal(retrievedEvent.detailsJson.includes('Always use strict TypeScript types'), false, 'Audit event must not contain raw memory content');
+});
+
+test('getMemoryUsageHistory - audit privacy guarantee: does not expose memory key or raw content in audit event', () => {
+  const env = setupTestEnvironment();
+
+  const memory = env.memoryService.createMemory(env.adminAlpha, {
+    key: 'confidential_server_key',
+    content: 'confidential_internal_ip_10.0.0.42_sensitive_host',
+    category: 'PROJECT_FACT',
+    scopeType: 'WORKSPACE',
+    scopeId: 'ws-alpha'
+  });
+
+  env.memoryService.getMemoryUsageHistory(env.readOnlyAlpha, memory.id);
+
+  const auditEvents = env.auditRepo.getEventsByTaskId('__system_memory__');
+  const retrievedEvent = auditEvents.find(
+    (e) => e.eventType === 'MEMORY_RETRIEVED' && e.detailsJson.includes('getMemoryUsageHistory')
+  );
+  assert.ok(retrievedEvent, 'Expected MEMORY_RETRIEVED audit event for getMemoryUsageHistory');
+
+  const details = JSON.parse(retrievedEvent.detailsJson);
+  assert.equal(details.memoryId, memory.id);
+  assert.equal(details.operation, 'getMemoryUsageHistory');
+  assert.equal(details.scopeType, 'WORKSPACE');
+  assert.equal(details.scopeId, 'ws-alpha');
+  assert.equal(details.totalInjections, 0);
+
+  // Guarantee: Zero memory key and zero raw content leakage in audit event
+  assert.equal('key' in details, false, 'Audit event must not contain memory key');
+  assert.equal(retrievedEvent.detailsJson.includes('confidential_server_key'), false);
+  assert.equal(retrievedEvent.detailsJson.includes('confidential_internal_ip'), false);
 });
 
 // ============================================================================
