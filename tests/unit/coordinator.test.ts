@@ -1533,6 +1533,7 @@ test('TaskCoordinator - Phase 7.4 Substep 4B: failure during step persistence ro
   });
 
   const harness = createMemoryCoordHarness({ idProvider });
+  let originalCreateStep: typeof harness.taskRepo.createStep | undefined;
 
   try {
     const coordinator = harness.createCoordinator();
@@ -1560,15 +1561,33 @@ test('TaskCoordinator - Phase 7.4 Substep 4B: failure during step persistence ro
 
     await coordinator.step(task.id); // transitions to PLANNING
 
-    // Inject failure on step persistence
-    const originalCreateStep = harness.taskRepo.createStep.bind(harness.taskRepo);
+    // Enqueue a deterministic multi-step plan
+    harness.modelProvider.enqueuePlan([
+      {
+        stepOrder: 1,
+        description: 'First action',
+        toolName: 'calculate',
+        arguments: { expression: '1 + 1' },
+        expectedOutcome: 'Step 1 success'
+      },
+      {
+        stepOrder: 2,
+        description: 'Second action',
+        toolName: 'calculate',
+        arguments: { expression: '2 + 2' },
+        expectedOutcome: 'Step 2 success'
+      }
+    ]);
+
+    // Inject failure on second step persistence to prove rollback of a partially written plan
+    originalCreateStep = harness.taskRepo.createStep.bind(harness.taskRepo);
     let stepCount = 0;
     harness.taskRepo.createStep = (input) => {
       stepCount++;
-      if (stepCount === 1) {
+      if (stepCount === 2) {
         throw new DatabaseError('Simulated step insert disk failure');
       }
-      return originalCreateStep(input);
+      return originalCreateStep!(input);
     };
 
     await assert.rejects(
@@ -1586,6 +1605,9 @@ test('TaskCoordinator - Phase 7.4 Substep 4B: failure during step persistence ro
     assert.equal(harness.memoryRepo.getInjectionsByTaskId(task.id).length, 0);
     assert.equal(harness.auditRepo.getEventsByTaskId(task.id).filter((e) => e.eventType === 'PLAN_GENERATED').length, 0);
   } finally {
+    if (originalCreateStep) {
+      harness.taskRepo.createStep = originalCreateStep;
+    }
     harness.sharedDb.close();
     if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
   }
