@@ -104,7 +104,8 @@ test('MockModelProvider - generatePlan records pre-compiled prompt and updates t
   const compiledPrompt = {
     systemInstruction: 'Compiled system instructions for planning',
     userPrompt: 'TASK GOAL:\nBuild artifact\n\nADDITIONAL CONTEXT / ARTIFACTS:\n{"records":[{"id":"mem-1"}]}',
-    contextOmitted: false
+    contextOmitted: false,
+    contextIncluded: true
   };
 
   const result = await provider.generatePlan('Build artifact', tools, undefined, compiledPrompt);
@@ -131,7 +132,8 @@ test('MockModelProvider - generatePlan supports 3-arg compiledPrompt path and le
   const compiled = {
     systemInstruction: 'System instructions',
     userPrompt: 'TASK GOAL:\nGoal 1',
-    contextOmitted: false
+    contextOmitted: false,
+    contextIncluded: false
   };
   await provider.generatePlan('Goal 1', tools, compiled as any);
 
@@ -159,7 +161,8 @@ test('MockModelProvider - generatePlan ignores legacy context argument when comp
   const compiledPrompt = {
     systemInstruction: 'Compiled instructions',
     userPrompt: 'TASK GOAL:\nGoal with prompt',
-    contextOmitted: false
+    contextOmitted: false,
+    contextIncluded: true
   };
 
   await provider.generatePlan('Goal with prompt', tools, 'raw-unscrubbed-context' as any, compiledPrompt);

@@ -65,7 +65,8 @@ test('GeminiProvider - generatePlan uses pre-compiled systemInstruction and user
     const compiledPrompt = {
       systemInstruction: 'Scrubbed system instruction with custom tools',
       userPrompt: 'TASK GOAL:\nSolve problem\n\nADDITIONAL CONTEXT / ARTIFACTS:\n{"records":[]}',
-      contextOmitted: false
+      contextOmitted: false,
+      contextIncluded: true
     };
 
     const result = await provider.generatePlan(
@@ -108,7 +109,8 @@ test('GeminiProvider - generatePlan supports 3-argument compiledPrompt path: gen
     const compiledPrompt = {
       systemInstruction: 'Instruction via 3-arg call',
       userPrompt: 'TASK GOAL:\nGoal via 3-arg call',
-      contextOmitted: false
+      contextOmitted: false,
+      contextIncluded: false
     };
 
     await provider.generatePlan('Goal via 3-arg call', [], compiledPrompt as any);
@@ -174,7 +176,8 @@ test('GeminiProvider - generatePlan ignores legacy context argument when pre-com
     const compiledPrompt = {
       systemInstruction: 'Compiled instruction',
       userPrompt: 'TASK GOAL:\nGoal with compiled prompt',
-      contextOmitted: false
+      contextOmitted: false,
+      contextIncluded: true
     };
 
     // Even if raw context string was passed as 3rd arg alongside compiledPrompt

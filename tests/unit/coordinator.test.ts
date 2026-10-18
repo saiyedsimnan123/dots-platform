@@ -24,7 +24,7 @@ import { ApprovalBroker } from '../../src/security/approval-broker.ts';
 import { VerificationEngine } from '../../src/verification/verifier.ts';
 import { TokenBudgetTracker } from '../../src/model/budget-tracker.ts';
 import { TaskCoordinator } from '../../src/orchestrator/coordinator.ts';
-import { ValidationError, SecurityViolationError } from '../../src/domain/errors.ts';
+import { ValidationError, SecurityViolationError, DatabaseError } from '../../src/domain/errors.ts';
 import type { CallerContext } from '../../src/domain/types.ts';
 import { PromptCompiler, type CompiledPlanPrompt } from '../../src/model/prompt-compiler.ts';
 import { MEMORY_CONTEXT_SECURITY_BOUNDARY, MEMORY_CONTEXT_SECURITY_BOUNDARY_END } from '../../src/memory/context-builder.ts';
@@ -1094,7 +1094,7 @@ test('TaskCoordinator - Phase 7.4 Substep 4A: valid scoped task retrieves and pa
       requestedScope: { scopeType: 'WORKSPACE', scopeId: 'analytics' }
     });
 
-    harness.memoryService.createMemory(user, {
+    const mem = harness.memoryService.createMemory(user, {
       category: 'PROJECT_FACT',
       scopeType: 'WORKSPACE',
       scopeId: 'analytics',
@@ -1130,6 +1130,7 @@ test('TaskCoordinator - Phase 7.4 Substep 4A: valid scoped task retrieves and pa
     const compiled = calls[0]!.args.compiledPrompt as CompiledPlanPrompt;
     assert.ok(compiled);
     assert.equal(compiled.contextOmitted, false);
+    assert.equal(compiled.contextIncluded, true);
 
     const systemInstruction = calls[0]!.args.systemInstruction as string;
     assert.ok(systemInstruction.includes('AVAILABLE TOOLS:'));
@@ -1150,9 +1151,22 @@ test('TaskCoordinator - Phase 7.4 Substep 4A: valid scoped task retrieves and pa
     const retrievedEvents = auditEvents.filter((e) => e.eventType === 'MEMORY_RETRIEVED');
     assert.equal(retrievedEvents.length, 1);
 
-    // 7. Verify NO memory injection provenance was recorded in Substep 4A (Substep 4B scope)
+    // 7. Verify atomic memory injection provenance was recorded (Substep 4B)
     const injections = harness.memoryRepo.getInjectionsByTaskId(task.id);
-    assert.equal(injections.length, 0);
+    assert.equal(injections.length, 1);
+    assert.equal(injections[0]!.taskId, task.id);
+    assert.equal(injections[0]!.memoryId, mem.id);
+    assert.equal(injections[0]!.charCount, mem.content.length);
+    assert.equal(injections[0]!.estimatedTokens, Math.ceil(mem.content.length / 3.8));
+
+    // 8. Verify PLAN_GENERATED audit event contains provenance metadata but zero raw content/keys
+    const planGenEvent = auditEvents.find((e) => e.eventType === 'PLAN_GENERATED');
+    assert.ok(planGenEvent);
+    const planDetails = JSON.parse(planGenEvent.detailsJson);
+    assert.equal(planDetails.injectedMemoriesCount, 1);
+    assert.deepEqual(planDetails.injectedMemoryIds, [mem.id]);
+    assert.ok(!planGenEvent.detailsJson.includes(mem.content), 'Audit event must never log raw memory content');
+    assert.ok(!planGenEvent.detailsJson.includes('db.schema.version'), 'Audit event must not log raw memory key');
   } finally {
     harness.sharedDb.close();
     if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
@@ -1207,11 +1221,15 @@ test('TaskCoordinator - Phase 7.4 Substep 4A: unattested legacy task skips memor
     const compiled = calls[0]!.args.compiledPrompt as CompiledPlanPrompt;
     assert.ok(compiled);
     assert.equal(compiled.contextOmitted, false);
+    assert.equal(compiled.contextIncluded, false);
 
     const userPrompt = calls[0]!.args.userPrompt as string;
     assert.equal(userPrompt, 'TASK GOAL:\nLegacy task without scope claims');
     assert.ok(!userPrompt.includes('legacy.secret.fact'));
     assert.ok(!userPrompt.includes(MEMORY_CONTEXT_SECURITY_BOUNDARY));
+
+    // Zero memory injection provenance for legacy task
+    assert.equal(harness.memoryRepo.getInjectionsByTaskId(legacyTask.id).length, 0);
 
     // No MEMORY_RETRIEVED audit event for legacy task
     const auditEvents = harness.auditRepo.getEventsByTaskId(legacyTask.id);
@@ -1372,11 +1390,19 @@ test('TaskCoordinator - Phase 7.4 Substep 4A: prompt budget overflow omits memor
     const compiled = calls[0]!.args.compiledPrompt as CompiledPlanPrompt;
     assert.ok(compiled);
     assert.equal(compiled.contextOmitted, true);
+    assert.equal(compiled.contextIncluded, false);
 
     const userPrompt = calls[0]!.args.userPrompt as string;
     assert.equal(userPrompt, `TASK GOAL:\n${shortGoal}`);
     assert.ok(!userPrompt.includes('research.large.artifact'));
     assert.ok(!userPrompt.includes(MEMORY_CONTEXT_SECURITY_BOUNDARY));
+
+    // Zero memory injection provenance when context is omitted
+    assert.equal(harness.memoryRepo.getInjectionsByTaskId(task.id).length, 0);
+
+    const planGenAudit = harness.auditRepo.getEventsByTaskId(task.id).find((e) => e.eventType === 'PLAN_GENERATED');
+    assert.ok(planGenAudit);
+    assert.equal(JSON.parse(planGenAudit.detailsJson).injectedMemoriesCount, 0);
 
     // 6. Oversized goal itself throws ValidationError
     const oversizedGoal = 'A'.repeat(300);
@@ -1492,6 +1518,293 @@ test('TaskCoordinator - Phase 7.4 Substep 4A: secrets inside memory records are 
     assert.ok(!userPrompt.includes('secretbearer12345abcdef'), 'Raw token must not leak into model prompt');
     assert.ok(userPrompt.includes('[REDACTED_GOOGLE_API_KEY]'), 'Scrubbed Google API key marker must be present');
     assert.ok(userPrompt.includes('[REDACTED_TOKEN]'), 'Scrubbed token marker must be present');
+  } finally {
+    harness.sharedDb.close();
+    if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
+  }
+});
+
+test('TaskCoordinator - Phase 7.4 Substep 4B: failure during step persistence rolls back steps, provenance, and audit event', async () => {
+  const idProvider = new MockIdentityProvider();
+  idProvider.register('token-dev', {
+    principalId: 'dev-1',
+    role: 'MEMBER',
+    permittedScopes: [{ scopeType: 'WORKSPACE', scopeId: 'atomic-test' }]
+  });
+
+  const harness = createMemoryCoordHarness({ idProvider });
+
+  try {
+    const coordinator = harness.createCoordinator();
+
+    const dev = harness.authorizer.authorizeUser({
+      credentials: 'token-dev',
+      requestedScope: { scopeType: 'WORKSPACE', scopeId: 'atomic-test' }
+    });
+
+    harness.memoryService.createMemory(dev, {
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'atomic-test',
+      key: 'service.port',
+      content: 'Production service port is 8080.',
+      tags: ['network', 'port'],
+      priority: 80,
+      status: 'ACTIVE'
+    });
+
+    const task = await coordinator.submitScopedTask({
+      goal: 'Connect to service port',
+      caller: dev
+    });
+
+    await coordinator.step(task.id); // transitions to PLANNING
+
+    // Inject failure on step persistence
+    const originalCreateStep = harness.taskRepo.createStep.bind(harness.taskRepo);
+    let stepCount = 0;
+    harness.taskRepo.createStep = (input) => {
+      stepCount++;
+      if (stepCount === 1) {
+        throw new DatabaseError('Simulated step insert disk failure');
+      }
+      return originalCreateStep(input);
+    };
+
+    await assert.rejects(
+      async () => coordinator.step(task.id),
+      (err: unknown) => {
+        assert.ok(err instanceof DatabaseError);
+        assert.match(err.message, /Simulated step insert disk failure/);
+        return true;
+      }
+    );
+
+    // Verify atomic rollback
+    assert.equal(harness.taskRepo.getTaskById(task.id)!.status, 'PLANNING');
+    assert.equal(harness.taskRepo.getStepsByTaskId(task.id).length, 0);
+    assert.equal(harness.memoryRepo.getInjectionsByTaskId(task.id).length, 0);
+    assert.equal(harness.auditRepo.getEventsByTaskId(task.id).filter((e) => e.eventType === 'PLAN_GENERATED').length, 0);
+  } finally {
+    harness.sharedDb.close();
+    if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
+  }
+});
+
+test('TaskCoordinator - Phase 7.4 Substep 4B: failure during provenance persistence rolls back all steps and audit event', async () => {
+  const idProvider = new MockIdentityProvider();
+  idProvider.register('token-dev', {
+    principalId: 'dev-1',
+    role: 'MEMBER',
+    permittedScopes: [{ scopeType: 'WORKSPACE', scopeId: 'atomic-prov' }]
+  });
+
+  const harness = createMemoryCoordHarness({ idProvider });
+
+  try {
+    const coordinator = harness.createCoordinator();
+
+    const dev = harness.authorizer.authorizeUser({
+      credentials: 'token-dev',
+      requestedScope: { scopeType: 'WORKSPACE', scopeId: 'atomic-prov' }
+    });
+
+    harness.memoryService.createMemory(dev, {
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'atomic-prov',
+      key: 'service.url',
+      content: 'Service url is https://api.internal.net',
+      tags: ['network', 'url'],
+      priority: 80,
+      status: 'ACTIVE'
+    });
+
+    const task = await coordinator.submitScopedTask({
+      goal: 'Find service url',
+      caller: dev
+    });
+
+    await coordinator.step(task.id); // transitions to PLANNING
+
+    // Inject failure on provenance batch persistence
+    harness.memoryService.recordTaskInjectionsBatch = () => {
+      throw new DatabaseError('Simulated provenance foreign key failure');
+    };
+
+    await assert.rejects(
+      async () => coordinator.step(task.id),
+      (err: unknown) => {
+        assert.ok(err instanceof DatabaseError);
+        assert.match(err.message, /Simulated provenance foreign key failure/);
+        return true;
+      }
+    );
+
+    // Verify atomic rollback: steps that were inserted before provenance failure must be rolled back!
+    assert.equal(harness.taskRepo.getTaskById(task.id)!.status, 'PLANNING');
+    assert.equal(harness.taskRepo.getStepsByTaskId(task.id).length, 0);
+    assert.equal(harness.memoryRepo.getInjectionsByTaskId(task.id).length, 0);
+    assert.equal(harness.auditRepo.getEventsByTaskId(task.id).filter((e) => e.eventType === 'PLAN_GENERATED').length, 0);
+  } finally {
+    harness.sharedDb.close();
+    if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
+  }
+});
+
+test('TaskCoordinator - Phase 7.4 Substep 4B: failure during audit event append rolls back steps and provenance', async () => {
+  const idProvider = new MockIdentityProvider();
+  idProvider.register('token-dev', {
+    principalId: 'dev-1',
+    role: 'MEMBER',
+    permittedScopes: [{ scopeType: 'WORKSPACE', scopeId: 'atomic-audit' }]
+  });
+
+  const harness = createMemoryCoordHarness({ idProvider });
+
+  try {
+    const coordinator = harness.createCoordinator();
+
+    const dev = harness.authorizer.authorizeUser({
+      credentials: 'token-dev',
+      requestedScope: { scopeType: 'WORKSPACE', scopeId: 'atomic-audit' }
+    });
+
+    harness.memoryService.createMemory(dev, {
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'atomic-audit',
+      key: 'service.key',
+      content: 'Config key is cluster-alpha',
+      tags: ['cluster'],
+      priority: 80,
+      status: 'ACTIVE'
+    });
+
+    const task = await coordinator.submitScopedTask({
+      goal: 'Query cluster key',
+      caller: dev
+    });
+
+    await coordinator.step(task.id); // transitions to PLANNING
+
+    // Inject failure on audit append for PLAN_GENERATED
+    const originalAppend = harness.auditRepo.appendEvent.bind(harness.auditRepo);
+    harness.auditRepo.appendEvent = (input) => {
+      if (input.eventType === 'PLAN_GENERATED') {
+        throw new DatabaseError('Simulated audit append lock conflict');
+      }
+      return originalAppend(input);
+    };
+
+    await assert.rejects(
+      async () => coordinator.step(task.id),
+      (err: unknown) => {
+        assert.ok(err instanceof DatabaseError);
+        assert.match(err.message, /Simulated audit append lock conflict/);
+        return true;
+      }
+    );
+
+    // Verify atomic rollback
+    assert.equal(harness.taskRepo.getTaskById(task.id)!.status, 'PLANNING');
+    assert.equal(harness.taskRepo.getStepsByTaskId(task.id).length, 0);
+    assert.equal(harness.memoryRepo.getInjectionsByTaskId(task.id).length, 0);
+    assert.equal(harness.auditRepo.getEventsByTaskId(task.id).filter((e) => e.eventType === 'PLAN_GENERATED').length, 0);
+  } finally {
+    harness.sharedDb.close();
+    if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
+  }
+});
+
+test('TaskCoordinator - Phase 7.4 Substep 4B: failed transaction followed by successful retry leaves zero duplicate records', async () => {
+  const idProvider = new MockIdentityProvider();
+  idProvider.register('token-dev', {
+    principalId: 'dev-1',
+    role: 'MEMBER',
+    permittedScopes: [{ scopeType: 'WORKSPACE', scopeId: 'retry-test' }]
+  });
+
+  const harness = createMemoryCoordHarness({ idProvider });
+
+  try {
+    const coordinator = harness.createCoordinator();
+
+    const dev = harness.authorizer.authorizeUser({
+      credentials: 'token-dev',
+      requestedScope: { scopeType: 'WORKSPACE', scopeId: 'retry-test' }
+    });
+
+    const mem = harness.memoryService.createMemory(dev, {
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'retry-test',
+      key: 'retry.config',
+      content: 'Retry timeout is 30 seconds',
+      tags: ['retry'],
+      priority: 85,
+      status: 'ACTIVE'
+    });
+
+    const task = await coordinator.submitScopedTask({
+      goal: 'Lookup retry timeout',
+      caller: dev
+    });
+
+    await coordinator.step(task.id); // transitions to PLANNING
+
+    // 1. First Attempt: Inject failure on PLAN_GENERATED audit append
+    let failAuditOnce = true;
+    const originalAppend = harness.auditRepo.appendEvent.bind(harness.auditRepo);
+    harness.auditRepo.appendEvent = (input) => {
+      if (input.eventType === 'PLAN_GENERATED' && failAuditOnce) {
+        failAuditOnce = false;
+        throw new DatabaseError('Simulated temporary audit failure');
+      }
+      return originalAppend(input);
+    };
+
+    await assert.rejects(
+      async () => coordinator.step(task.id),
+      (err: unknown) => {
+        assert.ok(err instanceof DatabaseError);
+        assert.match(err.message, /Simulated temporary audit failure/);
+        return true;
+      }
+    );
+
+    // Verify attempt 1 rolled back completely
+    assert.equal(harness.taskRepo.getTaskById(task.id)!.status, 'PLANNING');
+    assert.equal(harness.taskRepo.getStepsByTaskId(task.id).length, 0);
+    assert.equal(harness.memoryRepo.getInjectionsByTaskId(task.id).length, 0);
+    assert.equal(harness.auditRepo.getEventsByTaskId(task.id).filter((e) => e.eventType === 'PLAN_GENERATED').length, 0);
+    assert.equal(harness.modelProvider.getRecordedCalls().length, 1);
+
+    // 2. Second Attempt (Retry): Calling step() again should re-plan cleanly
+    const step2 = await coordinator.step(task.id);
+    assert.equal(step2.status, 'EXECUTING');
+
+    // Model was called twice (once per planning attempt)
+    assert.equal(harness.modelProvider.getRecordedCalls().length, 2);
+
+    // Exactly one set of steps persisted (NO duplicate steps)
+    const steps = harness.taskRepo.getStepsByTaskId(task.id);
+    assert.equal(steps.length, 1);
+
+    // Exactly one provenance record persisted (NO duplicate injections)
+    const injections = harness.memoryRepo.getInjectionsByTaskId(task.id);
+    assert.equal(injections.length, 1);
+    assert.equal(injections[0]!.memoryId, mem.id);
+    assert.equal(injections[0]!.charCount, mem.content.length);
+    assert.equal(injections[0]!.estimatedTokens, Math.ceil(mem.content.length / 3.8));
+
+    // Exactly one PLAN_GENERATED audit event persisted
+    const planEvents = harness.auditRepo.getEventsByTaskId(task.id).filter((e) => e.eventType === 'PLAN_GENERATED');
+    assert.equal(planEvents.length, 1);
+    const details = JSON.parse(planEvents[0]!.detailsJson);
+    assert.equal(details.injectedMemoriesCount, 1);
+    assert.deepEqual(details.injectedMemoryIds, [mem.id]);
+    assert.ok(!planEvents[0]!.detailsJson.includes(mem.content), 'Raw memory content must never be logged in audit');
   } finally {
     harness.sharedDb.close();
     if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });

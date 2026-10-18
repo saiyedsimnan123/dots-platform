@@ -131,30 +131,35 @@ test('PromptCompiler - existing callers without context continue to work normall
   assert.equal(contextOmitted, false);
 });
 
-test('PromptCompiler - sets contextOmitted to true only when non-empty context is omitted due to limit', () => {
+test('PromptCompiler - sets contextOmitted to true and contextIncluded to false only when non-empty context is omitted due to limit', () => {
   const compiler = new PromptCompiler({ maxContextChars: 50 });
   const result = compiler.compilePlanPrompt('My Task Goal', sampleTools, 'Very long context that exceeds the configured limit');
   assert.equal(result.contextOmitted, true);
+  assert.equal(result.contextIncluded, false);
   assert.equal(result.userPrompt, 'TASK GOAL:\nMy Task Goal');
 });
 
-test('PromptCompiler - sets contextOmitted to false when optional context fits within limit', () => {
+test('PromptCompiler - sets contextOmitted to false and contextIncluded to true when optional context fits within limit', () => {
   const compiler = new PromptCompiler({ maxContextChars: 1000 });
   const result = compiler.compilePlanPrompt('My Task Goal', sampleTools, 'Short context');
   assert.equal(result.contextOmitted, false);
+  assert.equal(result.contextIncluded, true);
   assert.ok(result.userPrompt.includes('Short context'));
 });
 
-test('PromptCompiler - sets contextOmitted to false when no context is supplied or context is empty whitespace', () => {
+test('PromptCompiler - sets contextOmitted to false and contextIncluded to false when no context is supplied or context is empty whitespace', () => {
   const compiler = new PromptCompiler();
   const noContext = compiler.compilePlanPrompt('My Task Goal', sampleTools);
   assert.equal(noContext.contextOmitted, false);
+  assert.equal(noContext.contextIncluded, false);
 
   const emptyContext = compiler.compilePlanPrompt('My Task Goal', sampleTools, '');
   assert.equal(emptyContext.contextOmitted, false);
+  assert.equal(emptyContext.contextIncluded, false);
 
   const whitespaceContext = compiler.compilePlanPrompt('My Task Goal', sampleTools, '   \t\n  ');
   assert.equal(whitespaceContext.contextOmitted, false);
+  assert.equal(whitespaceContext.contextIncluded, false);
 });
 
 test('PromptCompiler - throws ValidationError on empty task goal', () => {

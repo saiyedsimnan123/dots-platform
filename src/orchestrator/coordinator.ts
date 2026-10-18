@@ -10,7 +10,15 @@
  * dynamic replanning on step failure, and automated rollback compensation.
  */
 
-import type { Task, TaskStep, ToolExecution, CallerContext, ScopeIdentifier } from '../domain/types.ts';
+import type {
+  Task,
+  TaskStep,
+  ToolExecution,
+  CallerContext,
+  ScopeIdentifier,
+  BuiltMemoryContext,
+  RecordMemoryInjectionInput
+} from '../domain/types.ts';
 import type { TaskRepository } from '../storage/task-repository.ts';
 import type { AuditRepository } from '../storage/audit-repository.ts';
 import type { IModelProvider, CompiledPlanPrompt } from '../model/types.ts';
@@ -484,11 +492,13 @@ export class TaskCoordinator {
       const availableTools = this.toolRegistry.listDefinitions();
 
       let compiled: CompiledPlanPrompt;
+      let memoryContext: BuiltMemoryContext | undefined;
+      let agentCaller: CallerContext | undefined;
 
       if (this.memoryService && this.authorizer) {
         const taskScope = this.verifyTaskScope(task);
         if (taskScope !== null) {
-          const agentCaller = this.authorizer.authorizeAgent({ taskId: task.id });
+          agentCaller = this.authorizer.authorizeAgent({ taskId: task.id });
           const permissions = agentCaller.permissions instanceof Set
             ? agentCaller.permissions
             : new Set(agentCaller.permissions);
@@ -499,7 +509,7 @@ export class TaskCoordinator {
             );
           }
 
-          const memoryContext = this.memoryService.buildTaskMemoryContext(agentCaller, {
+          memoryContext = this.memoryService.buildTaskMemoryContext(agentCaller, {
             query: task.goal,
             taskId: task.id,
             recordInjections: false,
@@ -551,26 +561,58 @@ export class TaskCoordinator {
         );
       }
 
-      // Persist plan steps
-      for (const step of planResult.steps) {
-        this.taskRepo.createStep({
-          taskId: task.id,
-          stepOrder: step.stepOrder,
-          description: step.description,
-          toolName: step.toolName,
-          toolArguments: step.arguments
-        });
+      // Stage memory-injection provenance if memory context was actually included in compiled prompt
+      const stagedInjections: RecordMemoryInjectionInput[] = [];
+      if (
+        compiled.contextIncluded &&
+        memoryContext &&
+        memoryContext.included.length > 0 &&
+        this.memoryService &&
+        agentCaller
+      ) {
+        for (const inc of memoryContext.included) {
+          stagedInjections.push({
+            taskId: task.id,
+            memoryId: inc.id,
+            charCount: inc.charCount,
+            estimatedTokens: inc.estimatedTokens
+          });
+        }
       }
 
-      this.auditRepo.appendEvent({
-        taskId: task.id,
-        eventType: 'PLAN_GENERATED',
-        actor: 'AGENT',
-        details: {
-          stepCount: planResult.steps.length,
-          steps: planResult.steps,
-          usage: planResult.usage
+      // Persist plan steps, memory-injection provenance, and PLAN_GENERATED audit event atomically
+      this.taskRepo.db.transaction(() => {
+        // 1. Persist plan steps
+        for (const step of planResult.steps) {
+          this.taskRepo.createStep({
+            taskId: task.id,
+            stepOrder: step.stepOrder,
+            description: step.description,
+            toolName: step.toolName,
+            toolArguments: step.arguments
+          });
         }
+
+        // 2. Persist memory-injection provenance records (only for memories actually included)
+        if (stagedInjections.length > 0 && this.memoryService && agentCaller) {
+          this.memoryService.recordTaskInjectionsBatch(agentCaller, stagedInjections);
+        }
+
+        // 3. Persist PLAN_GENERATED audit event
+        this.auditRepo.appendEvent({
+          taskId: task.id,
+          eventType: 'PLAN_GENERATED',
+          actor: 'AGENT',
+          details: {
+            stepCount: planResult.steps.length,
+            steps: planResult.steps,
+            usage: planResult.usage,
+            injectedMemoriesCount: stagedInjections.length,
+            injectedMemoryIds: stagedInjections
+              .map((inj) => inj.memoryId)
+              .filter((id): id is string => id !== null && id !== undefined)
+          }
+        });
       });
 
       steps = this.taskRepo.getStepsByTaskId(task.id);

@@ -349,6 +349,8 @@ export interface IncludedMemoryInfo {
   readonly key: string;
   readonly score: number;
   readonly category: MemoryCategory;
+  readonly charCount: number;
+  readonly estimatedTokens: number;
 }
 
 export interface ExcludedMemoryInfo {

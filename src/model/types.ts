@@ -72,6 +72,7 @@ export interface CompiledPlanPrompt {
   readonly systemInstruction: string;
   readonly userPrompt: string;
   readonly contextOmitted: boolean;
+  readonly contextIncluded: boolean;
 }
 
 /**

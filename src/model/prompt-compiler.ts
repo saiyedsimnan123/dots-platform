@@ -85,10 +85,12 @@ export class PromptCompiler {
 
     let userPrompt = baseUserPrompt;
     let contextOmitted = false;
+    let contextIncluded = false;
     if (scrubbedContext) {
       const fullUserPrompt = `${baseUserPrompt}\n\nADDITIONAL CONTEXT / ARTIFACTS:\n${scrubbedContext}`;
       if (fullUserPrompt.length <= this.maxContextChars) {
         userPrompt = fullUserPrompt;
+        contextIncluded = true;
       } else {
         contextOmitted = true;
       }
@@ -98,7 +100,8 @@ export class PromptCompiler {
     return {
       systemInstruction: this.scrubber.scrub(systemInstruction),
       userPrompt: this.scrubber.scrub(userPrompt),
-      contextOmitted
+      contextOmitted,
+      contextIncluded
     };
   }
 

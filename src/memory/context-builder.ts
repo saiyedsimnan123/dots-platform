@@ -177,11 +177,15 @@ export class MemoryContextBuilder {
 
       if (prospectivePayload.length <= this.maxBudgetChars) {
         currentRecords.push(prospectiveRecord);
+        const charCount = scored.memory.content.length;
+        const estimatedTokens = Math.ceil(charCount / 3.8);
         includedInfo.push({
           id: scored.memory.id,
           key: scored.memory.key,
           score: scored.score,
-          category: scored.memory.category
+          category: scored.memory.category,
+          charCount,
+          estimatedTokens
         });
       } else {
         // Exclude oversized candidate, but CONTINUE loop to test smaller subsequent candidates

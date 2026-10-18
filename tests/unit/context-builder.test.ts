@@ -67,8 +67,9 @@ test('MemoryContextBuilder - enforces hard 4,000-character ceiling and generates
   // Hard ceiling verification
   assert.ok(result.totalChars <= 4_000);
   assert.equal(result.totalChars, result.serializedContext.length);
-  assert.equal(result.included.length, 1);
   assert.equal(result.included[0]!.id, 'mem-1');
+  assert.equal(result.included[0]!.charCount, mem.content.length);
+  assert.equal(result.included[0]!.estimatedTokens, Math.ceil(mem.content.length / 3.8));
   assert.equal(result.excluded.length, 0);
 
   // Token estimate
