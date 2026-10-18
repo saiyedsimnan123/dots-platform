@@ -74,14 +74,20 @@ export class PromptCompiler {
       '  ]\n' +
       '}';
 
-    let userPrompt = `TASK GOAL:\n${scrubbedGoal}`;
-    if (scrubbedContext) {
-      userPrompt += `\n\nADDITIONAL CONTEXT / ARTIFACTS:\n${scrubbedContext}`;
+    const baseUserPrompt = `TASK GOAL:\n${scrubbedGoal}`;
+    if (baseUserPrompt.length > this.maxContextChars) {
+      throw new ValidationError(
+        `Task goal prompt length (${baseUserPrompt.length} chars) exceeds maximum allowed context limit (${this.maxContextChars} chars).`
+      );
     }
 
-    // Enforce bounds
-    if (userPrompt.length > this.maxContextChars) {
-      userPrompt = userPrompt.slice(0, this.maxContextChars) + '\n[...truncated to context limit...]';
+    let userPrompt = baseUserPrompt;
+    if (scrubbedContext) {
+      const fullUserPrompt = `${baseUserPrompt}\n\nADDITIONAL CONTEXT / ARTIFACTS:\n${scrubbedContext}`;
+      if (fullUserPrompt.length <= this.maxContextChars) {
+        userPrompt = fullUserPrompt;
+      }
+      // If optional context would exceed limit, omit the entire context block atomically
     }
 
     return {

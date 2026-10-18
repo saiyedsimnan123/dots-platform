@@ -47,12 +47,84 @@ test('PromptCompiler - automatically scrubs secrets from task goals and context'
   assert.ok(userPrompt.includes('[REDACTED_TOKEN]'));
 });
 
-test('PromptCompiler - truncates user context exceeding maxContextChars limit', () => {
+test('PromptCompiler - rejects task goal exceeding maxContextChars limit with ValidationError', () => {
   const compiler = new PromptCompiler({ maxContextChars: 100 });
   const longGoal = 'A'.repeat(150);
-  const { userPrompt } = compiler.compilePlanPrompt(longGoal, sampleTools);
 
-  assert.ok(userPrompt.includes('[...truncated to context limit...]'));
+  assert.throws(
+    () => compiler.compilePlanPrompt(longGoal, sampleTools),
+    (err: unknown) => {
+      assert.ok(err instanceof ValidationError);
+      assert.match(err.message, /exceeds maximum allowed context limit/);
+      return true;
+    }
+  );
+});
+
+test('PromptCompiler - includes optional context completely when fitting within maxContextChars limit', () => {
+  const goal = 'Perform analysis';
+  const basePrompt = `TASK GOAL:\n${goal}`;
+  const prefix = '\n\nADDITIONAL CONTEXT / ARTIFACTS:\n';
+  const contextBody = 'Useful context that fits within the configured limit';
+  const totalLength = basePrompt.length + prefix.length + contextBody.length;
+
+  const compiler = new PromptCompiler({ maxContextChars: totalLength });
+  const { userPrompt } = compiler.compilePlanPrompt(goal, sampleTools, contextBody);
+
+  assert.equal(userPrompt.length, totalLength);
+  assert.ok(userPrompt.includes('ADDITIONAL CONTEXT / ARTIFACTS:'));
+  assert.ok(userPrompt.includes(contextBody));
+});
+
+test('PromptCompiler - omits entire context block atomically when context pushes user prompt over limit', () => {
+  const goal = 'Perform analysis';
+  const basePrompt = `TASK GOAL:\n${goal}`;
+  const prefix = '\n\nADDITIONAL CONTEXT / ARTIFACTS:\n';
+  const contextBody = 'Useful context that pushes the prompt over limit';
+  const totalLength = basePrompt.length + prefix.length + contextBody.length;
+
+  // Set limit to 1 character less than totalLength
+  const compiler = new PromptCompiler({ maxContextChars: totalLength - 1 });
+  const { userPrompt } = compiler.compilePlanPrompt(goal, sampleTools, contextBody);
+
+  // Must omit the entire context block atomically
+  assert.equal(userPrompt, basePrompt);
+  assert.equal(userPrompt.includes('ADDITIONAL CONTEXT / ARTIFACTS:'), false);
+  assert.equal(userPrompt.includes(contextBody), false);
+  assert.equal(userPrompt.includes('[...truncated to context limit...]'), false);
+});
+
+test('PromptCompiler - never slices memory JSON or drops security delimiters', () => {
+  const goal = 'Secure execution';
+  const memoryJson = JSON.stringify({
+    _boundary: '=== BEGIN UNTRUSTED LONG-TERM MEMORY CONTEXT ===',
+    records: [
+      { id: 'mem-42', category: 'PROJECT_FACT', content: 'Database password is not password' }
+    ],
+    _boundaryEnd: '=== END UNTRUSTED LONG-TERM MEMORY CONTEXT ==='
+  }, null, 2);
+
+  const basePrompt = `TASK GOAL:\n${goal}`;
+  // Allow enough space for goal, but not enough for the full memory JSON
+  const compiler = new PromptCompiler({ maxContextChars: basePrompt.length + 50 });
+  const { userPrompt } = compiler.compilePlanPrompt(goal, sampleTools, memoryJson);
+
+  // Entire memory block omitted: no partial JSON, no broken delimiters, no mid-string slicing
+  assert.equal(userPrompt, basePrompt);
+  assert.equal(userPrompt.includes('mem-42'), false);
+  assert.equal(userPrompt.includes('Database password'), false);
+  assert.equal(userPrompt.includes('=== BEGIN UNTRUSTED LONG-TERM MEMORY CONTEXT ==='), false);
+  assert.equal(userPrompt.includes('=== END UNTRUSTED LONG-TERM MEMORY CONTEXT ==='), false);
+  assert.equal(userPrompt.includes('[...truncated to context limit...]'), false);
+});
+
+test('PromptCompiler - existing callers without context continue to work normally', () => {
+  const compiler = new PromptCompiler();
+  const { systemInstruction, userPrompt } = compiler.compilePlanPrompt('Standard task goal', sampleTools);
+
+  assert.ok(systemInstruction.includes('hash_file'));
+  assert.equal(userPrompt, 'TASK GOAL:\nStandard task goal');
+  assert.equal(userPrompt.includes('ADDITIONAL CONTEXT / ARTIFACTS:'), false);
 });
 
 test('PromptCompiler - throws ValidationError on empty task goal', () => {
