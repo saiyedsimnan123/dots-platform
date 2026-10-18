@@ -252,6 +252,66 @@ export class MemoryRepository {
   }
 
   /**
+   * Retrieves archived memories within an explicit scope whose updated_at <= cutoffTimestamp.
+   * Ordered deterministically by updated_at ASC, id ASC.
+   */
+  public getArchivedMemoriesOlderThan(
+    scope: ScopeIdentifier,
+    cutoffTimestamp: string,
+    limit?: number
+  ): Memory[] {
+    if (!scope || typeof scope !== 'object') {
+      throw new ValidationError('Scope must be provided to getArchivedMemoriesOlderThan.');
+    }
+    this.validateScope(scope.scopeType, scope.scopeId);
+    if (typeof cutoffTimestamp !== 'string' || cutoffTimestamp.trim() === '') {
+      throw new ValidationError('Cutoff timestamp must be a non-empty string.');
+    }
+
+    let sql = `
+      SELECT * FROM memories 
+      WHERE scope_type = ? AND scope_id = ? AND status = 'ARCHIVED' AND updated_at <= ?
+      ORDER BY updated_at ASC, id ASC
+    `;
+    const params: SqlParam[] = [scope.scopeType, scope.scopeId, cutoffTimestamp];
+
+    if (limit !== undefined) {
+      if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1) {
+        throw new ValidationError('Limit must be a positive integer.');
+      }
+      sql += ' LIMIT ?';
+      params.push(limit);
+    }
+
+    const stmt = this.db.prepare(sql);
+    const rows = stmt.all(...params) as unknown as MemoryDbRow[];
+    return rows.map((r) => this.mapMemoryRow(r));
+  }
+
+  /**
+   * Counts archived memories within an explicit scope whose updated_at <= cutoffTimestamp.
+   */
+  public countArchivedMemoriesOlderThan(
+    scope: ScopeIdentifier,
+    cutoffTimestamp: string
+  ): number {
+    if (!scope || typeof scope !== 'object') {
+      throw new ValidationError('Scope must be provided to countArchivedMemoriesOlderThan.');
+    }
+    this.validateScope(scope.scopeType, scope.scopeId);
+    if (typeof cutoffTimestamp !== 'string' || cutoffTimestamp.trim() === '') {
+      throw new ValidationError('Cutoff timestamp must be a non-empty string.');
+    }
+
+    const stmt = this.db.prepare(`
+      SELECT COUNT(*) as count FROM memories 
+      WHERE scope_type = ? AND scope_id = ? AND status = 'ARCHIVED' AND updated_at <= ?
+    `);
+    const row = stmt.get(scope.scopeType, scope.scopeId, cutoffTimestamp) as unknown as { count: number };
+    return row.count;
+  }
+
+  /**
    * Updates an existing memory record, verifying scope containment.
    */
   public updateMemory(id: string, scope: ScopeIdentifier, input: UpdateMemoryInput): Memory {

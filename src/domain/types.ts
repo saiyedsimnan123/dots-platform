@@ -82,7 +82,8 @@ export type AuditEventType =
   | 'MEMORY_PROPOSAL_SUBMITTED'
   | 'MEMORY_PROPOSAL_DECIDED'
   | 'MEMORY_EXPORTED'
-  | 'MEMORIES_IMPORTED';
+  | 'MEMORIES_IMPORTED'
+  | 'MEMORIES_PURGED';
 
 /**
  * Primary Task Entity.
@@ -480,5 +481,53 @@ export interface MemoryImportResult {
   readonly importedCount: number;
   readonly skippedCount: number;
   readonly overwrittenCount: number;
+}
+
+/**
+ * Phase 7.5 Substep 3 - Safe Archived Memory Purge Types
+ */
+
+export type MemoryPurgeMode = 'CUTOFF' | 'ID_LIST';
+
+export interface PurgeArchivedMemoriesOptions {
+  /**
+   * Explicit list of memory IDs to purge.
+   * Mutually exclusive with `olderThan`. Every ID must belong to caller scope and have status ARCHIVED.
+   */
+  readonly memoryIds?: readonly string[];
+
+  /**
+   * ISO 8601 UTC timestamp cutoff. Purges archived memories whose updatedAt <= olderThan.
+   * Mutually exclusive with `memoryIds`.
+   */
+  readonly olderThan?: string;
+
+  /**
+   * If true, previews and reports eligible count without deleting records or emitting mutation audit events.
+   * Default: false.
+   */
+  readonly dryRun?: boolean;
+
+  /**
+   * Maximum number of archived records to purge in a single batch.
+   * Must be a positive integer if specified.
+   */
+  readonly maxBatchSize?: number;
+
+  /**
+   * Optional scope safety check. If provided, must match caller.scope exactly.
+   */
+  readonly scopeType?: MemoryScopeType;
+  readonly scopeId?: string;
+}
+
+export interface MemoryPurgeResult {
+  readonly targetScope: ScopeIdentifier;
+  readonly purgeMode: MemoryPurgeMode;
+  readonly eligibleCount: number;
+  readonly purgedCount: number;
+  readonly isDryRun: boolean;
+  readonly cutoffTimestamp?: string;
+  readonly batchSizeLimit?: number;
 }
 

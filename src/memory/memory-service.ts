@@ -56,7 +56,10 @@ import type {
   MemoryUsageHistory,
   ImportConflictStrategy,
   ImportMemoriesOptions,
-  MemoryImportResult
+  MemoryImportResult,
+  MemoryPurgeMode,
+  PurgeArchivedMemoriesOptions,
+  MemoryPurgeResult
 } from '../domain/types.ts';
 import {
   ValidationError,
@@ -103,6 +106,10 @@ export interface MemoryServiceOptions {
   readonly contextBuilder?: MemoryContextBuilder;
   /** Internal hook for testing transactional failure after audit append */
   readonly _testPostAuditHook?: () => void;
+  /** Internal hook for testing transactional failure mid-purge */
+  readonly _testMidPurgeHook?: (deletedCount: number) => void;
+  /** Internal hook for testing transactional failure after purge audit append */
+  readonly _testPostPurgeAuditHook?: () => void;
 }
 
 export class MemoryService {
@@ -114,6 +121,8 @@ export class MemoryService {
   private readonly relevanceMatcher: RelevanceMatcher;
   private readonly contextBuilder: MemoryContextBuilder;
   private readonly _testPostAuditHook?: () => void;
+  private readonly _testMidPurgeHook?: (deletedCount: number) => void;
+  private readonly _testPostPurgeAuditHook?: () => void;
   private systemTaskId?: string;
 
   constructor(options: MemoryServiceOptions) {
@@ -153,6 +162,8 @@ export class MemoryService {
     this.#authorizer = options.authorizer ?? options.hostAuthority?.authorizer ?? new MemoryAuthorizer({ taskRepo: options.taskRepo });
     this.#hostAuthority = options.hostAuthority;
     this._testPostAuditHook = options._testPostAuditHook;
+    this._testMidPurgeHook = options._testMidPurgeHook;
+    this._testPostPurgeAuditHook = options._testPostPurgeAuditHook;
     this.relevanceMatcher = options.relevanceMatcher ?? new RelevanceMatcher();
     this.contextBuilder = options.contextBuilder ?? new MemoryContextBuilder({ matcher: this.relevanceMatcher });
   }
@@ -1317,6 +1328,284 @@ export class MemoryService {
         overwrittenCount
       };
     });
+  }
+
+  /**
+   * Permanently purges archived memories within the caller's verified scope
+   * with deliberate selection, atomic rollback, and privacy-safe audit logging.
+   * 
+   * Security & Architectural Guarantees:
+   * 1. Authorization: Requires verified caller with explicit DELETE permission.
+   * 2. Agent Restriction: Agents are strictly forbidden from performing permanent deletion.
+   * 3. Scope Isolation: Scope is derived strictly from verified caller (caller.scope).
+   *    Never accepts an arbitrary or untrusted destination scope.
+   * 4. Deliberate Selection: Requires explicit memoryIds list OR cutoff timestamp (olderThan).
+   *    Purging all archived memories silently by default is strictly rejected.
+   * 5. Status Strictness: Only records whose status is exactly 'ARCHIVED' can be purged.
+   *    ACTIVE and PENDING_APPROVAL records can NEVER be purged.
+   * 6. All-or-Nothing Atomicity: All eligibility checks, deletions, and the MEMORIES_PURGED
+   *    audit event occur in a single atomic database transaction. Any failure rolls back completely.
+   * 7. Provenance Preservation: Foreign keys in memory_task_injections automatically set
+   *    memory_id = NULL on deletion, preserving token and task execution audit history.
+   * 8. Privacy Guarantee: Audit events and summary results contain only operational counters
+   *    and non-sensitive cutoff metadata. Raw memory content and keys are never logged or returned.
+   * 
+   * Deletion Guarantee Limitations:
+   * Logical deletion removes records from SQLite B-trees and zeroes cells if secure_delete pragma is active.
+   * Does NOT claim or guarantee forensic byte erasure from unallocated disk space, WAL frames prior to checkpoint,
+   * or external operating system backups.
+   */
+  public purgeArchivedMemories(
+    caller: CallerContext,
+    options: PurgeArchivedMemoriesOptions
+  ): MemoryPurgeResult {
+    // 1. Authorization
+    this.validateCaller(caller);
+
+    if (caller.actor === 'AGENT') {
+      this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+        reason: 'AGENT_PURGE_DENIED',
+        operation: 'purgeArchivedMemories'
+      }, false);
+      throw new SecurityViolationError(
+        'Agents cannot directly purge memories; archived memories must be purged by an authorized user.',
+        'AGENT_PURGE_RESTRICTED'
+      );
+    }
+
+    this.validateCaller(caller, 'DELETE');
+
+    // 2. Options validation
+    if (!options || typeof options !== 'object' || Array.isArray(options)) {
+      throw new ValidationError('PurgeArchivedMemoriesOptions must be an object.');
+    }
+
+    // Reject scope spoofing in options if provided
+    this.assertCallerScopeMatch(caller, options.scopeType, options.scopeId, 'purgeArchivedMemories');
+
+    const hasIds = options.memoryIds !== undefined;
+    const hasCutoff = options.olderThan !== undefined;
+
+    if (hasIds && hasCutoff) {
+      throw new ValidationError(
+        'Ambiguous purge options: cannot specify both memoryIds and olderThan. Choose either explicit ID list or cutoff timestamp.'
+      );
+    }
+
+    if (!hasIds && !hasCutoff) {
+      throw new ValidationError(
+        'Deliberate purge required: must specify either memoryIds or olderThan. Purging all archived memories by default is not permitted.'
+      );
+    }
+
+    if (options.dryRun !== undefined && typeof options.dryRun !== 'boolean') {
+      throw new ValidationError('dryRun must be a boolean if provided.');
+    }
+    const isDryRun = Boolean(options.dryRun);
+
+    if (options.maxBatchSize !== undefined) {
+      if (
+        typeof options.maxBatchSize !== 'number' ||
+        !Number.isInteger(options.maxBatchSize) ||
+        options.maxBatchSize < 1
+      ) {
+        throw new ValidationError(
+          `maxBatchSize must be a positive integer, received '${String(options.maxBatchSize)}'.`
+        );
+      }
+    }
+
+    const purgeMode: MemoryPurgeMode = hasIds ? 'ID_LIST' : 'CUTOFF';
+
+    if (purgeMode === 'ID_LIST') {
+      const memoryIds = options.memoryIds!;
+      if (!Array.isArray(memoryIds)) {
+        throw new ValidationError('memoryIds must be an array of memory ID strings.');
+      }
+
+      // Validate each item
+      for (let i = 0; i < memoryIds.length; i++) {
+        const id = memoryIds[i];
+        if (typeof id !== 'string' || id.trim() === '') {
+          throw new ValidationError(`Memory ID at index ${i} must be a non-empty string.`);
+        }
+      }
+
+      const uniqueIds = Array.from(new Set(memoryIds));
+
+      if (uniqueIds.length === 0) {
+        // Empty selection behaves safely
+        return {
+          targetScope: { scopeType: caller.scope.scopeType, scopeId: caller.scope.scopeId },
+          purgeMode: 'ID_LIST',
+          eligibleCount: 0,
+          purgedCount: 0,
+          isDryRun,
+          ...(options.maxBatchSize !== undefined ? { batchSizeLimit: options.maxBatchSize } : {})
+        };
+      }
+
+      if (options.maxBatchSize !== undefined && uniqueIds.length > options.maxBatchSize) {
+        throw new ValidationError(
+          `Requested memory ID count (${uniqueIds.length}) exceeds maximum batch size limit of ${options.maxBatchSize}.`
+        );
+      }
+
+      // Pre-flight validation of every requested ID before opening mutation transaction
+      const memoriesToDelete: Memory[] = [];
+      for (const id of uniqueIds) {
+        let memory: Memory | null;
+        try {
+          memory = this.memoryRepo.getMemoryById(id, caller.scope);
+        } catch (err) {
+          if (err instanceof MemoryScopeViolationError) {
+            this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+              reason: 'CROSS_SCOPE_PURGE_ATTEMPT',
+              memoryId: id,
+              expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+            }, false);
+          }
+          throw err;
+        }
+
+        if (!memory) {
+          throw new MemoryNotFoundError(id);
+        }
+
+        if (memory.status !== 'ARCHIVED') {
+          this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+            reason: 'NON_ARCHIVED_PURGE_DENIED',
+            operation: 'purgeArchivedMemories',
+            memoryId: id,
+            status: memory.status
+          }, false);
+          throw new ValidationError(
+            `Cannot purge memory '${id}': status is '${memory.status}'. Only records with status 'ARCHIVED' can be purged.`,
+            { memoryId: id, status: memory.status }
+          );
+        }
+
+        memoriesToDelete.push(memory);
+      }
+
+      if (isDryRun) {
+        return {
+          targetScope: { scopeType: caller.scope.scopeType, scopeId: caller.scope.scopeId },
+          purgeMode: 'ID_LIST',
+          eligibleCount: memoriesToDelete.length,
+          purgedCount: 0,
+          isDryRun: true,
+          ...(options.maxBatchSize !== undefined ? { batchSizeLimit: options.maxBatchSize } : {})
+        };
+      }
+
+      // Atomic mutation transaction
+      return this.memoryRepo.transaction(() => {
+        let deletedCount = 0;
+        for (const memory of memoriesToDelete) {
+          this.memoryRepo.deleteMemory(memory.id, caller.scope);
+          deletedCount++;
+          if (this._testMidPurgeHook) {
+            this._testMidPurgeHook(deletedCount);
+          }
+        }
+
+        const auditDetails: Record<string, unknown> = {
+          scopeType: caller.scope.scopeType,
+          scopeId: caller.scope.scopeId,
+          purgeMode: 'ID_LIST',
+          purgedCount: deletedCount
+        };
+        if (options.maxBatchSize !== undefined) {
+          auditDetails.batchSizeLimit = options.maxBatchSize;
+        }
+
+        this.audit(caller, 'MEMORIES_PURGED', auditDetails, true);
+
+        if (this._testPostPurgeAuditHook) {
+          this._testPostPurgeAuditHook();
+        }
+
+        return {
+          targetScope: { scopeType: caller.scope.scopeType, scopeId: caller.scope.scopeId },
+          purgeMode: 'ID_LIST',
+          eligibleCount: memoriesToDelete.length,
+          purgedCount: deletedCount,
+          isDryRun: false,
+          ...(options.maxBatchSize !== undefined ? { batchSizeLimit: options.maxBatchSize } : {})
+        };
+      });
+    } else {
+      // CUTOFF mode
+      const rawOlderThan = options.olderThan!;
+      if (typeof rawOlderThan !== 'string' || rawOlderThan.trim() === '') {
+        throw new ValidationError('olderThan must be a non-empty ISO 8601 timestamp string.');
+      }
+      const parsedTime = Date.parse(rawOlderThan);
+      if (isNaN(parsedTime)) {
+        throw new ValidationError(`Invalid timestamp for olderThan: '${rawOlderThan}'. Must be a valid ISO 8601 string.`);
+      }
+      const cutoffIso = new Date(rawOlderThan).toISOString();
+
+      if (isDryRun) {
+        const eligibleCount = this.memoryRepo.countArchivedMemoriesOlderThan(caller.scope, cutoffIso);
+        return {
+          targetScope: { scopeType: caller.scope.scopeType, scopeId: caller.scope.scopeId },
+          purgeMode: 'CUTOFF',
+          eligibleCount,
+          purgedCount: 0,
+          isDryRun: true,
+          cutoffTimestamp: cutoffIso,
+          ...(options.maxBatchSize !== undefined ? { batchSizeLimit: options.maxBatchSize } : {})
+        };
+      }
+
+      // Atomic mutation transaction
+      return this.memoryRepo.transaction(() => {
+        const eligibleCount = this.memoryRepo.countArchivedMemoriesOlderThan(caller.scope, cutoffIso);
+        const memoriesToDelete = this.memoryRepo.getArchivedMemoriesOlderThan(
+          caller.scope,
+          cutoffIso,
+          options.maxBatchSize
+        );
+
+        let deletedCount = 0;
+        for (const memory of memoriesToDelete) {
+          this.memoryRepo.deleteMemory(memory.id, caller.scope);
+          deletedCount++;
+          if (this._testMidPurgeHook) {
+            this._testMidPurgeHook(deletedCount);
+          }
+        }
+
+        const auditDetails: Record<string, unknown> = {
+          scopeType: caller.scope.scopeType,
+          scopeId: caller.scope.scopeId,
+          purgeMode: 'CUTOFF',
+          purgedCount: deletedCount,
+          cutoffTimestamp: cutoffIso
+        };
+        if (options.maxBatchSize !== undefined) {
+          auditDetails.batchSizeLimit = options.maxBatchSize;
+        }
+
+        this.audit(caller, 'MEMORIES_PURGED', auditDetails, true);
+
+        if (this._testPostPurgeAuditHook) {
+          this._testPostPurgeAuditHook();
+        }
+
+        return {
+          targetScope: { scopeType: caller.scope.scopeType, scopeId: caller.scope.scopeId },
+          purgeMode: 'CUTOFF',
+          eligibleCount,
+          purgedCount: deletedCount,
+          isDryRun: false,
+          cutoffTimestamp: cutoffIso,
+          ...(options.maxBatchSize !== undefined ? { batchSizeLimit: options.maxBatchSize } : {})
+        };
+      });
+    }
   }
 
   // --- Private Helpers ---
