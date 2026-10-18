@@ -886,3 +886,189 @@ test('TaskCoordinator - recursively sanitizes arrays and nested object/array com
     if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
   }
 });
+
+test('TaskCoordinator - normalizes and strips common credential key variants while preserving legitimate fields in persisted metadata and audit events', async () => {
+  const idProvider = new MockIdentityProvider();
+  idProvider.register('token-admin', {
+    principalId: 'admin-1',
+    role: 'ADMIN',
+    permittedScopes: [{ scopeType: 'WORKSPACE', scopeId: 'core-infra' }]
+  });
+
+  const harness = createMemoryCoordHarness({ idProvider });
+
+  try {
+    const coordinator = harness.createCoordinator();
+
+    const variedMetadata = {
+      // Sensitive variants at top level
+      api_key: 'sensitive-api-key-val-1',
+      accessToken: 'sensitive-access-token-val-2',
+      refresh_token: 'sensitive-refresh-token-val-3',
+      client_secret: 'sensitive-client-secret-val-4',
+      privateKey: 'sensitive-private-key-val-5',
+      clientSecret: 'sensitive-client-secret-val-6',
+      _proof: { signature: 'sig-proof-val-7' },
+      scope_proof: 'sensitive-scope-proof-val-8',
+      db_password: 'sensitive-db-password-val-9',
+      user_credentials: { token: 'cred-val-10' },
+
+      // Legitimate non-sensitive fields at top level
+      key: 'project_configuration_key',
+      tokenCount: 450,
+      tokenBudget: 1000,
+      author: 'alice_engineer',
+      authorId: 'usr-9876',
+      authority: 'internal-corp',
+      publicKey: 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC...',
+      waterproof: true,
+      description: 'System maintenance job',
+
+      // Nested inside arrays and objects
+      pipelineStages: [
+        {
+          stageName: 'build',
+          api_key: 'stage-api-key-val-11',
+          private_key: 'stage-priv-key-val-12',
+          itemKey: 'build-step-1',
+          artifactsPreserved: 5
+        },
+        {
+          stageName: 'deploy',
+          accessToken: 'deploy-access-token-val-13',
+          authToken: 'deploy-auth-token-val-14',
+          targetEnvironment: 'staging',
+          nestedMatrix: [
+            [
+              {
+                refresh_token: 'deep-refresh-token-val-15',
+                client_secret: 'deep-client-secret-val-16',
+                deepProof: 'deep-proof-val-17',
+                metricScore: 99.5,
+                verifiedFlag: true
+              }
+            ]
+          ]
+        }
+      ]
+    };
+
+    // 1. Submit legacy task and check persisted database state
+    const task = await coordinator.submitTask('Legacy task with varied credential keys', variedMetadata);
+    const persistedMeta = JSON.parse(task.metadataJson!);
+
+    // Verify sensitive variants are absent from persisted task metadata
+    assert.equal(persistedMeta.api_key, undefined);
+    assert.equal(persistedMeta.accessToken, undefined);
+    assert.equal(persistedMeta.refresh_token, undefined);
+    assert.equal(persistedMeta.client_secret, undefined);
+    assert.equal(persistedMeta.privateKey, undefined);
+    assert.equal(persistedMeta.clientSecret, undefined);
+    assert.equal(persistedMeta._proof, undefined);
+    assert.equal(persistedMeta.scope_proof, undefined);
+    assert.equal(persistedMeta.db_password, undefined);
+    assert.equal(persistedMeta.user_credentials, undefined);
+
+    // Verify nested array/object sensitive keys are absent
+    assert.equal(persistedMeta.pipelineStages[0].api_key, undefined);
+    assert.equal(persistedMeta.pipelineStages[0].private_key, undefined);
+    assert.equal(persistedMeta.pipelineStages[1].accessToken, undefined);
+    assert.equal(persistedMeta.pipelineStages[1].authToken, undefined);
+    assert.equal(persistedMeta.pipelineStages[1].nestedMatrix[0][0].refresh_token, undefined);
+    assert.equal(persistedMeta.pipelineStages[1].nestedMatrix[0][0].client_secret, undefined);
+    assert.equal(persistedMeta.pipelineStages[1].nestedMatrix[0][0].deepProof, undefined);
+
+    // Verify no secret values leaked anywhere in the JSON
+    const rawMetaJson = task.metadataJson!;
+    assert.ok(!rawMetaJson.includes('sensitive-api-key-val-1'));
+    assert.ok(!rawMetaJson.includes('sensitive-access-token-val-2'));
+    assert.ok(!rawMetaJson.includes('sensitive-refresh-token-val-3'));
+    assert.ok(!rawMetaJson.includes('sensitive-client-secret-val-4'));
+    assert.ok(!rawMetaJson.includes('sensitive-private-key-val-5'));
+    assert.ok(!rawMetaJson.includes('sensitive-client-secret-val-6'));
+    assert.ok(!rawMetaJson.includes('sig-proof-val-7'));
+    assert.ok(!rawMetaJson.includes('sensitive-scope-proof-val-8'));
+    assert.ok(!rawMetaJson.includes('sensitive-db-password-val-9'));
+    assert.ok(!rawMetaJson.includes('stage-api-key-val-11'));
+    assert.ok(!rawMetaJson.includes('stage-priv-key-val-12'));
+    assert.ok(!rawMetaJson.includes('deploy-access-token-val-13'));
+    assert.ok(!rawMetaJson.includes('deploy-auth-token-val-14'));
+    assert.ok(!rawMetaJson.includes('deep-refresh-token-val-15'));
+    assert.ok(!rawMetaJson.includes('deep-client-secret-val-16'));
+    assert.ok(!rawMetaJson.includes('deep-proof-val-17'));
+
+    // Verify legitimate fields are fully preserved
+    assert.equal(persistedMeta.key, 'project_configuration_key');
+    assert.equal(persistedMeta.tokenCount, 450);
+    assert.equal(persistedMeta.tokenBudget, 1000);
+    assert.equal(persistedMeta.author, 'alice_engineer');
+    assert.equal(persistedMeta.authorId, 'usr-9876');
+    assert.equal(persistedMeta.authority, 'internal-corp');
+    assert.equal(persistedMeta.publicKey, 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC...');
+    assert.equal(persistedMeta.waterproof, true);
+    assert.equal(persistedMeta.description, 'System maintenance job');
+    assert.equal(persistedMeta.pipelineStages[0].stageName, 'build');
+    assert.equal(persistedMeta.pipelineStages[0].itemKey, 'build-step-1');
+    assert.equal(persistedMeta.pipelineStages[0].artifactsPreserved, 5);
+    assert.equal(persistedMeta.pipelineStages[1].stageName, 'deploy');
+    assert.equal(persistedMeta.pipelineStages[1].targetEnvironment, 'staging');
+    assert.equal(persistedMeta.pipelineStages[1].nestedMatrix[0][0].metricScore, 99.5);
+    assert.equal(persistedMeta.pipelineStages[1].nestedMatrix[0][0].verifiedFlag, true);
+
+    // Verify audit event in audit_events table matches exact preservation and stripping
+    const auditEvents = harness.auditRepo.getEventsByTaskId(task.id);
+    assert.equal(auditEvents.length, 1);
+    const auditDetails = JSON.parse(auditEvents[0]!.detailsJson);
+    const auditMeta = auditDetails.metadata;
+
+    assert.equal(auditMeta.api_key, undefined);
+    assert.equal(auditMeta.accessToken, undefined);
+    assert.equal(auditMeta.client_secret, undefined);
+    assert.equal(auditMeta.privateKey, undefined);
+    assert.equal(auditMeta.key, 'project_configuration_key');
+    assert.equal(auditMeta.tokenCount, 450);
+    assert.equal(auditMeta.pipelineStages[1].nestedMatrix[0][0].metricScore, 99.5);
+
+    const rawAuditJson = auditEvents[0]!.detailsJson;
+    assert.ok(!rawAuditJson.includes('sensitive-api-key-val-1'));
+    assert.ok(!rawAuditJson.includes('deep-refresh-token-val-15'));
+    assert.ok(!rawAuditJson.includes('sensitive-db-password-val-9'));
+    assert.ok(rawAuditJson.includes('project_configuration_key'));
+    assert.ok(rawAuditJson.includes('alice_engineer'));
+
+    // 2. Submit scoped task and verify identical security in scoped task metadata and audit
+    const adminUser = harness.authorizer.authorizeUser({
+      credentials: 'token-admin',
+      requestedScope: { scopeType: 'WORKSPACE', scopeId: 'core-infra' }
+    });
+
+    const scopedTask = await coordinator.submitScopedTask({
+      goal: 'Scoped task testing key variant sanitization',
+      caller: adminUser,
+      metadata: variedMetadata
+    });
+
+    const scopedPersistedMeta = JSON.parse(scopedTask.metadataJson!);
+    assert.equal(scopedPersistedMeta.api_key, undefined);
+    assert.equal(scopedPersistedMeta.accessToken, undefined);
+    assert.equal(scopedPersistedMeta.client_secret, undefined);
+    assert.equal(scopedPersistedMeta.privateKey, undefined);
+    assert.equal(scopedPersistedMeta.key, 'project_configuration_key');
+    assert.equal(scopedPersistedMeta.tokenCount, 450);
+    assert.equal(scopedPersistedMeta.pipelineStages[1].nestedMatrix[0][0].metricScore, 99.5);
+
+    const scopedRawJson = scopedTask.metadataJson!;
+    assert.ok(!scopedRawJson.includes('sensitive-api-key-val-1'));
+    assert.ok(!scopedRawJson.includes('deep-refresh-token-val-15'));
+    assert.ok(scopedRawJson.includes('project_configuration_key'));
+
+    const scopedAuditEvents = harness.auditRepo.getEventsByTaskId(scopedTask.id);
+    const scopedAuditJson = scopedAuditEvents[0]!.detailsJson;
+    assert.ok(!scopedAuditJson.includes('sensitive-api-key-val-1'));
+    assert.ok(!scopedAuditJson.includes('deep-refresh-token-val-15'));
+    assert.ok(scopedAuditJson.includes('project_configuration_key'));
+  } finally {
+    harness.sharedDb.close();
+    if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
+  }
+});

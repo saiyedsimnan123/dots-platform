@@ -30,7 +30,55 @@ import { MemoryAuthorizer, validateScope } from '../security/memory-authorizer.t
 import { PromptCompiler } from '../model/prompt-compiler.ts';
 import { defaultSecretScrubber } from '../model/secret-scrubber.ts';
 
-const SENSITIVE_KEY_PATTERN = /^(credentials|token|secret|password|authorization|apiKey|auth|bearer|_proof)$/i;
+const NON_SENSITIVE_PROOF_WORDS = new Set([
+  'waterproof',
+  'bulletproof',
+  'fireproof',
+  'soundproof',
+  'childproof',
+  'foolproof',
+  'shatterproof',
+  'rustproof',
+  'leakproof'
+]);
+
+function isSensitiveKey(key: string): boolean {
+  if (typeof key !== 'string') {
+    return false;
+  }
+  const trimmed = key.trim();
+  if (!trimmed) {
+    return false;
+  }
+  const normalized = trimmed.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!normalized) {
+    return false;
+  }
+
+  if (NON_SENSITIVE_PROOF_WORDS.has(normalized)) {
+    return false;
+  }
+
+  return (
+    normalized.endsWith('password') ||
+    normalized.endsWith('passphrase') ||
+    normalized.endsWith('passwd') ||
+    normalized.endsWith('secret') ||
+    normalized.endsWith('secrets') ||
+    normalized.endsWith('apikey') ||
+    normalized.endsWith('privatekey') ||
+    normalized.endsWith('token') ||
+    normalized.endsWith('tokens') ||
+    normalized === 'bearer' ||
+    normalized === 'bearertoken' ||
+    normalized.endsWith('credential') ||
+    normalized.endsWith('credentials') ||
+    normalized === 'auth' ||
+    normalized === 'authorization' ||
+    normalized === 'authtoken' ||
+    normalized.endsWith('proof')
+  );
+}
 
 function sanitizeValue(val: unknown): unknown {
   if (typeof val === 'string') {
@@ -42,7 +90,7 @@ function sanitizeValue(val: unknown): unknown {
   if (val && typeof val === 'object') {
     const sanitizedObj: Record<string, unknown> = {};
     for (const [key, propVal] of Object.entries(val as Record<string, unknown>)) {
-      if (SENSITIVE_KEY_PATTERN.test(key)) {
+      if (isSensitiveKey(key)) {
         continue; // Never persist authentication credentials
       }
       sanitizedObj[key] = sanitizeValue(propVal);
@@ -58,7 +106,7 @@ function sanitizeMetadata(metadata?: Record<string, unknown>): Record<string, un
   }
   const sanitized: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(metadata)) {
-    if (SENSITIVE_KEY_PATTERN.test(key)) {
+    if (isSensitiveKey(key)) {
       continue; // Never persist authentication credentials
     }
     sanitized[key] = sanitizeValue(val);
