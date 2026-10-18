@@ -4,7 +4,7 @@
  * 
  * Architectural Mandate & Threat Model:
  * This module is strictly internal to the trusted host environment (orchestrator,
- * service bootstrap scripts, host infrastructure). It is NEVER re-exported by the
+ * service bootstrap scripts, host infrastructure). It is NOT exported by the
  * public package entry point (src/index.ts) and must never be exposed to untrusted
  * agent or task execution contexts.
  * 
@@ -12,7 +12,8 @@
  * In a JavaScript runtime (Node.js/V8), code executing in the same heap with unrestricted
  * module resolution cannot be isolated solely by TypeScript visibility modifiers (private/protected)
  * or naming conventions. If untrusted code could execute arbitrary JavaScript within the host heap,
- * it could import internal modules or inspect process memory.
+ * it could import internal modules or inspect process memory. Internal module visibility is NOT a
+ * security boundary against unrestricted JavaScript executing in the same Node.js process.
  * 
  * Consequently:
  * 1. Untrusted agent content, task instructions, and user-supplied prompts MUST NEVER be
@@ -24,6 +25,8 @@
  *    and privileged operations (createTask, authorizeSystem, attestTaskScope). Ordinary application code
  *    and agent-facing services only receive the unprivileged MemoryAuthorizer, preventing accidental
  *    capability escalation.
+ * 4. Constructing a separate HostMemoryAuthority instance does not grant access to an existing
+ *    host authority's private secret, context registry, or task scope attestations.
  */
 
 import { createHmac, randomBytes } from 'node:crypto';
