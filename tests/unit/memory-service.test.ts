@@ -855,6 +855,18 @@ test('MemoryService - Enforces shared DatabaseManager constructor invariant acro
   }
 });
 
+test('MemoryService - exposes shared DatabaseManager instance via db getter', () => {
+  const db = new DatabaseManager(':memory:');
+  try {
+    const memoryRepo = new MemoryRepository(db);
+    const service = new MemoryService({ memoryRepo });
+    assert.strictEqual(service.db, memoryRepo.db);
+    assert.strictEqual(service.db, db);
+  } finally {
+    db.close();
+  }
+});
+
 test('MemoryService - Guarantees two-way atomicity: no orphaned audit event when memory transaction fails after audit append', () => {
   const db = new DatabaseManager(':memory:');
   const taskRepo = new TaskRepository(db);

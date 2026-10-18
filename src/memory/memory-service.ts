@@ -61,6 +61,7 @@ import {
 import { MemoryRepository } from '../storage/memory-repository.ts';
 import type { AuditRepository } from '../storage/audit-repository.ts';
 import type { TaskRepository } from '../storage/task-repository.ts';
+import type { DatabaseManager } from '../storage/db.ts';
 import { RelevanceMatcher } from './relevance-matcher.ts';
 import { MemoryContextBuilder } from './context-builder.ts';
 import { MemoryAuthorizer } from '../security/memory-authorizer.ts';
@@ -125,6 +126,13 @@ export class MemoryService {
     this._testPostAuditHook = options._testPostAuditHook;
     this.relevanceMatcher = options.relevanceMatcher ?? new RelevanceMatcher();
     this.contextBuilder = options.contextBuilder ?? new MemoryContextBuilder({ matcher: this.relevanceMatcher });
+  }
+
+  /**
+   * Returns the underlying DatabaseManager instance shared by this service's repositories.
+   */
+  public get db(): DatabaseManager {
+    return this.memoryRepo.db;
   }
 
   // --- Public Operations ---
