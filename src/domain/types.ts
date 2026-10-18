@@ -480,8 +480,5 @@ export interface MemoryImportResult {
   readonly importedCount: number;
   readonly skippedCount: number;
   readonly overwrittenCount: number;
-  readonly importedKeys: readonly string[];
-  readonly skippedKeys: readonly string[];
-  readonly overwrittenKeys: readonly string[];
 }
 

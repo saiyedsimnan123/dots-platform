@@ -1230,9 +1230,6 @@ export class MemoryService {
       let importedCount = 0;
       let skippedCount = 0;
       let overwrittenCount = 0;
-      const importedKeys: string[] = [];
-      const skippedKeys: string[] = [];
-      const overwrittenKeys: string[] = [];
 
       for (const item of bundle.memories) {
         const status: MemoryStatus = item.status ?? 'ACTIVE';
@@ -1252,7 +1249,6 @@ export class MemoryService {
               );
             } else if (conflictStrategy === 'SKIP') {
               skippedCount++;
-              skippedKeys.push(key);
               continue;
             } else if (conflictStrategy === 'OVERWRITE') {
               // Archive existing active record (preserves the old record with status ARCHIVED)
@@ -1273,7 +1269,6 @@ export class MemoryService {
               });
 
               overwrittenCount++;
-              overwrittenKeys.push(key);
               continue;
             }
           }
@@ -1293,7 +1288,6 @@ export class MemoryService {
         });
 
         importedCount++;
-        importedKeys.push(key);
       }
 
       // Mandatory audit write for state mutation - metadata only, NO raw content or keys
@@ -1320,10 +1314,7 @@ export class MemoryService {
         totalInBundle: bundle.count,
         importedCount,
         skippedCount,
-        overwrittenCount,
-        importedKeys,
-        skippedKeys,
-        overwrittenKeys
+        overwrittenCount
       };
     });
   }

@@ -204,7 +204,6 @@ test('importMemories - derives destination scope strictly from verified caller a
   assert.equal(result.importedCount, 1);
   assert.equal(result.skippedCount, 0);
   assert.equal(result.overwrittenCount, 0);
-  assert.deepEqual(result.importedKeys, ['routed_fact']);
 
   // Memory must exist in ws-alpha
   const inAlpha = env.memoryRepo.getMemoryByKey('routed_fact', env.scopeAlpha, 'ACTIVE');
@@ -488,8 +487,6 @@ test('importMemories - conflict strategy SKIP skips existing active memories and
   assert.equal(result.importedCount, 1);
   assert.equal(result.skippedCount, 1);
   assert.equal(result.overwrittenCount, 0);
-  assert.deepEqual(result.importedKeys, ['non_conflicting_item']);
-  assert.deepEqual(result.skippedKeys, ['existing_conflict']);
 
   // Conflicting memory was untouched
   const untouched = env.memoryRepo.getMemoryByKey('existing_conflict', env.scopeAlpha, 'ACTIVE');
@@ -538,7 +535,6 @@ test('importMemories - conflict strategy OVERWRITE archives existing active reco
   assert.equal(result.importedCount, 0);
   assert.equal(result.overwrittenCount, 1);
   assert.equal(result.skippedCount, 0);
-  assert.deepEqual(result.overwrittenKeys, ['replaceable_key']);
 
   // 1. Verify old record is preserved as ARCHIVED
   const oldRecord = env.memoryRepo.getMemoryById(original.id, env.scopeAlpha);
@@ -669,6 +665,17 @@ test('importMemories - audit privacy guarantee: records MEMORIES_IMPORTED with m
 
   const result = env.memoryService.importMemories(env.adminAlpha, bundle);
   assert.equal(result.importedCount, 1);
+  assert.equal(result.skippedCount, 0);
+  assert.equal(result.overwrittenCount, 0);
+  assert.equal(result.totalInBundle, 1);
+  assert.deepEqual(result.targetScope, env.scopeAlpha);
+
+  // Guarantee: Public result must not contain memory keys or content
+  assert.equal('importedKeys' in (result as unknown as Record<string, unknown>), false);
+  assert.equal('skippedKeys' in (result as unknown as Record<string, unknown>), false);
+  assert.equal('overwrittenKeys' in (result as unknown as Record<string, unknown>), false);
+  assert.equal(JSON.stringify(result).includes(secretKey), false, 'Result must not contain memory key');
+  assert.equal(JSON.stringify(result).includes(secretContent), false, 'Result must not contain memory content');
 
   const auditEvents = env.auditRepo.getEventsByTaskId('__system_memory__');
   const importEvent = auditEvents.find((e) => e.eventType === 'MEMORIES_IMPORTED');
@@ -688,9 +695,81 @@ test('importMemories - audit privacy guarantee: records MEMORIES_IMPORTED with m
   // 1. Audit event must NOT contain memory key
   assert.equal('key' in details, false);
   assert.equal('importedKeys' in details, false);
+  assert.equal('skippedKeys' in details, false);
+  assert.equal('overwrittenKeys' in details, false);
   assert.equal(importEvent.detailsJson.includes(secretKey), false, 'Audit event must not contain memory key');
 
   // 2. Audit event must NOT contain raw memory content or metadata values
   assert.equal(importEvent.detailsJson.includes(secretContent), false, 'Audit event must not contain memory content');
   assert.equal(importEvent.detailsJson.includes('secret_val'), false, 'Audit event must not contain metadata secrets');
 });
+
+test('importMemories - result privacy guarantee: public result does not expose memory keys or content across all conflict modes', () => {
+  const env = setupTestEnvironment();
+
+  // Create an existing active memory
+  env.memoryService.createMemory(env.adminAlpha, {
+    key: 'confidential_existing_key',
+    content: 'confidential_existing_secret_123',
+    category: 'PROJECT_FACT',
+    scopeType: 'WORKSPACE',
+    scopeId: 'ws-alpha'
+  });
+
+  const bundle = createValidBundle([
+    {
+      key: 'confidential_existing_key',
+      content: 'confidential_new_secret_456',
+      category: 'PROJECT_FACT',
+      tags: [],
+      priority: 50,
+      metadata: {},
+      status: 'ACTIVE',
+      createdAt: '2026-10-19T00:00:00.000Z',
+      updatedAt: '2026-10-19T00:00:00.000Z'
+    },
+    {
+      key: 'confidential_brand_new_key',
+      content: 'confidential_brand_new_secret_789',
+      category: 'PROJECT_FACT',
+      tags: [],
+      priority: 50,
+      metadata: {},
+      status: 'ACTIVE',
+      createdAt: '2026-10-19T00:00:01.000Z',
+      updatedAt: '2026-10-19T00:00:01.000Z'
+    }
+  ]);
+
+  // Test SKIP mode
+  const skipResult = env.memoryService.importMemories(env.adminAlpha, bundle, { conflictStrategy: 'SKIP' });
+  const skipJson = JSON.stringify(skipResult);
+  assert.equal('importedKeys' in (skipResult as unknown as Record<string, unknown>), false);
+  assert.equal('skippedKeys' in (skipResult as unknown as Record<string, unknown>), false);
+  assert.equal('overwrittenKeys' in (skipResult as unknown as Record<string, unknown>), false);
+  assert.equal(skipJson.includes('confidential'), false, 'Result must not leak keys or content');
+  assert.equal(skipResult.importedCount, 1);
+  assert.equal(skipResult.skippedCount, 1);
+  assert.equal(skipResult.overwrittenCount, 0);
+
+  // Test OVERWRITE mode on fresh env
+  const env2 = setupTestEnvironment();
+  env2.memoryService.createMemory(env2.adminAlpha, {
+    key: 'confidential_existing_key',
+    content: 'confidential_existing_secret_123',
+    category: 'PROJECT_FACT',
+    scopeType: 'WORKSPACE',
+    scopeId: 'ws-alpha'
+  });
+
+  const overwriteResult = env2.memoryService.importMemories(env2.adminAlpha, bundle, { conflictStrategy: 'OVERWRITE' });
+  const overwriteJson = JSON.stringify(overwriteResult);
+  assert.equal('importedKeys' in (overwriteResult as unknown as Record<string, unknown>), false);
+  assert.equal('skippedKeys' in (overwriteResult as unknown as Record<string, unknown>), false);
+  assert.equal('overwrittenKeys' in (overwriteResult as unknown as Record<string, unknown>), false);
+  assert.equal(overwriteJson.includes('confidential'), false, 'Result must not leak keys or content');
+  assert.equal(overwriteResult.importedCount, 1);
+  assert.equal(overwriteResult.skippedCount, 0);
+  assert.equal(overwriteResult.overwrittenCount, 1);
+});
+
