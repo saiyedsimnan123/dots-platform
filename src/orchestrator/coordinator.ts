@@ -10,7 +10,7 @@
  * dynamic replanning on step failure, and automated rollback compensation.
  */
 
-import type { Task, TaskStep, ToolExecution } from '../domain/types.ts';
+import type { Task, TaskStep, ToolExecution, CallerContext, ScopeIdentifier } from '../domain/types.ts';
 import type { TaskRepository } from '../storage/task-repository.ts';
 import type { AuditRepository } from '../storage/audit-repository.ts';
 import type { IModelProvider } from '../model/types.ts';
@@ -23,7 +23,41 @@ import type { StepOutputContext } from './variable-resolver.ts';
 import { VariableResolver } from './variable-resolver.ts';
 import { CompensationManager } from './compensation.ts';
 import { TaskStateMachine } from '../domain/state-machine.ts';
-import { TaskNotFoundError, CircuitBreakerError } from '../domain/errors.ts';
+import { TaskNotFoundError, CircuitBreakerError, ValidationError, SecurityViolationError } from '../domain/errors.ts';
+import type { MemoryService } from '../memory/memory-service.ts';
+import type { HostMemoryAuthority } from '../security/host-authority.ts';
+import { MemoryAuthorizer, validateScope } from '../security/memory-authorizer.ts';
+import { PromptCompiler } from '../model/prompt-compiler.ts';
+import { defaultSecretScrubber } from '../model/secret-scrubber.ts';
+
+const SENSITIVE_KEY_PATTERN = /^(credentials|token|secret|password|authorization|apiKey|auth|bearer|_proof)$/i;
+
+function sanitizeMetadata(metadata?: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (!metadata || typeof metadata !== 'object') {
+    return undefined;
+  }
+  const sanitized: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(metadata)) {
+    if (SENSITIVE_KEY_PATTERN.test(key)) {
+      continue; // Never persist authentication credentials
+    }
+    if (typeof val === 'string') {
+      sanitized[key] = defaultSecretScrubber.scrub(val);
+    } else if (val && typeof val === 'object' && !Array.isArray(val)) {
+      sanitized[key] = sanitizeMetadata(val as Record<string, unknown>);
+    } else {
+      sanitized[key] = val;
+    }
+  }
+  return sanitized;
+}
+
+export interface SubmitScopedTaskInput {
+  readonly goal: string;
+  readonly caller: CallerContext;
+  readonly requestedScope?: ScopeIdentifier;
+  readonly metadata?: Record<string, unknown>;
+}
 
 export interface CoordinatorOptions {
   readonly taskRepo: TaskRepository;
@@ -35,6 +69,10 @@ export interface CoordinatorOptions {
   readonly verifier: VerificationEngine;
   readonly budgetTracker: TokenBudgetTracker;
   readonly workspaceRoot: string;
+  readonly memoryService?: MemoryService;
+  readonly hostAuthority?: HostMemoryAuthority;
+  readonly authorizer?: MemoryAuthorizer;
+  readonly promptCompiler?: PromptCompiler;
   readonly backoffBaseMs?: number;       // Base delay in ms (0 in test environments)
   readonly backoffMaxMs?: number;        // Max retry backoff delay
   readonly enableDynamicReplan?: boolean; // Whether dynamic replanning is enabled on step failure (default: false)
@@ -62,8 +100,25 @@ export class TaskCoordinator {
   private readonly maxPlanSteps: number;
   private readonly maxTotalRetries: number;
   private readonly enableCompensation: boolean;
+  public readonly memoryService?: MemoryService;
+  private readonly hostAuthority?: HostMemoryAuthority;
+  public readonly authorizer?: MemoryAuthorizer;
+  public readonly promptCompiler: PromptCompiler;
 
   constructor(options: CoordinatorOptions) {
+    if (options.memoryService) {
+      if (options.taskRepo.db !== options.auditRepo.db) {
+        throw new ValidationError(
+          'TaskRepository and AuditRepository must share the exact same DatabaseManager instance when memory integration is enabled.'
+        );
+      }
+      if (options.memoryService.db !== options.taskRepo.db) {
+        throw new ValidationError(
+          'MemoryService, TaskRepository, and AuditRepository must share the exact same DatabaseManager instance.'
+        );
+      }
+    }
+
     this.taskRepo = options.taskRepo;
     this.auditRepo = options.auditRepo;
     this.modelProvider = options.modelProvider;
@@ -81,23 +136,185 @@ export class TaskCoordinator {
     this.maxPlanSteps = options.maxPlanSteps ?? 8;
     this.maxTotalRetries = options.maxTotalRetries ?? 5;
     this.enableCompensation = options.enableCompensation ?? false;
+    this.memoryService = options.memoryService;
+    this.hostAuthority = options.hostAuthority;
+    this.authorizer = options.authorizer ?? options.hostAuthority?.authorizer;
+    this.promptCompiler = options.promptCompiler ?? new PromptCompiler();
   }
 
 
   /**
-   * Ingests a new task, persists it in SUBMITTED state, and writes the audit event.
+   * Ingests a new legacy task, persists it in SUBMITTED state, and writes the audit event.
+   * Legacy tasks submitted through this API are unattested and cannot access long-term memory.
    */
   public async submitTask(goal: string, metadata?: Record<string, unknown>): Promise<Task> {
-    const task = this.taskRepo.createTask({ goal, metadata });
+    if (!goal || typeof goal !== 'string' || goal.trim() === '') {
+      throw new ValidationError('Task goal must not be empty.');
+    }
+
+    const sanitizedMeta = sanitizeMetadata(metadata);
+    const task = this.taskRepo.createTask({ goal: goal.trim(), metadata: sanitizedMeta });
 
     this.auditRepo.appendEvent({
       taskId: task.id,
       eventType: 'TASK_CREATED',
       actor: 'USER',
-      details: { goal, metadata }
+      details: {
+        goal: task.goal,
+        metadata: sanitizedMeta
+      }
     });
 
     return task;
+  }
+
+  /**
+   * Submits a task with authenticated caller context and cryptographically attested scope.
+   * Derives authoritative task scope strictly from verified host authority.
+   */
+  public async submitScopedTask(input: SubmitScopedTaskInput): Promise<Task>;
+  public async submitScopedTask(
+    goal: string,
+    caller: CallerContext,
+    metadata?: Record<string, unknown>
+  ): Promise<Task>;
+  public async submitScopedTask(
+    goalOrInput: string | SubmitScopedTaskInput,
+    callerArg?: CallerContext,
+    metadataArg?: Record<string, unknown>
+  ): Promise<Task> {
+    let goal: string;
+    let caller: CallerContext;
+    let requestedScope: ScopeIdentifier | undefined;
+    let metadata: Record<string, unknown> | undefined;
+
+    if (typeof goalOrInput === 'object' && goalOrInput !== null) {
+      goal = goalOrInput.goal;
+      caller = goalOrInput.caller;
+      requestedScope = goalOrInput.requestedScope;
+      metadata = goalOrInput.metadata;
+    } else {
+      goal = goalOrInput;
+      caller = callerArg!;
+      metadata = metadataArg;
+    }
+
+    if (!goal || typeof goal !== 'string' || goal.trim() === '') {
+      throw new ValidationError('Task goal must not be empty.');
+    }
+
+    if (!caller || typeof caller !== 'object') {
+      throw new ValidationError('CallerContext must be provided for scoped task submission.');
+    }
+
+    if (!this.authorizer || !this.hostAuthority) {
+      throw new SecurityViolationError(
+        'Host authorization boundary is not configured on coordinator. Cannot submit scoped tasks.',
+        'MISSING_HOST_AUTHORITY'
+      );
+    }
+
+    // 1. Authenticate caller and verify cryptographic proof & WeakSet containment
+    const verifiedCaller = this.authorizer.verify(caller);
+
+    // 2. Permission check: caller must have WRITE permission to submit tasks
+    const permissions = verifiedCaller.permissions instanceof Set
+      ? verifiedCaller.permissions
+      : new Set(verifiedCaller.permissions);
+    if (!permissions.has('WRITE')) {
+      throw new SecurityViolationError(
+        `Caller with actor '${verifiedCaller.actor}' lacks WRITE permission to create tasks in scope '${verifiedCaller.scope.scopeType}:${verifiedCaller.scope.scopeId}'.`,
+        'PERMISSION_DENIED'
+      );
+    }
+
+    // 3. Derive authoritative scope and validate
+    const effectiveScope = verifiedCaller.scope;
+    validateScope(effectiveScope.scopeType, effectiveScope.scopeId);
+
+    // 4. If requestedScope is specified, it must strictly match the verified caller scope
+    if (requestedScope) {
+      validateScope(requestedScope.scopeType, requestedScope.scopeId);
+      if (
+        requestedScope.scopeType !== effectiveScope.scopeType ||
+        requestedScope.scopeId !== effectiveScope.scopeId
+      ) {
+        throw new SecurityViolationError(
+          `Requested scope '${requestedScope.scopeType}:${requestedScope.scopeId}' does not match authorized caller scope '${effectiveScope.scopeType}:${effectiveScope.scopeId}'.`,
+          'TASK_CALLER_SCOPE_MISMATCH'
+        );
+      }
+    }
+
+    // 5. If metadata claims an explicit scope or workspaceId, reject if inconsistent
+    if (metadata && typeof metadata === 'object') {
+      if ('workspaceId' in metadata && typeof metadata.workspaceId === 'string') {
+        if (effectiveScope.scopeType === 'WORKSPACE' && metadata.workspaceId !== effectiveScope.scopeId) {
+          throw new SecurityViolationError(
+            `Metadata workspaceId '${metadata.workspaceId}' does not match authorized scope '${effectiveScope.scopeId}'.`,
+            'TASK_CALLER_SCOPE_MISMATCH'
+          );
+        }
+      }
+      if ('scope' in metadata && metadata.scope && typeof metadata.scope === 'object') {
+        const metaScope = metadata.scope as ScopeIdentifier;
+        if (metaScope.scopeType !== effectiveScope.scopeType || metaScope.scopeId !== effectiveScope.scopeId) {
+          throw new SecurityViolationError(
+            `Metadata scope '${metaScope.scopeType}:${metaScope.scopeId}' does not match authorized scope '${effectiveScope.scopeType}:${effectiveScope.scopeId}'.`,
+            'TASK_CALLER_SCOPE_MISMATCH'
+          );
+        }
+      }
+    }
+
+    // 6. Sanitize metadata to strip credentials, passwords, tokens, proofs
+    const sanitizedMeta = sanitizeMetadata(metadata);
+
+    // 7. Create task via privileged HostMemoryAuthority (generates cryptographic host attestation)
+    const task = this.hostAuthority.createTask(this.taskRepo, {
+      goal: goal.trim(),
+      scope: effectiveScope,
+      metadata: sanitizedMeta
+    });
+
+    // 8. Log tamper-evident audit event without credentials
+    this.auditRepo.appendEvent({
+      taskId: task.id,
+      eventType: 'TASK_CREATED',
+      actor: verifiedCaller.actor === 'SYSTEM' ? 'SYSTEM' : 'USER',
+      details: {
+        goal: task.goal,
+        scope: effectiveScope,
+        metadata: sanitizedMeta
+      }
+    });
+
+    return task;
+  }
+
+  /**
+   * Resolves and cryptographically verifies the authoritative scope of a task.
+   * - Returns ScopeIdentifier if the task has a valid host attestation.
+   * - Returns null if the task is an unattested legacy task (no _scopeAttestation).
+   * - Throws SecurityViolationError if the task claims a scope attestation that is forged or tampered.
+   */
+  public verifyTaskScope(task: Task): ScopeIdentifier | null {
+    if (!this.authorizer) {
+      return null;
+    }
+    if (!task.metadataJson) {
+      return null;
+    }
+    let meta: Record<string, unknown>;
+    try {
+      meta = JSON.parse(task.metadataJson);
+    } catch {
+      return null;
+    }
+    if (!meta._scopeAttestation) {
+      return null;
+    }
+    return this.authorizer.verifyTaskScope(task);
   }
 
   /**
