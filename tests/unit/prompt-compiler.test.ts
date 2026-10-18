@@ -69,11 +69,12 @@ test('PromptCompiler - includes optional context completely when fitting within 
   const totalLength = basePrompt.length + prefix.length + contextBody.length;
 
   const compiler = new PromptCompiler({ maxContextChars: totalLength });
-  const { userPrompt } = compiler.compilePlanPrompt(goal, sampleTools, contextBody);
+  const { userPrompt, contextOmitted } = compiler.compilePlanPrompt(goal, sampleTools, contextBody);
 
   assert.equal(userPrompt.length, totalLength);
   assert.ok(userPrompt.includes('ADDITIONAL CONTEXT / ARTIFACTS:'));
   assert.ok(userPrompt.includes(contextBody));
+  assert.equal(contextOmitted, false);
 });
 
 test('PromptCompiler - omits entire context block atomically when context pushes user prompt over limit', () => {
@@ -85,13 +86,14 @@ test('PromptCompiler - omits entire context block atomically when context pushes
 
   // Set limit to 1 character less than totalLength
   const compiler = new PromptCompiler({ maxContextChars: totalLength - 1 });
-  const { userPrompt } = compiler.compilePlanPrompt(goal, sampleTools, contextBody);
+  const { userPrompt, contextOmitted } = compiler.compilePlanPrompt(goal, sampleTools, contextBody);
 
   // Must omit the entire context block atomically
   assert.equal(userPrompt, basePrompt);
   assert.equal(userPrompt.includes('ADDITIONAL CONTEXT / ARTIFACTS:'), false);
   assert.equal(userPrompt.includes(contextBody), false);
   assert.equal(userPrompt.includes('[...truncated to context limit...]'), false);
+  assert.equal(contextOmitted, true);
 });
 
 test('PromptCompiler - never slices memory JSON or drops security delimiters', () => {
@@ -107,7 +109,7 @@ test('PromptCompiler - never slices memory JSON or drops security delimiters', (
   const basePrompt = `TASK GOAL:\n${goal}`;
   // Allow enough space for goal, but not enough for the full memory JSON
   const compiler = new PromptCompiler({ maxContextChars: basePrompt.length + 50 });
-  const { userPrompt } = compiler.compilePlanPrompt(goal, sampleTools, memoryJson);
+  const { userPrompt, contextOmitted } = compiler.compilePlanPrompt(goal, sampleTools, memoryJson);
 
   // Entire memory block omitted: no partial JSON, no broken delimiters, no mid-string slicing
   assert.equal(userPrompt, basePrompt);
@@ -116,15 +118,43 @@ test('PromptCompiler - never slices memory JSON or drops security delimiters', (
   assert.equal(userPrompt.includes('=== BEGIN UNTRUSTED LONG-TERM MEMORY CONTEXT ==='), false);
   assert.equal(userPrompt.includes('=== END UNTRUSTED LONG-TERM MEMORY CONTEXT ==='), false);
   assert.equal(userPrompt.includes('[...truncated to context limit...]'), false);
+  assert.equal(contextOmitted, true);
 });
 
 test('PromptCompiler - existing callers without context continue to work normally', () => {
   const compiler = new PromptCompiler();
-  const { systemInstruction, userPrompt } = compiler.compilePlanPrompt('Standard task goal', sampleTools);
+  const { systemInstruction, userPrompt, contextOmitted } = compiler.compilePlanPrompt('Standard task goal', sampleTools);
 
   assert.ok(systemInstruction.includes('hash_file'));
   assert.equal(userPrompt, 'TASK GOAL:\nStandard task goal');
   assert.equal(userPrompt.includes('ADDITIONAL CONTEXT / ARTIFACTS:'), false);
+  assert.equal(contextOmitted, false);
+});
+
+test('PromptCompiler - sets contextOmitted to true only when non-empty context is omitted due to limit', () => {
+  const compiler = new PromptCompiler({ maxContextChars: 50 });
+  const result = compiler.compilePlanPrompt('My Task Goal', sampleTools, 'Very long context that exceeds the configured limit');
+  assert.equal(result.contextOmitted, true);
+  assert.equal(result.userPrompt, 'TASK GOAL:\nMy Task Goal');
+});
+
+test('PromptCompiler - sets contextOmitted to false when optional context fits within limit', () => {
+  const compiler = new PromptCompiler({ maxContextChars: 1000 });
+  const result = compiler.compilePlanPrompt('My Task Goal', sampleTools, 'Short context');
+  assert.equal(result.contextOmitted, false);
+  assert.ok(result.userPrompt.includes('Short context'));
+});
+
+test('PromptCompiler - sets contextOmitted to false when no context is supplied or context is empty whitespace', () => {
+  const compiler = new PromptCompiler();
+  const noContext = compiler.compilePlanPrompt('My Task Goal', sampleTools);
+  assert.equal(noContext.contextOmitted, false);
+
+  const emptyContext = compiler.compilePlanPrompt('My Task Goal', sampleTools, '');
+  assert.equal(emptyContext.contextOmitted, false);
+
+  const whitespaceContext = compiler.compilePlanPrompt('My Task Goal', sampleTools, '   \t\n  ');
+  assert.equal(whitespaceContext.contextOmitted, false);
 });
 
 test('PromptCompiler - throws ValidationError on empty task goal', () => {

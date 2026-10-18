@@ -19,6 +19,12 @@ export interface PromptCompilerOptions {
   readonly defaultSystemPrompt?: string;
 }
 
+export interface CompiledPlanPrompt {
+  readonly systemInstruction: string;
+  readonly userPrompt: string;
+  readonly contextOmitted: boolean;
+}
+
 export class PromptCompiler {
   public static readonly DEFAULT_SYSTEM_PROMPT =
     'You are the execution engine of the Dots AI Platform. Formulate concise, bounded, verifiable plans. ' +
@@ -41,7 +47,7 @@ export class PromptCompiler {
     goal: string,
     availableTools: readonly ToolDefinition[],
     context?: string
-  ): { systemInstruction: string; userPrompt: string } {
+  ): CompiledPlanPrompt {
     if (!goal || goal.trim() === '') {
       throw new ValidationError('Task goal cannot be empty for plan compilation.');
     }
@@ -82,17 +88,21 @@ export class PromptCompiler {
     }
 
     let userPrompt = baseUserPrompt;
+    let contextOmitted = false;
     if (scrubbedContext) {
       const fullUserPrompt = `${baseUserPrompt}\n\nADDITIONAL CONTEXT / ARTIFACTS:\n${scrubbedContext}`;
       if (fullUserPrompt.length <= this.maxContextChars) {
         userPrompt = fullUserPrompt;
+      } else {
+        contextOmitted = true;
       }
       // If optional context would exceed limit, omit the entire context block atomically
     }
 
     return {
       systemInstruction: this.scrubber.scrub(systemInstruction),
-      userPrompt: this.scrubber.scrub(userPrompt)
+      userPrompt: this.scrubber.scrub(userPrompt),
+      contextOmitted
     };
   }
 
