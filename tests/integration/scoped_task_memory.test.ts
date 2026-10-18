@@ -15,8 +15,9 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { resolve } from 'node:path';
-import { existsSync, rmSync, mkdirSync, unlinkSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { existsSync, rmSync, mkdirSync, mkdtempSync } from 'node:fs';
 import { DatabaseManager } from '../../src/storage/db.ts';
 import { TaskRepository } from '../../src/storage/task-repository.ts';
 import { AuditRepository } from '../../src/storage/audit-repository.ts';
@@ -32,23 +33,6 @@ import { PolicyEngine } from '../../src/security/policy-engine.ts';
 import { ApprovalBroker } from '../../src/security/approval-broker.ts';
 import { VerificationEngine } from '../../src/verification/verifier.ts';
 import { TokenBudgetTracker } from '../../src/model/budget-tracker.ts';
-
-const testDiskDb = resolve('test_scoped_memory_e2e.db');
-const testWorkspace = resolve('test_scoped_memory_workspace');
-
-function cleanArtifacts(): void {
-  for (const ext of ['', '-wal', '-shm']) {
-    const f = `${testDiskDb}${ext}`;
-    try {
-      if (existsSync(f)) unlinkSync(f);
-    } catch {
-      // Ignore brief OS file locks on Windows
-    }
-  }
-  if (existsSync(testWorkspace)) {
-    rmSync(testWorkspace, { recursive: true, force: true });
-  }
-}
 
 class MockIdentityProvider implements TrustedIdentityProvider {
   private readonly principals = new Map<string, AuthenticatedPrincipal>();
@@ -66,9 +50,7 @@ class MockIdentityProvider implements TrustedIdentityProvider {
 }
 
 test('Scoped Task Memory Integration - full lifecycle from submission through verified completion, provenance, and cold reboot persistence', async () => {
-  cleanArtifacts();
-  mkdirSync(testWorkspace, { recursive: true });
-
+  let testDir: string | null = null;
   let db1: DatabaseManager | null = null;
   let db2: DatabaseManager | null = null;
 
@@ -78,6 +60,11 @@ test('Scoped Task Memory Integration - full lifecycle from submission through ve
   const memoryContent = `Primary backend database listener on ${memoryMarker}.`;
 
   try {
+    testDir = mkdtempSync(join(tmpdir(), 'dots-scoped-mem-'));
+    const testDiskDb = join(testDir, 'scoped_memory.db');
+    const testWorkspace = join(testDir, 'workspace');
+    mkdirSync(testWorkspace, { recursive: true });
+
     // =========================================================================
     // 1. Setup Shared Database, Authority, MemoryService, and Coordinator
     // =========================================================================
@@ -324,10 +311,18 @@ test('Scoped Task Memory Integration - full lifecycle from submission through ve
     }
   } finally {
     // =========================================================================
-    // 10. Clean up Database Handles and Temporary Files
+    // 10. Clean up Database Handles and Unique Temporary Directory
     // =========================================================================
-    if (db1?.isOpen) db1.close();
-    if (db2?.isOpen) db2.close();
-    cleanArtifacts();
+    try {
+      if (db1?.isOpen) db1.close();
+    } finally {
+      try {
+        if (db2?.isOpen) db2.close();
+      } finally {
+        if (testDir && existsSync(testDir)) {
+          rmSync(testDir, { recursive: true, force: true });
+        }
+      }
+    }
   }
 });
