@@ -53,13 +53,17 @@ import type {
   MemoryExportItem,
   MemoryExportBundle,
   ExportMemoriesOptions,
-  MemoryUsageHistory
+  MemoryUsageHistory,
+  ImportConflictStrategy,
+  ImportMemoriesOptions,
+  MemoryImportResult
 } from '../domain/types.ts';
 import {
   ValidationError,
   SecurityViolationError,
   MemoryScopeViolationError,
   MemoryNotFoundError,
+  MemoryConflictError,
   TaskNotFoundError
 } from '../domain/errors.ts';
 import { MemoryRepository } from '../storage/memory-repository.ts';
@@ -70,11 +74,23 @@ import { RelevanceMatcher } from './relevance-matcher.ts';
 import { MemoryContextBuilder } from './context-builder.ts';
 import { MemoryAuthorizer } from '../security/memory-authorizer.ts';
 import type { HostMemoryAuthority } from '../security/host-authority.ts';
-import { computeCanonicalSha256 } from './canonical-json.ts';
+import { computeCanonicalSha256, verifyBundleChecksum } from './canonical-json.ts';
 
 const VALID_SCOPES: ReadonlySet<MemoryScopeType> = new Set([
   'GLOBAL',
   'WORKSPACE'
+]);
+
+const VALID_CATEGORIES: ReadonlySet<MemoryCategory> = new Set([
+  'USER_PREFERENCE',
+  'PROJECT_FACT',
+  'LEARNED_PROCEDURE'
+]);
+
+const VALID_CONFLICT_STRATEGIES: ReadonlySet<ImportConflictStrategy> = new Set([
+  'FAIL',
+  'SKIP',
+  'OVERWRITE'
 ]);
 
 export interface MemoryServiceOptions {
@@ -1051,6 +1067,265 @@ export class MemoryService {
     }, false);
 
     return bundle;
+  }
+
+  /**
+   * Imports memories from a canonical bundle into the caller's authorized scope
+   * with atomic conflict resolution and fail-closed audit logging.
+   * 
+   * Architectural & Security Guarantees:
+   * 1. Authorization: Requires verified caller with explicit WRITE permission.
+   * 2. Scope Isolation: Destination scope is derived strictly from verified caller (caller.scope).
+   *    Never trusts bundle.sourceScope for authorization or destination routing.
+   * 3. Pre-flight Validation: Validates bundle structure, version, count, item fields,
+   *    checksum (via verifyBundleChecksum), and duplicate active keys BEFORE database transaction.
+   * 4. Proposal Isolation: Rejects entries with status 'PENDING_APPROVAL'. Imported entries must be ACTIVE or ARCHIVED.
+   * 5. Uniqueness Rule: Uniqueness is enforced on (scope_type, scope_id, key) WHERE status = 'ACTIVE'.
+   *    Duplicate active keys in the incoming bundle are rejected regardless of category.
+   * 6. Host Field Protection: Imported data cannot override internal IDs, scope, audit identity, or telemetry.
+   * 7. Conflict Strategies:
+   *    - 'FAIL': Aborts the entire import if any incoming active key conflicts with an existing active memory.
+   *    - 'SKIP': Skips conflicting incoming entries and imports non-conflicting entries.
+   *    - 'OVERWRITE': Archives the existing active memory and inserts the imported record as new ACTIVE memory.
+   *      Preserves the old archived record. Tags and metadata are replaced by imported values (not merged).
+   * 8. Transactional Atomicity: All inserts, archives, and the MEMORIES_IMPORTED audit event occur
+   *    in a single atomic database transaction. Any failure rolls back the entire operation.
+   * 9. Audit Privacy: Logs destination scope, counts, conflict strategy, and checksum.
+   *    NEVER includes raw memory content or keys in the audit event.
+   */
+  public importMemories(
+    caller: CallerContext,
+    bundle: MemoryExportBundle,
+    options: ImportMemoriesOptions = {}
+  ): MemoryImportResult {
+    // 1. Authorization
+    this.validateCaller(caller, 'WRITE');
+
+    if (caller.actor === 'AGENT') {
+      this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+        reason: 'AGENT_DIRECT_ACTIVE_CREATION_DENIED',
+        operation: 'importMemories'
+      }, false);
+      throw new SecurityViolationError(
+        'Agents cannot directly import active memories; memories must be imported by a verified user.',
+        'AGENT_PROPOSAL_REQUIRED'
+      );
+    }
+
+    if (!options || typeof options !== 'object') {
+      throw new ValidationError('ImportMemoriesOptions must be an object if provided.');
+    }
+
+    const conflictStrategy: ImportConflictStrategy = options.conflictStrategy ?? 'FAIL';
+    if (!VALID_CONFLICT_STRATEGIES.has(conflictStrategy)) {
+      throw new ValidationError(
+        `Invalid conflict strategy '${String(conflictStrategy)}'. Must be 'FAIL', 'SKIP', or 'OVERWRITE'.`
+      );
+    }
+
+    // 2. Pre-flight Bundle Validation
+    if (!bundle || typeof bundle !== 'object') {
+      throw new ValidationError('MemoryExportBundle must be provided as an object.');
+    }
+    if (bundle.version !== '1.0') {
+      throw new ValidationError(
+        `Unsupported bundle version '${String((bundle as unknown as Record<string, unknown>).version)}'. Only version '1.0' is supported.`
+      );
+    }
+    if (typeof bundle.count !== 'number' || !Number.isInteger(bundle.count) || bundle.count < 0) {
+      throw new ValidationError('Bundle count must be a non-negative integer.');
+    }
+    if (!Array.isArray(bundle.memories)) {
+      throw new ValidationError('Bundle memories must be an array.');
+    }
+    if (bundle.memories.length !== bundle.count) {
+      throw new ValidationError(
+        `Bundle count mismatch: declared count is ${bundle.count}, but bundle contains ${bundle.memories.length} memories.`
+      );
+    }
+    if (typeof bundle.checksum !== 'string' || bundle.checksum.trim() === '') {
+      throw new ValidationError('Bundle checksum must be a non-empty string.');
+    }
+
+    // Verify integrity checksum before any database mutation
+    if (!verifyBundleChecksum(bundle)) {
+      throw new ValidationError(
+        'Bundle checksum verification failed: bundle payload does not match checksum (corrupted or tampered).'
+      );
+    }
+
+    // 3. Item Field Validation & Duplicate Key Prevention
+    const seenActiveKeys = new Set<string>();
+
+    for (let i = 0; i < bundle.memories.length; i++) {
+      const item = bundle.memories[i];
+      if (!item || typeof item !== 'object') {
+        throw new ValidationError(`Bundle memory at index ${i} must be an object.`);
+      }
+      if (typeof item.key !== 'string' || item.key.trim() === '') {
+        throw new ValidationError(`Memory key at index ${i} must be a non-empty string.`);
+      }
+      if (item.key.length > 256) {
+        throw new ValidationError(
+          `Memory key at index ${i} exceeds limit of 256 characters (${item.key.length} > 256).`
+        );
+      }
+      if (typeof item.content !== 'string' || item.content.trim() === '') {
+        throw new ValidationError(`Memory content for key '${item.key}' must be a non-empty string.`);
+      }
+      if (!item.category || !VALID_CATEGORIES.has(item.category)) {
+        throw new ValidationError(
+          `Invalid memory category '${String(item.category)}' for key '${item.key}'. Must be one of: ${Array.from(VALID_CATEGORIES).join(', ')}.`
+        );
+      }
+      if (
+        item.priority !== undefined &&
+        (typeof item.priority !== 'number' ||
+          !Number.isInteger(item.priority) ||
+          item.priority < 0 ||
+          item.priority > 100)
+      ) {
+        throw new ValidationError(
+          `Memory priority for key '${item.key}' must be an integer between 0 and 100, received '${String(item.priority)}'.`
+        );
+      }
+      if (
+        item.tags !== undefined &&
+        (!Array.isArray(item.tags) || item.tags.some((t: unknown) => typeof t !== 'string'))
+      ) {
+        throw new ValidationError(`Memory tags for key '${item.key}' must be an array of strings.`);
+      }
+      if (
+        item.metadata !== undefined &&
+        (typeof item.metadata !== 'object' || item.metadata === null || Array.isArray(item.metadata))
+      ) {
+        throw new ValidationError(`Memory metadata for key '${item.key}' must be an object.`);
+      }
+      if (item.status === 'PENDING_APPROVAL') {
+        throw new ValidationError(
+          `Cannot import memory with status 'PENDING_APPROVAL' for key '${item.key}'. Only ACTIVE or ARCHIVED memories may be imported.`
+        );
+      }
+      if (item.status !== undefined && item.status !== 'ACTIVE' && item.status !== 'ARCHIVED') {
+        throw new ValidationError(
+          `Unsupported memory status '${String(item.status)}' for key '${item.key}'. Only ACTIVE or ARCHIVED memories may be imported.`
+        );
+      }
+
+      // Check for duplicate incoming active keys according to real uniqueness rule (scope_type, scope_id, key)
+      const itemStatus = item.status ?? 'ACTIVE';
+      if (itemStatus === 'ACTIVE') {
+        const trimmedKey = item.key.trim();
+        if (seenActiveKeys.has(trimmedKey)) {
+          throw new ValidationError(
+            `Bundle contains duplicate active memory key '${trimmedKey}'. Duplicate active keys are not permitted within an import bundle regardless of category.`
+          );
+        }
+        seenActiveKeys.add(trimmedKey);
+      }
+    }
+
+    // 4. Atomic Database Mutation
+    return this.memoryRepo.transaction(() => {
+      let importedCount = 0;
+      let skippedCount = 0;
+      let overwrittenCount = 0;
+      const importedKeys: string[] = [];
+      const skippedKeys: string[] = [];
+      const overwrittenKeys: string[] = [];
+
+      for (const item of bundle.memories) {
+        const status: MemoryStatus = item.status ?? 'ACTIVE';
+        const key = item.key.trim();
+
+        if (status === 'ACTIVE') {
+          // Check for existing active memory in destination scope (derived strictly from caller)
+          const existing = this.memoryRepo.getMemoryByKey(key, caller.scope, 'ACTIVE');
+
+          if (existing) {
+            if (conflictStrategy === 'FAIL') {
+              throw new MemoryConflictError(
+                key,
+                caller.scope.scopeType,
+                caller.scope.scopeId,
+                { operation: 'importMemories', conflictStrategy: 'FAIL' }
+              );
+            } else if (conflictStrategy === 'SKIP') {
+              skippedCount++;
+              skippedKeys.push(key);
+              continue;
+            } else if (conflictStrategy === 'OVERWRITE') {
+              // Archive existing active record (preserves the old record with status ARCHIVED)
+              this.memoryRepo.archiveMemory(existing.id, caller.scope);
+
+              // Insert imported record as new ACTIVE record
+              // Tags and metadata replace existing values rather than merging
+              this.memoryRepo.createMemory({
+                key,
+                content: item.content.trim(),
+                category: item.category,
+                scopeType: caller.scope.scopeType,
+                scopeId: caller.scope.scopeId,
+                status: 'ACTIVE',
+                priority: item.priority ?? 50,
+                tags: item.tags ?? [],
+                metadata: item.metadata ?? {}
+              });
+
+              overwrittenCount++;
+              overwrittenKeys.push(key);
+              continue;
+            }
+          }
+        }
+
+        // Non-conflicting insert (new ACTIVE or ARCHIVED)
+        this.memoryRepo.createMemory({
+          key,
+          content: item.content.trim(),
+          category: item.category,
+          scopeType: caller.scope.scopeType,
+          scopeId: caller.scope.scopeId,
+          status,
+          priority: item.priority ?? 50,
+          tags: item.tags ?? [],
+          metadata: item.metadata ?? {}
+        });
+
+        importedCount++;
+        importedKeys.push(key);
+      }
+
+      // Mandatory audit write for state mutation - metadata only, NO raw content or keys
+      this.audit(caller, 'MEMORIES_IMPORTED', {
+        targetScopeType: caller.scope.scopeType,
+        targetScopeId: caller.scope.scopeId,
+        totalInBundle: bundle.count,
+        importedCount,
+        skippedCount,
+        overwrittenCount,
+        conflictStrategy,
+        checksum: bundle.checksum
+      }, true);
+
+      if (this._testPostAuditHook) {
+        this._testPostAuditHook();
+      }
+
+      return {
+        targetScope: {
+          scopeType: caller.scope.scopeType,
+          scopeId: caller.scope.scopeId
+        },
+        totalInBundle: bundle.count,
+        importedCount,
+        skippedCount,
+        overwrittenCount,
+        importedKeys,
+        skippedKeys,
+        overwrittenKeys
+      };
+    });
   }
 
   // --- Private Helpers ---

@@ -81,7 +81,8 @@ export type AuditEventType =
   | 'MEMORY_ACCESS_DENIED'
   | 'MEMORY_PROPOSAL_SUBMITTED'
   | 'MEMORY_PROPOSAL_DECIDED'
-  | 'MEMORY_EXPORTED';
+  | 'MEMORY_EXPORTED'
+  | 'MEMORIES_IMPORTED';
 
 /**
  * Primary Task Entity.
@@ -465,5 +466,22 @@ export interface MemoryUsageHistory {
   readonly totalChars: number;
   readonly totalEstimatedTokens: number;
   readonly injections: readonly MemoryTaskInjection[];
+}
+
+export type ImportConflictStrategy = 'FAIL' | 'SKIP' | 'OVERWRITE';
+
+export interface ImportMemoriesOptions {
+  readonly conflictStrategy?: ImportConflictStrategy;
+}
+
+export interface MemoryImportResult {
+  readonly targetScope: ScopeIdentifier;
+  readonly totalInBundle: number;
+  readonly importedCount: number;
+  readonly skippedCount: number;
+  readonly overwrittenCount: number;
+  readonly importedKeys: readonly string[];
+  readonly skippedKeys: readonly string[];
+  readonly overwrittenKeys: readonly string[];
 }
 
