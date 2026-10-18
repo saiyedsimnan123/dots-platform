@@ -68,6 +68,12 @@ export interface ModelConfig {
   readonly stopSequences?: readonly string[];
 }
 
+export interface CompiledPlanPrompt {
+  readonly systemInstruction: string;
+  readonly userPrompt: string;
+  readonly contextOmitted: boolean;
+}
+
 /**
  * Universal interface for all AI model providers.
  */
@@ -77,11 +83,14 @@ export interface IModelProvider {
 
   /**
    * Generates a structured multi-step plan for the given goal and available tools.
+   * Supports both legacy callers passing optional context string, and callers passing
+   * a pre-compiled, scrubbed, bounded prompt (CompiledPlanPrompt).
    */
   generatePlan(
     goal: string,
     availableTools: readonly ToolDefinition[],
-    context?: string
+    context?: string | CompiledPlanPrompt,
+    compiledPrompt?: CompiledPlanPrompt
   ): Promise<PlanGenerationResult>;
 
   /**

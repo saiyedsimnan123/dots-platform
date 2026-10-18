@@ -16,7 +16,8 @@ import type {
   PlanGenerationResult,
   CompletionResult,
   ToolCallProposal,
-  ModelUsage
+  ModelUsage,
+  CompiledPlanPrompt
 } from './types.ts';
 import { PromptCompiler } from './prompt-compiler.ts';
 import { ValidationError, DatabaseError } from '../domain/errors.ts';
@@ -72,15 +73,35 @@ export class GeminiProvider implements IModelProvider {
 
   /**
    * Generates a structured plan via Gemini's JSON mode.
+   * Uses pre-compiled prompt when provided; otherwise compiles from goal, tools, and context.
    */
   public async generatePlan(
     goal: string,
     availableTools: readonly ToolDefinition[],
-    context?: string
+    contextOrCompiledPrompt?: string | CompiledPlanPrompt,
+    compiledPrompt?: CompiledPlanPrompt
   ): Promise<PlanGenerationResult> {
     this.assertApiKey();
 
-    const { systemInstruction, userPrompt } = this.compiler.compilePlanPrompt(goal, availableTools, context);
+    let effectiveCompiled: CompiledPlanPrompt | undefined;
+    let effectiveContext: string | undefined;
+
+    if (compiledPrompt) {
+      effectiveCompiled = compiledPrompt;
+      effectiveContext = typeof contextOrCompiledPrompt === 'string' ? contextOrCompiledPrompt : undefined;
+    } else if (
+      contextOrCompiledPrompt &&
+      typeof contextOrCompiledPrompt === 'object' &&
+      'systemInstruction' in contextOrCompiledPrompt
+    ) {
+      effectiveCompiled = contextOrCompiledPrompt;
+      effectiveContext = undefined;
+    } else if (typeof contextOrCompiledPrompt === 'string') {
+      effectiveContext = contextOrCompiledPrompt;
+    }
+
+    const { systemInstruction, userPrompt } = effectiveCompiled ??
+      this.compiler.compilePlanPrompt(goal, availableTools, effectiveContext);
 
     const endpoint = `${this.baseUrl}/models/${this.modelId}:generateContent?key=${this.apiKey}`;
     const payload = {

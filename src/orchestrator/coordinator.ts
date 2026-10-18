@@ -13,7 +13,7 @@
 import type { Task, TaskStep, ToolExecution, CallerContext, ScopeIdentifier } from '../domain/types.ts';
 import type { TaskRepository } from '../storage/task-repository.ts';
 import type { AuditRepository } from '../storage/audit-repository.ts';
-import type { IModelProvider } from '../model/types.ts';
+import type { IModelProvider, CompiledPlanPrompt } from '../model/types.ts';
 import type { ToolRegistry } from '../tools/registry.ts';
 import type { PolicyEngine } from '../security/policy-engine.ts';
 import type { ApprovalBroker } from '../security/approval-broker.ts';
@@ -483,6 +483,7 @@ export class TaskCoordinator {
     if (steps.length === 0) {
       const availableTools = this.toolRegistry.listDefinitions();
 
+      let compiled: CompiledPlanPrompt;
       let planningContext: string | undefined;
 
       if (this.memoryService && this.authorizer) {
@@ -506,7 +507,7 @@ export class TaskCoordinator {
             maxBudgetChars: 4000
           });
 
-          const compiled = this.promptCompiler.compilePlanPrompt(
+          compiled = this.promptCompiler.compilePlanPrompt(
             task.goal,
             availableTools,
             memoryContext.serializedContext
@@ -516,16 +517,17 @@ export class TaskCoordinator {
             planningContext = memoryContext.serializedContext;
           }
         } else {
-          this.promptCompiler.compilePlanPrompt(task.goal, availableTools);
+          compiled = this.promptCompiler.compilePlanPrompt(task.goal, availableTools);
         }
       } else {
-        this.promptCompiler.compilePlanPrompt(task.goal, availableTools);
+        compiled = this.promptCompiler.compilePlanPrompt(task.goal, availableTools);
       }
 
       const planResult = await this.modelProvider.generatePlan(
         task.goal,
         availableTools,
-        planningContext
+        planningContext,
+        compiled
       );
 
       this.budgetTracker.recordUsage(

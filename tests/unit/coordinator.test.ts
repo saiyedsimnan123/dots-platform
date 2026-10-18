@@ -26,7 +26,7 @@ import { TokenBudgetTracker } from '../../src/model/budget-tracker.ts';
 import { TaskCoordinator } from '../../src/orchestrator/coordinator.ts';
 import { ValidationError, SecurityViolationError } from '../../src/domain/errors.ts';
 import type { CallerContext } from '../../src/domain/types.ts';
-import { PromptCompiler } from '../../src/model/prompt-compiler.ts';
+import { PromptCompiler, type CompiledPlanPrompt } from '../../src/model/prompt-compiler.ts';
 import { MEMORY_CONTEXT_SECURITY_BOUNDARY, MEMORY_CONTEXT_SECURITY_BOUNDARY_END } from '../../src/memory/context-builder.ts';
 
 const testWorkspace = resolve('test_coord_workspace');
@@ -1120,11 +1120,27 @@ test('TaskCoordinator - Phase 7.4 Substep 4A: valid scoped task retrieves and pa
     const step2 = await coordinator.step(task.id);
     assert.equal(step2.status, 'EXECUTING');
 
-    // 5. Verify model provider recorded planning call with context
+    // 5. Verify model provider recorded planning call with compiled prompt and context
     const calls = harness.modelProvider.getRecordedCalls();
     assert.equal(calls.length, 1);
     assert.equal(calls[0]!.method, 'generatePlan');
     assert.equal(calls[0]!.args.goal, task.goal);
+
+    // Verify pre-compiled prompt delivery
+    const compiled = calls[0]!.args.compiledPrompt as CompiledPlanPrompt;
+    assert.ok(compiled);
+    assert.equal(compiled.contextOmitted, false);
+
+    const systemInstruction = calls[0]!.args.systemInstruction as string;
+    assert.ok(systemInstruction.includes('AVAILABLE TOOLS:'));
+    assert.ok(systemInstruction.includes('INSTRUCTIONS:'));
+
+    const userPrompt = calls[0]!.args.userPrompt as string;
+    assert.ok(userPrompt.includes(task.goal));
+    assert.ok(userPrompt.includes(MEMORY_CONTEXT_SECURITY_BOUNDARY));
+    assert.ok(userPrompt.includes(MEMORY_CONTEXT_SECURITY_BOUNDARY_END));
+    assert.ok(userPrompt.includes('db.schema.version'));
+    assert.ok(userPrompt.includes('Database schema is v2.4 with UUID primary keys.'));
 
     const receivedContext = calls[0]!.args.context as string;
     assert.equal(typeof receivedContext, 'string');
@@ -1186,11 +1202,20 @@ test('TaskCoordinator - Phase 7.4 Substep 4A: unattested legacy task skips memor
     const step2 = await coordinator.step(legacyTask.id);
     assert.equal(step2.status, 'EXECUTING');
 
-    // Provider was invoked with context === undefined
+    // Provider was invoked with context === undefined and clean userPrompt without memory context
     const calls = harness.modelProvider.getRecordedCalls();
     assert.equal(calls.length, 1);
     assert.equal(calls[0]!.args.goal, 'Legacy task without scope claims');
     assert.equal(calls[0]!.args.context, undefined);
+
+    const compiled = calls[0]!.args.compiledPrompt as CompiledPlanPrompt;
+    assert.ok(compiled);
+    assert.equal(compiled.contextOmitted, false);
+
+    const userPrompt = calls[0]!.args.userPrompt as string;
+    assert.equal(userPrompt, 'TASK GOAL:\nLegacy task without scope claims');
+    assert.ok(!userPrompt.includes('legacy.secret.fact'));
+    assert.ok(!userPrompt.includes(MEMORY_CONTEXT_SECURITY_BOUNDARY));
 
     // No MEMORY_RETRIEVED audit event for legacy task
     const auditEvents = harness.auditRepo.getEventsByTaskId(legacyTask.id);
@@ -1348,6 +1373,15 @@ test('TaskCoordinator - Phase 7.4 Substep 4A: prompt budget overflow omits memor
     assert.equal(calls[0]!.args.goal, shortGoal);
     assert.equal(calls[0]!.args.context, undefined);
 
+    const compiled = calls[0]!.args.compiledPrompt as CompiledPlanPrompt;
+    assert.ok(compiled);
+    assert.equal(compiled.contextOmitted, true);
+
+    const userPrompt = calls[0]!.args.userPrompt as string;
+    assert.equal(userPrompt, `TASK GOAL:\n${shortGoal}`);
+    assert.ok(!userPrompt.includes('research.large.artifact'));
+    assert.ok(!userPrompt.includes(MEMORY_CONTEXT_SECURITY_BOUNDARY));
+
     // 6. Oversized goal itself throws ValidationError
     const oversizedGoal = 'A'.repeat(300);
     const oversizedTask = harness.hostAuthority.createTask(harness.taskRepo, {
@@ -1403,8 +1437,67 @@ test('TaskCoordinator - Phase 7.4 Substep 4A: legacy coordinator without memory 
     assert.equal(calls.length, 1);
     assert.equal(calls[0]!.args.goal, 'Standard legacy workflow');
     assert.equal(calls[0]!.args.context, undefined);
+
+    const compiled = calls[0]!.args.compiledPrompt as CompiledPlanPrompt;
+    assert.ok(compiled);
+    assert.equal(compiled.contextOmitted, false);
+    assert.equal(calls[0]!.args.userPrompt, 'TASK GOAL:\nStandard legacy workflow');
   } finally {
     harness.db.close();
+    if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
+  }
+});
+
+test('TaskCoordinator - Phase 7.4 Substep 4A: secrets inside memory records are scrubbed before reaching the model prompt', async () => {
+  const idProvider = new MockIdentityProvider();
+  idProvider.register('token-admin', {
+    principalId: 'admin-1',
+    role: 'ADMIN',
+    permittedScopes: [{ scopeType: 'WORKSPACE', scopeId: 'security-lab' }]
+  });
+
+  const harness = createMemoryCoordHarness({ idProvider });
+
+  try {
+    const coordinator = harness.createCoordinator();
+
+    const admin = harness.authorizer.authorizeUser({
+      credentials: 'token-admin',
+      requestedScope: { scopeType: 'WORKSPACE', scopeId: 'security-lab' }
+    });
+
+    const sensitiveApiKey = 'AIzaSyD9876543210zyxwvutsrqponmlkjihgfed';
+    const sensitiveToken = 'Bearer secretbearer12345abcdef';
+
+    harness.memoryService.createMemory(admin, {
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'security-lab',
+      key: 'internal.credentials',
+      content: `Access server with ${sensitiveApiKey} and auth header ${sensitiveToken}`,
+      tags: ['security', 'credentials'],
+      priority: 95,
+      status: 'ACTIVE'
+    });
+
+    const task = await coordinator.submitScopedTask({
+      goal: 'Connect to internal server',
+      caller: admin
+    });
+
+    await coordinator.step(task.id);
+    await coordinator.step(task.id);
+
+    const calls = harness.modelProvider.getRecordedCalls();
+    assert.equal(calls.length, 1);
+
+    const userPrompt = calls[0]!.args.userPrompt as string;
+    assert.ok(!userPrompt.includes(sensitiveApiKey), 'Raw API key must not leak into model prompt');
+    assert.ok(!userPrompt.includes('secretbearer12345abcdef'), 'Raw token must not leak into model prompt');
+    assert.ok(userPrompt.includes('[REDACTED_GOOGLE_API_KEY]'), 'Scrubbed Google API key marker must be present');
+    assert.ok(userPrompt.includes('[REDACTED_TOKEN]'), 'Scrubbed token marker must be present');
+  } finally {
+    harness.sharedDb.close();
     if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
   }
 });

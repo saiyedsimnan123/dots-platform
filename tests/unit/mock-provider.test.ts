@@ -98,3 +98,56 @@ test('MockModelProvider - clears call history', async () => {
   provider.clearHistory();
   assert.equal(provider.getRecordedCalls().length, 0);
 });
+
+test('MockModelProvider - generatePlan records pre-compiled prompt and updates token accounting', async () => {
+  const provider = new MockModelProvider();
+  const compiledPrompt = {
+    systemInstruction: 'Compiled system instructions for planning',
+    userPrompt: 'TASK GOAL:\nBuild artifact\n\nADDITIONAL CONTEXT / ARTIFACTS:\n{"records":[{"id":"mem-1"}]}',
+    contextOmitted: false
+  };
+
+  const result = await provider.generatePlan('Build artifact', tools, undefined, compiledPrompt);
+  assert.ok(result.steps.length > 0);
+
+  const calls = provider.getRecordedCalls();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.method, 'generatePlan');
+  assert.equal(calls[0]!.args.goal, 'Build artifact');
+  assert.equal(calls[0]!.args.compiledPrompt, compiledPrompt);
+  assert.equal(calls[0]!.args.systemInstruction, compiledPrompt.systemInstruction);
+  assert.equal(calls[0]!.args.userPrompt, compiledPrompt.userPrompt);
+
+  // Token accounting uses compiled prompt characters
+  const expectedChars = compiledPrompt.userPrompt.length + compiledPrompt.systemInstruction.length;
+  assert.equal(result.usage.promptTokens, Math.ceil(expectedChars / 4) + 50);
+});
+
+test('MockModelProvider - generatePlan supports 3-arg compiledPrompt path and legacy context path', async () => {
+  const provider = new MockModelProvider();
+
+  // 1. 3-arg call with compiledPrompt
+  const compiled = {
+    systemInstruction: 'System instructions',
+    userPrompt: 'TASK GOAL:\nGoal 1',
+    contextOmitted: false
+  };
+  await provider.generatePlan('Goal 1', tools, compiled as any);
+
+  // 2. Legacy 3-arg call with context string
+  await provider.generatePlan('Goal 2', tools, 'Legacy context body');
+
+  const calls = provider.getRecordedCalls();
+  assert.equal(calls.length, 2);
+
+  // Call 1
+  assert.equal(calls[0]!.args.goal, 'Goal 1');
+  assert.equal(calls[0]!.args.compiledPrompt, compiled);
+  assert.equal(calls[0]!.args.systemInstruction, 'System instructions');
+  assert.equal(calls[0]!.args.userPrompt, 'TASK GOAL:\nGoal 1');
+
+  // Call 2
+  assert.equal(calls[1]!.args.goal, 'Goal 2');
+  assert.equal(calls[1]!.args.context, 'Legacy context body');
+  assert.equal(calls[1]!.args.compiledPrompt, undefined);
+});

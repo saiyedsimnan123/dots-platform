@@ -9,20 +9,16 @@
  * 3. Context window length bounding to prevent memory/token exhaustion.
  */
 
-import type { ToolDefinition, ModelMessage } from './types.ts';
+import type { ToolDefinition, ModelMessage, CompiledPlanPrompt } from './types.ts';
 import { SecretScrubber, defaultSecretScrubber } from './secret-scrubber.ts';
 import { ValidationError } from '../domain/errors.ts';
+
+export type { CompiledPlanPrompt };
 
 export interface PromptCompilerOptions {
   readonly maxContextChars?: number;
   readonly scrubber?: SecretScrubber;
   readonly defaultSystemPrompt?: string;
-}
-
-export interface CompiledPlanPrompt {
-  readonly systemInstruction: string;
-  readonly userPrompt: string;
-  readonly contextOmitted: boolean;
 }
 
 export class PromptCompiler {

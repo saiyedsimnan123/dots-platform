@@ -16,7 +16,8 @@ import type {
   PlanGenerationResult,
   CompletionResult,
   ToolCallProposal,
-  ModelUsage
+  ModelUsage,
+  CompiledPlanPrompt
 } from './types.ts';
 
 export interface RecordedCall {
@@ -72,13 +73,42 @@ export class MockModelProvider implements IModelProvider {
 
   /**
    * Generates a plan using either an enqueued plan or a deterministic default.
+   * Records goal, availableTools, context, compiledPrompt, systemInstruction, and userPrompt.
    */
   public async generatePlan(
     goal: string,
     availableTools: readonly ToolDefinition[],
-    context?: string
+    contextOrCompiledPrompt?: string | CompiledPlanPrompt,
+    compiledPrompt?: CompiledPlanPrompt
   ): Promise<PlanGenerationResult> {
-    this.recordCall('generatePlan', { goal, availableTools, context });
+    let effectiveCompiled: CompiledPlanPrompt | undefined;
+    let effectiveContext: string | undefined;
+
+    if (compiledPrompt) {
+      effectiveCompiled = compiledPrompt;
+      effectiveContext = typeof contextOrCompiledPrompt === 'string' ? contextOrCompiledPrompt : undefined;
+    } else if (
+      contextOrCompiledPrompt &&
+      typeof contextOrCompiledPrompt === 'object' &&
+      'systemInstruction' in contextOrCompiledPrompt
+    ) {
+      effectiveCompiled = contextOrCompiledPrompt;
+      effectiveContext = undefined;
+    } else if (typeof contextOrCompiledPrompt === 'string') {
+      effectiveContext = contextOrCompiledPrompt;
+    }
+
+    const systemInstruction = effectiveCompiled?.systemInstruction;
+    const userPrompt = effectiveCompiled?.userPrompt;
+
+    this.recordCall('generatePlan', {
+      goal,
+      availableTools,
+      context: effectiveContext,
+      compiledPrompt: effectiveCompiled,
+      systemInstruction,
+      userPrompt
+    });
 
     if (this.failureQueue.length > 0) {
       const err = this.failureQueue.shift();
@@ -103,7 +133,9 @@ export class MockModelProvider implements IModelProvider {
     }
 
     const rawResponse = JSON.stringify({ steps }, null, 2);
-    const promptChars = goal.length + (context?.length ?? 0);
+    const promptChars = userPrompt
+      ? userPrompt.length + (systemInstruction?.length ?? 0)
+      : goal.length + (effectiveContext?.length ?? 0);
     const compChars = rawResponse.length;
 
     const usage: ModelUsage = {
