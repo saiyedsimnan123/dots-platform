@@ -80,7 +80,8 @@ export type AuditEventType =
   | 'MEMORY_RETRIEVED'
   | 'MEMORY_ACCESS_DENIED'
   | 'MEMORY_PROPOSAL_SUBMITTED'
-  | 'MEMORY_PROPOSAL_DECIDED';
+  | 'MEMORY_PROPOSAL_DECIDED'
+  | 'MEMORY_EXPORTED';
 
 /**
  * Primary Task Entity.
@@ -423,5 +424,46 @@ export interface BuildTaskMemoryContextOptions {
   readonly relevanceThreshold?: number;
   readonly maxBudgetChars?: number;
   readonly recordInjections?: boolean;
+}
+
+/**
+ * Phase 7.5 - Memory Provenance Inspection & Export DTOs
+ */
+
+export interface MemoryExportItem {
+  readonly key: string;
+  readonly content: string;
+  readonly category: MemoryCategory;
+  readonly tags: readonly string[];
+  readonly priority: number;
+  readonly metadata: Record<string, unknown>;
+  readonly status: MemoryStatus;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface MemoryExportBundle {
+  readonly version: '1.0';
+  readonly exportedAt: string;
+  readonly sourceScope: ScopeIdentifier;
+  readonly count: number;
+  readonly checksum: string;
+  readonly memories: readonly MemoryExportItem[];
+}
+
+export interface ExportMemoriesOptions {
+  readonly scopeType?: MemoryScopeType;
+  readonly scopeId?: string;
+  readonly includeArchived?: boolean;
+  readonly category?: MemoryCategory;
+}
+
+export interface MemoryUsageHistory {
+  readonly memoryId: string;
+  readonly scope: ScopeIdentifier;
+  readonly totalInjections: number;
+  readonly totalChars: number;
+  readonly totalEstimatedTokens: number;
+  readonly injections: readonly MemoryTaskInjection[];
 }
 

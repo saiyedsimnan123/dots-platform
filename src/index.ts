@@ -51,6 +51,7 @@ export * from './verification/verifier.ts';
 export * from './memory/relevance-matcher.ts';
 export * from './memory/context-builder.ts';
 export * from './memory/memory-service.ts';
+export * from './memory/canonical-json.ts';
 
 // Orchestration Layer
 export * from './orchestrator/coordinator.ts';

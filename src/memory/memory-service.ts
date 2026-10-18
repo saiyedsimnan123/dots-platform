@@ -49,7 +49,11 @@ import type {
   MemoryTaskInjection,
   ScopeIdentifier,
   AuditEventType,
-  Task
+  Task,
+  MemoryExportItem,
+  MemoryExportBundle,
+  ExportMemoriesOptions,
+  MemoryUsageHistory
 } from '../domain/types.ts';
 import {
   ValidationError,
@@ -66,6 +70,7 @@ import { RelevanceMatcher } from './relevance-matcher.ts';
 import { MemoryContextBuilder } from './context-builder.ts';
 import { MemoryAuthorizer } from '../security/memory-authorizer.ts';
 import type { HostMemoryAuthority } from '../security/host-authority.ts';
+import { computeCanonicalSha256 } from './canonical-json.ts';
 
 const VALID_SCOPES: ReadonlySet<MemoryScopeType> = new Set([
   'GLOBAL',
@@ -873,6 +878,180 @@ export class MemoryService {
     }
 
     return context;
+  }
+
+  /**
+   * Retrieves the task injection provenance history for a memory record within caller scope.
+   * Enforces caller verification and READ permissions.
+   * Throws MemoryScopeViolationError if the memory exists in a different scope.
+   * Throws MemoryNotFoundError if the memory does not exist.
+   */
+  public getMemoryUsageHistory(caller: CallerContext, memoryId: string): MemoryUsageHistory {
+    this.validateCaller(caller, 'READ');
+    if (!memoryId || typeof memoryId !== 'string' || memoryId.trim() === '') {
+      throw new ValidationError('Memory ID must be a non-empty string.');
+    }
+
+    let memory: Memory | null;
+    try {
+      memory = this.memoryRepo.getMemoryById(memoryId, caller.scope);
+    } catch (err) {
+      if (err instanceof MemoryScopeViolationError) {
+        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+          reason: 'CROSS_SCOPE_READ_ATTEMPT',
+          operation: 'getMemoryUsageHistory',
+          memoryId,
+          expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+        }, false);
+      }
+      throw err;
+    }
+
+    if (!memory) {
+      throw new MemoryNotFoundError(memoryId);
+    }
+
+    const injections = this.memoryRepo.getInjectionsByMemoryId(memoryId);
+    const totalChars = injections.reduce((sum, inj) => sum + inj.charCount, 0);
+    const totalEstimatedTokens = injections.reduce((sum, inj) => sum + inj.estimatedTokens, 0);
+
+    this.audit(caller, 'MEMORY_RETRIEVED', {
+      memoryId: memory.id,
+      key: memory.key,
+      category: memory.category,
+      scopeType: memory.scopeType,
+      scopeId: memory.scopeId,
+      operation: 'getMemoryUsageHistory',
+      totalInjections: injections.length
+    }, false);
+
+    return {
+      memoryId: memory.id,
+      scope: {
+        scopeType: memory.scopeType,
+        scopeId: memory.scopeId
+      },
+      totalInjections: injections.length,
+      totalChars,
+      totalEstimatedTokens,
+      injections
+    };
+  }
+
+  /**
+   * Exports memories within the caller's authorized scope into a canonical, portable bundle
+   * with a SHA-256 integrity checksum.
+   * 
+   * Safeguards:
+   * 1. Authorized scope is derived strictly from verified caller (caller.scope).
+   * 2. Any explicit scope in options is validated to match caller.scope; mismatches throw MemoryScopeViolationError.
+   * 3. Memory content is preserved lossless (byte-for-byte); no secret scrubbing on backup exports.
+   * 4. Excludes internal database UUIDs (id) to allow cross-environment portability without collisions.
+   * 5. Items are deterministically sorted by (category, key, createdAt).
+   * 6. Appends a privacy-safe MEMORY_EXPORTED audit event with metadata only (no raw content or secrets).
+   * 7. The operation is strictly read-only regarding memory and injection tables.
+   */
+  public exportMemories(
+    caller: CallerContext,
+    options: ExportMemoriesOptions = {}
+  ): MemoryExportBundle {
+    this.validateCaller(caller, 'READ');
+    if (!options || typeof options !== 'object') {
+      throw new ValidationError('ExportMemoriesOptions must be an object if provided.');
+    }
+
+    // Verify requested scope matches caller's authorized scope
+    this.assertCallerScopeMatch(caller, options.scopeType, options.scopeId, 'exportMemories');
+
+    // List memories within authorized caller scope
+    const memories = this.memoryRepo.listMemories({
+      scopeType: caller.scope.scopeType,
+      scopeId: caller.scope.scopeId,
+      category: options.category
+    });
+
+    // Filter by status: active memories always; archived only if includeArchived is true.
+    // Exclude PENDING_APPROVAL proposals from export bundles.
+    const filtered = memories.filter((m) => {
+      if (m.status === 'ACTIVE') {
+        return true;
+      }
+      if (options.includeArchived === true && m.status === 'ARCHIVED') {
+        return true;
+      }
+      return false;
+    });
+
+    // Map to export items preserving content byte-for-byte
+    const items: MemoryExportItem[] = filtered.map((m) => {
+      let tags: string[] = [];
+      try {
+        tags = JSON.parse(m.tagsJson || '[]');
+      } catch {
+        tags = [];
+      }
+
+      let metadata: Record<string, unknown> = {};
+      try {
+        metadata = JSON.parse(m.metadataJson || '{}');
+      } catch {
+        metadata = {};
+      }
+
+      return {
+        key: m.key,
+        content: m.content,
+        category: m.category,
+        tags,
+        priority: m.priority,
+        metadata,
+        status: m.status,
+        createdAt: m.createdAt,
+        updatedAt: m.updatedAt
+      };
+    });
+
+    // Deterministic sorting by category ASC, key ASC, createdAt ASC
+    items.sort((a, b) => {
+      if (a.category !== b.category) {
+        return a.category < b.category ? -1 : 1;
+      }
+      if (a.key !== b.key) {
+        return a.key < b.key ? -1 : 1;
+      }
+      return a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0;
+    });
+
+    const exportedAt = new Date().toISOString();
+    const sourceScope: ScopeIdentifier = {
+      scopeType: caller.scope.scopeType,
+      scopeId: caller.scope.scopeId
+    };
+
+    const bundlePayload = {
+      version: '1.0' as const,
+      exportedAt,
+      sourceScope,
+      count: items.length,
+      memories: items
+    };
+
+    const checksum = computeCanonicalSha256(bundlePayload);
+
+    const bundle: MemoryExportBundle = {
+      ...bundlePayload,
+      checksum
+    };
+
+    // Emit MEMORY_EXPORTED audit event with metadata only - no raw content or secret leakage
+    this.audit(caller, 'MEMORY_EXPORTED', {
+      scopeType: caller.scope.scopeType,
+      scopeId: caller.scope.scopeId,
+      exportedCount: items.length,
+      checksum: bundle.checksum
+    }, false);
+
+    return bundle;
   }
 
   // --- Private Helpers ---
