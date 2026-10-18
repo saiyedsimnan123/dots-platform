@@ -432,3 +432,56 @@ test('DatabaseManager - savepoint release failure during rollback cleanup poison
   assert.throws(() => db.prepare('SELECT 1'), /database connection is poisoned/);
 });
 
+test('DatabaseManager - outer transaction fails without attempting COMMIT when inner transaction poisons connection and callback catches error', () => {
+  const db = new DatabaseManager(':memory:');
+  const rawDb = (db as unknown as { db: { exec: (sql: string) => void } }).db;
+  const originalExec = rawDb.exec.bind(rawDb);
+  let commitAttempted = false;
+
+  assert.throws(
+    () => {
+      db.transaction(() => {
+        rawDb.exec = (sql: string) => {
+          if (sql.trim().startsWith('COMMIT')) {
+            commitAttempted = true;
+          }
+          if (sql.includes('ROLLBACK TO SAVEPOINT')) {
+            throw new Error('Simulated fatal savepoint rollback failure');
+          }
+          return originalExec(sql);
+        };
+
+        try {
+          db.transaction(() => {
+            throw new Error('Inner error needing savepoint rollback');
+          });
+        } catch (innerErr) {
+          // Swallow inner fatal error and attempt normal return
+          assert.ok(innerErr instanceof DatabaseError);
+          assert.match(innerErr.message, /Simulated fatal savepoint rollback failure/);
+        }
+      });
+    },
+    (err: unknown) => {
+      assert.ok(err instanceof DatabaseError);
+      assert.match((err as DatabaseError).message, /Fatal database rollback failure/);
+      assert.match((err as DatabaseError).message, /Simulated fatal savepoint rollback failure/);
+      return true;
+    }
+  );
+
+  // Commit was never attempted
+  assert.equal(commitAttempted, false);
+
+  // Connection remains poisoned and closed, depth restored to 0
+  assert.equal(db.poisoned, true);
+  assert.equal(db.isOpen, false);
+  assert.equal(db.currentTransactionDepth, 0);
+
+  // Subsequent operations rejected safely
+  assert.throws(() => db.prepare('SELECT 1'), /database connection is poisoned/);
+  assert.throws(() => db.exec('SELECT 1'), /database connection is poisoned/);
+  assert.throws(() => db.transaction(() => {}), /database connection is poisoned/);
+});
+
+

@@ -21,6 +21,7 @@ export class DatabaseManager {
   private isClosed: boolean = false;
   private isPoisoned: boolean = false;
   private transactionDepth: number = 0;
+  private fatalError: DatabaseError | null = null;
 
   constructor(dbPath: string = ':memory:') {
     this.dbPath = dbPath;
@@ -282,6 +283,12 @@ export class DatabaseManager {
 
     try {
       const result = callback();
+      if (this.isPoisoned) {
+        throw this.fatalError ?? new DatabaseError('Cannot commit transaction: database connection is poisoned due to a fatal transaction failure.');
+      }
+      if (this.isClosed) {
+        throw new DatabaseError('Cannot commit transaction on closed database connection.');
+      }
       if (isTopLevel) {
         this.db.exec('COMMIT;');
       } else {
@@ -289,7 +296,10 @@ export class DatabaseManager {
       }
       return result;
     } catch (callbackErr) {
-      if (this.isPoisoned || this.isClosed) {
+      if (this.isPoisoned) {
+        throw this.fatalError ?? callbackErr;
+      }
+      if (this.isClosed) {
         throw callbackErr;
       }
       try {
@@ -300,6 +310,14 @@ export class DatabaseManager {
           this.db.exec(`RELEASE SAVEPOINT ${savepointName};`);
         }
       } catch (cleanupErr) {
+        const fatalError = new DatabaseError(
+          `Fatal database rollback failure: ${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`,
+          {
+            cleanupError: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+            originalError: callbackErr instanceof Error ? callbackErr.message : String(callbackErr)
+          }
+        );
+        this.fatalError = fatalError;
         this.isPoisoned = true;
         try {
           this.db.close();
@@ -307,13 +325,7 @@ export class DatabaseManager {
           // Ignore secondary close error during emergency close
         }
         this.isClosed = true;
-        throw new DatabaseError(
-          `Fatal database rollback failure: ${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`,
-          {
-            cleanupError: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
-            originalError: callbackErr instanceof Error ? callbackErr.message : String(callbackErr)
-          }
-        );
+        throw fatalError;
       }
       throw callbackErr;
     } finally {
