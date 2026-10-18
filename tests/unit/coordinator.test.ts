@@ -26,6 +26,8 @@ import { TokenBudgetTracker } from '../../src/model/budget-tracker.ts';
 import { TaskCoordinator } from '../../src/orchestrator/coordinator.ts';
 import { ValidationError, SecurityViolationError } from '../../src/domain/errors.ts';
 import type { CallerContext } from '../../src/domain/types.ts';
+import { PromptCompiler } from '../../src/model/prompt-compiler.ts';
+import { MEMORY_CONTEXT_SECURITY_BOUNDARY, MEMORY_CONTEXT_SECURITY_BOUNDARY_END } from '../../src/memory/context-builder.ts';
 
 const testWorkspace = resolve('test_coord_workspace');
 
@@ -1069,6 +1071,340 @@ test('TaskCoordinator - normalizes and strips common credential key variants whi
     assert.ok(scopedAuditJson.includes('project_configuration_key'));
   } finally {
     harness.sharedDb.close();
+    if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
+  }
+});
+
+test('TaskCoordinator - Phase 7.4 Substep 4A: valid scoped task retrieves and passes memory context to model provider', async () => {
+  const idProvider = new MockIdentityProvider();
+  idProvider.register('token-eng', {
+    principalId: 'eng-1',
+    role: 'MEMBER',
+    permittedScopes: [{ scopeType: 'WORKSPACE', scopeId: 'analytics' }]
+  });
+
+  const harness = createMemoryCoordHarness({ idProvider });
+
+  try {
+    const coordinator = harness.createCoordinator();
+
+    // 1. Authorize user and seed active memory in WORKSPACE:analytics
+    const user = harness.authorizer.authorizeUser({
+      credentials: 'token-eng',
+      requestedScope: { scopeType: 'WORKSPACE', scopeId: 'analytics' }
+    });
+
+    harness.memoryService.createMemory(user, {
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'analytics',
+      key: 'db.schema.version',
+      content: 'Database schema is v2.4 with UUID primary keys.',
+      tags: ['database', 'schema', 'version'],
+      priority: 80,
+      status: 'ACTIVE'
+    });
+
+    // 2. Submit scoped task matching the memory query
+    const task = await coordinator.submitScopedTask({
+      goal: 'Retrieve database schema information for analytics',
+      caller: user
+    });
+    assert.equal(task.status, 'SUBMITTED');
+
+    // 3. Step task into PLANNING
+    const step1 = await coordinator.step(task.id);
+    assert.equal(step1.status, 'PLANNING');
+
+    // 4. Step task through planning phase
+    const step2 = await coordinator.step(task.id);
+    assert.equal(step2.status, 'EXECUTING');
+
+    // 5. Verify model provider recorded planning call with context
+    const calls = harness.modelProvider.getRecordedCalls();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.method, 'generatePlan');
+    assert.equal(calls[0]!.args.goal, task.goal);
+
+    const receivedContext = calls[0]!.args.context as string;
+    assert.equal(typeof receivedContext, 'string');
+    assert.ok(receivedContext.includes(MEMORY_CONTEXT_SECURITY_BOUNDARY));
+    assert.ok(receivedContext.includes(MEMORY_CONTEXT_SECURITY_BOUNDARY_END));
+    assert.ok(receivedContext.includes('db.schema.version'));
+    assert.ok(receivedContext.includes('Database schema is v2.4 with UUID primary keys.'));
+
+    // 6. Verify MemoryService logged read audit event
+    const auditEvents = harness.auditRepo.getEventsByTaskId(task.id);
+    const retrievedEvents = auditEvents.filter((e) => e.eventType === 'MEMORY_RETRIEVED');
+    assert.equal(retrievedEvents.length, 1);
+
+    // 7. Verify NO memory injection provenance was recorded in Substep 4A (Substep 4B scope)
+    const injections = harness.memoryRepo.getInjectionsByTaskId(task.id);
+    assert.equal(injections.length, 0);
+  } finally {
+    harness.sharedDb.close();
+    if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
+  }
+});
+
+test('TaskCoordinator - Phase 7.4 Substep 4A: unattested legacy task skips memory retrieval and passes undefined context', async () => {
+  const idProvider = new MockIdentityProvider();
+  idProvider.register('token-admin', {
+    principalId: 'admin-1',
+    role: 'ADMIN',
+    permittedScopes: [{ scopeType: 'WORKSPACE', scopeId: 'analytics' }]
+  });
+
+  const harness = createMemoryCoordHarness({ idProvider });
+
+  try {
+    const coordinator = harness.createCoordinator();
+
+    // Seed active memory in analytics
+    const admin = harness.authorizer.authorizeUser({
+      credentials: 'token-admin',
+      requestedScope: { scopeType: 'WORKSPACE', scopeId: 'analytics' }
+    });
+
+    harness.memoryService.createMemory(admin, {
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'analytics',
+      key: 'legacy.secret.fact',
+      content: 'This memory must never be retrieved by legacy tasks.',
+      tags: ['legacy'],
+      priority: 90,
+      status: 'ACTIVE'
+    });
+
+    // Submit legacy unattested task
+    const legacyTask = await coordinator.submitTask('Legacy task without scope claims');
+    assert.equal(legacyTask.status, 'SUBMITTED');
+
+    // Step into PLANNING then EXECUTING
+    await coordinator.step(legacyTask.id);
+    const step2 = await coordinator.step(legacyTask.id);
+    assert.equal(step2.status, 'EXECUTING');
+
+    // Provider was invoked with context === undefined
+    const calls = harness.modelProvider.getRecordedCalls();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.args.goal, 'Legacy task without scope claims');
+    assert.equal(calls[0]!.args.context, undefined);
+
+    // No MEMORY_RETRIEVED audit event for legacy task
+    const auditEvents = harness.auditRepo.getEventsByTaskId(legacyTask.id);
+    assert.equal(auditEvents.filter((e) => e.eventType === 'MEMORY_RETRIEVED').length, 0);
+  } finally {
+    harness.sharedDb.close();
+    if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
+  }
+});
+
+test('TaskCoordinator - Phase 7.4 Substep 4A: forged task scope attestation fails closed during planning', async () => {
+  const harness = createMemoryCoordHarness();
+
+  try {
+    const coordinator = harness.createCoordinator();
+
+    // Create a task directly with forged attestation (invalid HMAC signature)
+    const forgedTask = harness.taskRepo.createTask({
+      goal: 'Execute with forged host attestation',
+      metadata: {
+        _scopeAttestation: {
+          scopeType: 'WORKSPACE',
+          scopeId: 'confidential',
+          signature: 'ba0babdeadbeef00112233445566778899aabbccddeeff001122334455667788',
+          timestamp: new Date().toISOString()
+        }
+      }
+    });
+
+    // Advance task to PLANNING state
+    harness.taskRepo.updateTaskStatus(forgedTask.id, 'SUBMITTED', 'PLANNING');
+
+    // Stepping into planning must throw SecurityViolationError (FORGED_TASK_SCOPE)
+    await assert.rejects(
+      async () => coordinator.step(forgedTask.id),
+      (err: unknown) => {
+        assert.ok(err instanceof SecurityViolationError);
+        assert.equal((err as SecurityViolationError).violationType, 'FORGED_TASK_SCOPE');
+        return true;
+      }
+    );
+
+    // Model provider was NEVER invoked
+    assert.equal(harness.modelProvider.getRecordedCalls().length, 0);
+  } finally {
+    harness.sharedDb.close();
+    if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
+  }
+});
+
+test('TaskCoordinator - Phase 7.4 Substep 4A: agent caller lacking READ permission fails closed', async () => {
+  const idProvider = new MockIdentityProvider();
+  idProvider.register('token-eng', {
+    principalId: 'eng-1',
+    role: 'MEMBER',
+    permittedScopes: [{ scopeType: 'WORKSPACE', scopeId: 'analytics' }]
+  });
+
+  const harness = createMemoryCoordHarness({ idProvider });
+  const origAuthorizeAgent = harness.authorizer.authorizeAgent.bind(harness.authorizer);
+
+  try {
+    const user = harness.authorizer.authorizeUser({
+      credentials: 'token-eng',
+      requestedScope: { scopeType: 'WORKSPACE', scopeId: 'analytics' }
+    });
+
+    const coordinator = harness.createCoordinator();
+
+    const task = await coordinator.submitScopedTask({
+      goal: 'Read restricted data',
+      caller: user
+    });
+
+    // Advance task to PLANNING state
+    harness.taskRepo.updateTaskStatus(task.id, 'SUBMITTED', 'PLANNING');
+
+    // Configure authorizer to return an agent context without READ permission
+    (harness.authorizer as { authorizeAgent: unknown }).authorizeAgent = (input: unknown) => {
+      const real = origAuthorizeAgent(input as any);
+      return {
+        ...real,
+        permissions: new Set(['WRITE']) // Lacks READ!
+      } as CallerContext;
+    };
+
+    await assert.rejects(
+      async () => coordinator.step(task.id),
+      (err: unknown) => {
+        assert.ok(err instanceof SecurityViolationError);
+        assert.equal((err as SecurityViolationError).violationType, 'INSUFFICIENT_PERMISSIONS');
+        return true;
+      }
+    );
+
+    // Model provider was never invoked
+    assert.equal(harness.modelProvider.getRecordedCalls().length, 0);
+  } finally {
+    (harness.authorizer as { authorizeAgent: unknown }).authorizeAgent = origAuthorizeAgent;
+    harness.sharedDb.close();
+    if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
+  }
+});
+
+test('TaskCoordinator - Phase 7.4 Substep 4A: prompt budget overflow omits memory context atomically while preserving task goal', async () => {
+  const idProvider = new MockIdentityProvider();
+  idProvider.register('token-admin', {
+    principalId: 'admin-1',
+    role: 'ADMIN',
+    permittedScopes: [{ scopeType: 'WORKSPACE', scopeId: 'research' }]
+  });
+
+  const harness = createMemoryCoordHarness({ idProvider });
+
+  try {
+    // 1. Coordinator configured with a promptCompiler with tight maxContextChars: 250
+    // The memory context framing itself exceeds 300 characters, so optional context will overflow 250 characters
+    const restrictedCompiler = new PromptCompiler({ maxContextChars: 250 });
+    const coordinator = harness.createCoordinator({
+      promptCompiler: restrictedCompiler
+    });
+
+    // 2. Seed memory in research workspace
+    const admin = harness.authorizer.authorizeUser({
+      credentials: 'token-admin',
+      requestedScope: { scopeType: 'WORKSPACE', scopeId: 'research' }
+    });
+
+    harness.memoryService.createMemory(admin, {
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'research',
+      key: 'research.large.artifact',
+      content: 'Important research fact that fits within memory ceiling but exceeds tight prompt compiler budget.',
+      tags: ['research'],
+      priority: 80,
+      status: 'ACTIVE'
+    });
+
+    // 3. Short goal fits easily within 250 chars
+    const shortGoal = 'Execute research step';
+    const task = await coordinator.submitScopedTask({
+      goal: shortGoal,
+      caller: admin
+    });
+
+    // 4. Step task into PLANNING then EXECUTING
+    await coordinator.step(task.id);
+    const step2 = await coordinator.step(task.id);
+    assert.equal(step2.status, 'EXECUTING');
+
+    // 5. Context was atomically omitted due to prompt budget, but task goal was preserved completely
+    const calls = harness.modelProvider.getRecordedCalls();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.args.goal, shortGoal);
+    assert.equal(calls[0]!.args.context, undefined);
+
+    // 6. Oversized goal itself throws ValidationError
+    const oversizedGoal = 'A'.repeat(300);
+    const oversizedTask = harness.hostAuthority.createTask(harness.taskRepo, {
+      goal: oversizedGoal,
+      scope: {
+        scopeType: 'WORKSPACE',
+        scopeId: 'research'
+      }
+    });
+    harness.taskRepo.updateTaskStatus(oversizedTask.id, 'SUBMITTED', 'PLANNING');
+
+    await assert.rejects(
+      async () => coordinator.step(oversizedTask.id),
+      (err: unknown) => {
+        assert.ok(err instanceof ValidationError);
+        assert.match(err.message, /Task goal prompt length/);
+        return true;
+      }
+    );
+  } finally {
+    harness.sharedDb.close();
+    if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
+  }
+});
+
+test('TaskCoordinator - Phase 7.4 Substep 4A: legacy coordinator without memory dependencies remains compatible', async () => {
+  const harness = createTestHarness();
+
+  try {
+    // Legacy coordinator without memoryService / hostAuthority
+    assert.equal(harness.coordinator.memoryService, undefined);
+    assert.equal(harness.coordinator.authorizer, undefined);
+
+    const task = await harness.coordinator.submitTask('Standard legacy workflow');
+    assert.equal(task.status, 'SUBMITTED');
+
+    // Enqueue valid plan step
+    harness.modelProvider.enqueuePlan([
+      {
+        stepOrder: 1,
+        description: 'Perform calculation',
+        toolName: 'calculate',
+        arguments: { expression: '50 * 2' },
+        expectedOutcome: 'Math completed'
+      }
+    ]);
+
+    // Run to completion
+    const completed = await harness.coordinator.runToCompletion(task.id);
+    assert.equal(completed.status, 'COMPLETED');
+
+    const calls = harness.modelProvider.getRecordedCalls();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.args.goal, 'Standard legacy workflow');
+    assert.equal(calls[0]!.args.context, undefined);
+  } finally {
+    harness.db.close();
     if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
   }
 });

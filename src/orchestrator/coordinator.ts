@@ -482,8 +482,51 @@ export class TaskCoordinator {
     // Initial plan formulation if no steps exist yet
     if (steps.length === 0) {
       const availableTools = this.toolRegistry.listDefinitions();
-      
-      const planResult = await this.modelProvider.generatePlan(task.goal, availableTools);
+
+      let planningContext: string | undefined;
+
+      if (this.memoryService && this.authorizer) {
+        const taskScope = this.verifyTaskScope(task);
+        if (taskScope !== null) {
+          const agentCaller = this.authorizer.authorizeAgent({ taskId: task.id });
+          const permissions = agentCaller.permissions instanceof Set
+            ? agentCaller.permissions
+            : new Set(agentCaller.permissions);
+          if (!permissions.has('READ')) {
+            throw new SecurityViolationError(
+              `Agent caller lacks READ permission for task '${task.id}'.`,
+              'INSUFFICIENT_PERMISSIONS'
+            );
+          }
+
+          const memoryContext = this.memoryService.buildTaskMemoryContext(agentCaller, {
+            query: task.goal,
+            taskId: task.id,
+            recordInjections: false,
+            maxBudgetChars: 4000
+          });
+
+          const compiled = this.promptCompiler.compilePlanPrompt(
+            task.goal,
+            availableTools,
+            memoryContext.serializedContext
+          );
+
+          if (!compiled.contextOmitted) {
+            planningContext = memoryContext.serializedContext;
+          }
+        } else {
+          this.promptCompiler.compilePlanPrompt(task.goal, availableTools);
+        }
+      } else {
+        this.promptCompiler.compilePlanPrompt(task.goal, availableTools);
+      }
+
+      const planResult = await this.modelProvider.generatePlan(
+        task.goal,
+        availableTools,
+        planningContext
+      );
 
       this.budgetTracker.recordUsage(
         task.id,
