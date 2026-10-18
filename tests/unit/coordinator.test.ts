@@ -638,3 +638,251 @@ test('TaskCoordinator - credentials and authentication secrets are never persist
     if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
   }
 });
+
+test('TaskCoordinator - rejects mismatched coordinator authorizer and host authority', () => {
+  const harness = createMemoryCoordHarness();
+  const differentHostAuthority = new HostMemoryAuthority({ taskRepo: harness.taskRepo });
+
+  try {
+    assert.throws(
+      () => harness.createCoordinator({
+        hostAuthority: harness.hostAuthority,
+        authorizer: differentHostAuthority.authorizer
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof ValidationError);
+        assert.match(err.message, /Coordinator authorizer must be the exact authorizer owned by its configured HostMemoryAuthority/);
+        return true;
+      }
+    );
+  } finally {
+    harness.sharedDb.close();
+    if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
+  }
+});
+
+test('TaskCoordinator - rejects mismatched MemoryService authorization configuration', () => {
+  const sharedDb = new DatabaseManager(':memory:');
+
+  try {
+    const taskRepo = new TaskRepository(sharedDb);
+    const auditRepo = new AuditRepository(sharedDb);
+    const memoryRepo = new MemoryRepository(sharedDb);
+
+    const hostAuthority1 = new HostMemoryAuthority({ taskRepo });
+    const hostAuthority2 = new HostMemoryAuthority({ taskRepo });
+
+    // 1. MemoryService itself rejects mismatched authorizer and hostAuthority
+    assert.throws(
+      () => new MemoryService({
+        memoryRepo,
+        auditRepo,
+        taskRepo,
+        hostAuthority: hostAuthority1,
+        authorizer: hostAuthority2.authorizer
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof ValidationError);
+        assert.match(err.message, /MemoryService authorizer must be the exact authorizer owned by its configured HostMemoryAuthority/);
+        return true;
+      }
+    );
+
+    // 2. Coordinator rejects MemoryService configured with a different authority than Coordinator's hostAuthority
+    const memoryService1 = new MemoryService({
+      memoryRepo,
+      auditRepo,
+      taskRepo,
+      hostAuthority: hostAuthority1
+    });
+
+    const modelProvider = new MockModelProvider();
+    const toolRegistry = new ToolRegistry();
+    const policyEngine = new PolicyEngine({ workspaceRoot: testWorkspace });
+    const approvalBroker = new ApprovalBroker(taskRepo, auditRepo);
+    const verifier = new VerificationEngine(taskRepo);
+    const budgetTracker = new TokenBudgetTracker({ db: sharedDb, maxCostPerTaskUsd: 1.0 });
+
+    assert.throws(
+      () => new TaskCoordinator({
+        taskRepo,
+        auditRepo,
+        modelProvider,
+        toolRegistry,
+        policyEngine,
+        approvalBroker,
+        verifier,
+        budgetTracker,
+        workspaceRoot: testWorkspace,
+        memoryService: memoryService1,
+        hostAuthority: hostAuthority2
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof ValidationError);
+        assert.match(err.message, /MemoryService and Coordinator must share the exact same MemoryAuthorizer instance owned by HostMemoryAuthority/);
+        return true;
+      }
+    );
+  } finally {
+    sharedDb.close();
+  }
+});
+
+test('TaskCoordinator - prevents creating a task with an attestation for a caller accepted by a different authority', async () => {
+  const idProvider1 = new MockIdentityProvider();
+  idProvider1.register('token-user-auth1', {
+    principalId: 'user-1',
+    role: 'MEMBER',
+    permittedScopes: [{ scopeType: 'WORKSPACE', scopeId: 'analytics' }]
+  });
+
+  const harness = createMemoryCoordHarness({ idProvider: idProvider1 });
+  const otherHostAuthority = new HostMemoryAuthority({ taskRepo: harness.taskRepo });
+
+  try {
+    // Caller context issued by authority 1
+    const callerAuth1 = harness.authorizer.authorizeUser({
+      credentials: 'token-user-auth1',
+      requestedScope: { scopeType: 'WORKSPACE', scopeId: 'analytics' }
+    });
+
+    // Coordinator configured strictly with authority 2 (with matching memoryService2)
+    const memoryService2 = new MemoryService({
+      memoryRepo: harness.memoryRepo,
+      auditRepo: harness.auditRepo,
+      taskRepo: harness.taskRepo,
+      hostAuthority: otherHostAuthority
+    });
+
+    const coordinatorOther = harness.createCoordinator({
+      hostAuthority: otherHostAuthority,
+      memoryService: memoryService2
+    });
+
+    // Submitting with caller from authority 1 to coordinator bound to authority 2 must fail closed
+    await assert.rejects(
+      async () => coordinatorOther.submitScopedTask('Illegitimate cross-authority task', callerAuth1),
+      (err: unknown) => {
+        assert.ok(err instanceof SecurityViolationError);
+        assert.equal((err as SecurityViolationError).violationType, 'FORGED_CALLER_CONTEXT');
+        return true;
+      }
+    );
+  } finally {
+    harness.sharedDb.close();
+    if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
+  }
+});
+
+test('TaskCoordinator - recursively sanitizes arrays and nested object/array combinations in metadata', async () => {
+  const idProvider = new MockIdentityProvider();
+  idProvider.register('token-admin', {
+    principalId: 'admin-1',
+    role: 'ADMIN',
+    permittedScopes: [{ scopeType: 'WORKSPACE', scopeId: 'research' }]
+  });
+
+  const harness = createMemoryCoordHarness({ idProvider });
+
+  try {
+    const coordinator = harness.createCoordinator();
+
+    const complexMetadata = {
+      stringArray: [
+        'Normal string item',
+        'Sensitive key AIzaSyD9876543210zyxwvutsrqponmlkjihgfed embedded in string',
+        'sk-abcdef1234567890abcdef1234567890'
+      ],
+      objectArray: [
+        {
+          password: 'secret_password_in_array',
+          token: 'token_in_array',
+          apiKey: 'key_in_array',
+          auth: 'Bearer auth_in_array',
+          regularName: 'safe_name_in_array',
+          secretText: 'Bearer supersecrettoken123'
+        },
+        {
+          itemNumber: 999,
+          isActive: true
+        }
+      ],
+      deeplyNested: {
+        matrix: [
+          [
+            {
+              credentials: { secret: 'nested_deep_secret' },
+              note: 'Matrix note with AIzaSyD9876543210zyxwvutsrqponmlkjihgfed',
+              preservedCount: 42
+            }
+          ]
+        ]
+      }
+    };
+
+    // 1. Submit legacy task with complex nested arrays
+    const legacyTask = await coordinator.submitTask('Legacy task with nested array metadata', complexMetadata);
+    const legacyMetaJson = legacyTask.metadataJson!;
+
+    // Sensitive keys stripped
+    assert.ok(!legacyMetaJson.includes('secret_password_in_array'));
+    assert.ok(!legacyMetaJson.includes('token_in_array'));
+    assert.ok(!legacyMetaJson.includes('key_in_array'));
+    assert.ok(!legacyMetaJson.includes('auth_in_array'));
+    assert.ok(!legacyMetaJson.includes('nested_deep_secret'));
+
+    // Detectable secrets in strings scrubbed
+    assert.ok(!legacyMetaJson.includes('AIzaSyD9876543210zyxwvutsrqponmlkjihgfed'));
+    assert.ok(!legacyMetaJson.includes('sk-abcdef1234567890abcdef1234567890'));
+    assert.ok(!legacyMetaJson.includes('supersecrettoken123'));
+    assert.ok(legacyMetaJson.includes('[REDACTED_GOOGLE_API_KEY]'));
+    assert.ok(legacyMetaJson.includes('[REDACTED_OPENAI_API_KEY]'));
+    assert.ok(legacyMetaJson.includes('[REDACTED_TOKEN]'));
+
+    // Legitimate metadata preserved
+    assert.ok(legacyMetaJson.includes('Normal string item'));
+    assert.ok(legacyMetaJson.includes('safe_name_in_array'));
+    assert.ok(legacyMetaJson.includes('999'));
+    assert.ok(legacyMetaJson.includes('preservedCount'));
+    assert.ok(legacyMetaJson.includes('42'));
+
+    // Audit event matches
+    const legacyEvents = harness.auditRepo.getEventsByTaskId(legacyTask.id);
+    const legacyEventJson = legacyEvents[0]!.detailsJson;
+    assert.ok(!legacyEventJson.includes('secret_password_in_array'));
+    assert.ok(!legacyEventJson.includes('AIzaSyD9876543210zyxwvutsrqponmlkjihgfed'));
+    assert.ok(!legacyEventJson.includes('sk-abcdef1234567890abcdef1234567890'));
+    assert.ok(legacyEventJson.includes('safe_name_in_array'));
+
+    // 2. Submit scoped task with complex nested arrays
+    const adminUser = harness.authorizer.authorizeUser({
+      credentials: 'token-admin',
+      requestedScope: { scopeType: 'WORKSPACE', scopeId: 'research' }
+    });
+
+    const scopedTask = await coordinator.submitScopedTask({
+      goal: 'Scoped task with nested array metadata',
+      caller: adminUser,
+      metadata: complexMetadata
+    });
+
+    const scopedMetaJson = scopedTask.metadataJson!;
+    assert.ok(!scopedMetaJson.includes('secret_password_in_array'));
+    assert.ok(!scopedMetaJson.includes('token_in_array'));
+    assert.ok(!scopedMetaJson.includes('nested_deep_secret'));
+    assert.ok(!scopedMetaJson.includes('AIzaSyD9876543210zyxwvutsrqponmlkjihgfed'));
+    assert.ok(!scopedMetaJson.includes('sk-abcdef1234567890abcdef1234567890'));
+    assert.ok(scopedMetaJson.includes('[REDACTED_GOOGLE_API_KEY]'));
+    assert.ok(scopedMetaJson.includes('safe_name_in_array'));
+    assert.ok(scopedMetaJson.includes('42'));
+
+    const scopedEvents = harness.auditRepo.getEventsByTaskId(scopedTask.id);
+    const scopedEventJson = scopedEvents[0]!.detailsJson;
+    assert.ok(!scopedEventJson.includes('secret_password_in_array'));
+    assert.ok(!scopedEventJson.includes('AIzaSyD9876543210zyxwvutsrqponmlkjihgfed'));
+    assert.ok(scopedEventJson.includes('safe_name_in_array'));
+  } finally {
+    harness.sharedDb.close();
+    if (existsSync(testWorkspace)) rmSync(testWorkspace, { recursive: true, force: true });
+  }
+});

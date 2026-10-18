@@ -32,8 +32,28 @@ import { defaultSecretScrubber } from '../model/secret-scrubber.ts';
 
 const SENSITIVE_KEY_PATTERN = /^(credentials|token|secret|password|authorization|apiKey|auth|bearer|_proof)$/i;
 
+function sanitizeValue(val: unknown): unknown {
+  if (typeof val === 'string') {
+    return defaultSecretScrubber.scrub(val);
+  }
+  if (Array.isArray(val)) {
+    return val.map((item) => sanitizeValue(item));
+  }
+  if (val && typeof val === 'object') {
+    const sanitizedObj: Record<string, unknown> = {};
+    for (const [key, propVal] of Object.entries(val as Record<string, unknown>)) {
+      if (SENSITIVE_KEY_PATTERN.test(key)) {
+        continue; // Never persist authentication credentials
+      }
+      sanitizedObj[key] = sanitizeValue(propVal);
+    }
+    return sanitizedObj;
+  }
+  return val;
+}
+
 function sanitizeMetadata(metadata?: Record<string, unknown>): Record<string, unknown> | undefined {
-  if (!metadata || typeof metadata !== 'object') {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
     return undefined;
   }
   const sanitized: Record<string, unknown> = {};
@@ -41,13 +61,7 @@ function sanitizeMetadata(metadata?: Record<string, unknown>): Record<string, un
     if (SENSITIVE_KEY_PATTERN.test(key)) {
       continue; // Never persist authentication credentials
     }
-    if (typeof val === 'string') {
-      sanitized[key] = defaultSecretScrubber.scrub(val);
-    } else if (val && typeof val === 'object' && !Array.isArray(val)) {
-      sanitized[key] = sanitizeMetadata(val as Record<string, unknown>);
-    } else {
-      sanitized[key] = val;
-    }
+    sanitized[key] = sanitizeValue(val);
   }
   return sanitized;
 }
@@ -119,6 +133,29 @@ export class TaskCoordinator {
       }
     }
 
+    // Authorization boundary consistency: coordinator must bind to exactly one trusted authorization boundary
+    if (options.authorizer && options.hostAuthority && options.authorizer !== options.hostAuthority.authorizer) {
+      throw new ValidationError(
+        'Coordinator authorizer must be the exact authorizer owned by its configured HostMemoryAuthority.'
+      );
+    }
+
+    if (options.memoryService && options.hostAuthority) {
+      if (!options.memoryService.hasAuthorizer(options.hostAuthority.authorizer)) {
+        throw new ValidationError(
+          'MemoryService and Coordinator must share the exact same MemoryAuthorizer instance owned by HostMemoryAuthority.'
+        );
+      }
+    }
+
+    if (options.memoryService && options.authorizer) {
+      if (!options.memoryService.hasAuthorizer(options.authorizer)) {
+        throw new ValidationError(
+          'MemoryService and Coordinator must share the exact same MemoryAuthorizer instance.'
+        );
+      }
+    }
+
     this.taskRepo = options.taskRepo;
     this.auditRepo = options.auditRepo;
     this.modelProvider = options.modelProvider;
@@ -138,7 +175,7 @@ export class TaskCoordinator {
     this.enableCompensation = options.enableCompensation ?? false;
     this.memoryService = options.memoryService;
     this.hostAuthority = options.hostAuthority;
-    this.authorizer = options.authorizer ?? options.hostAuthority?.authorizer;
+    this.authorizer = options.hostAuthority ? options.hostAuthority.authorizer : options.authorizer;
     this.promptCompiler = options.promptCompiler ?? new PromptCompiler();
   }
 

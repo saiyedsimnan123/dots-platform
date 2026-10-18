@@ -118,6 +118,14 @@ export class MemoryService {
       );
     }
 
+    // Authorization boundary consistency: if both authorizer and hostAuthority are supplied,
+    // authorizer must be the exact authorizer instance owned by hostAuthority.
+    if (options.authorizer && options.hostAuthority && options.authorizer !== options.hostAuthority.authorizer) {
+      throw new ValidationError(
+        'MemoryService authorizer must be the exact authorizer owned by its configured HostMemoryAuthority.'
+      );
+    }
+
     this.memoryRepo = options.memoryRepo;
     this.auditRepo = options.auditRepo;
     this.taskRepo = options.taskRepo;
@@ -133,6 +141,13 @@ export class MemoryService {
    */
   public get db(): DatabaseManager {
     return this.memoryRepo.db;
+  }
+
+  /**
+   * Validates whether this service shares the exact same authorization boundary as the provided authorizer.
+   */
+  public hasAuthorizer(authorizer: MemoryAuthorizer): boolean {
+    return this.#authorizer === authorizer;
   }
 
   // --- Public Operations ---
