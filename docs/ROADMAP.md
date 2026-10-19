@@ -1,6 +1,6 @@
 # Engineering Roadmap: Next-Generation Dots AI Platform
 
-> **Document Status**: Approved Baseline (Phase 1)  
+> **Document Status**: Approved Baseline (Phase 7 Completed)<br/>
 > **Development Model**: Incremental, Test-Driven, Phase-Gated
 
 ---
@@ -18,7 +18,7 @@ flowchart LR
     P3 --> P4["Phase 4<br/>Policy & Sandboxed Tools"]
     P4 --> P5["Phase 5<br/>Vertical Slice Integration"]
     P5 --> P6["Phase 6<br/>Multi-Step & Recovery"]
-    P6 --> P7["Phase 7<br/>Auditable Memory"]
+    P6 --> P7["Phase 7 (COMPLETED)<br/>Auditable Memory"]
     P7 --> P8["Phase 8<br/>CLI & Advanced Ops"]
 ```
 
@@ -26,7 +26,7 @@ flowchart LR
 
 ## 2. Phase-by-Phase Execution Plan
 
-### Phase 1 — Architecture & Engineering Foundation (CURRENT)
+### Phase 1 — Architecture & Engineering Foundation (COMPLETED)
 - **Objective**: Establish the system boundaries, design documentation, threat models, architectural decisions, and acceptance contracts.
 - **Key Deliverables**:
   - `README.md`
@@ -103,7 +103,8 @@ flowchart LR
 
 ---
 
-### Phase 7 — User-Controlled Long-Term Memory & Context Management
+### Phase 7 — User-Controlled Long-Term Memory & Context Management (COMPLETED)
+- **Status**: Completed (Phase 7.5 Closed)
 - **Objective**: Equip the agent with durable knowledge while maintaining complete user sovereignty and transparency.
 - **Key Deliverables**:
   - Structured memory schema (id, key, category, value, source, confidence, timestamp).
