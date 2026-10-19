@@ -18,7 +18,19 @@ import { VerificationEngine } from '../../src/verification/verifier.ts';
 import { TokenBudgetTracker } from '../../src/model/budget-tracker.ts';
 import { MockModelProvider } from '../../src/model/mock-provider.ts';
 import { TaskCoordinator } from '../../src/orchestrator/coordinator.ts';
-import { createMemoryProposeTool, MEMORY_PROPOSE_TOOL_NAME } from '../../src/tools/memory-tools.ts';
+import {
+  createMemoryProposeTool,
+  MEMORY_PROPOSE_TOOL_NAME,
+  validateProposalMetadata,
+  validateSerializedMetadataSize,
+  isPlainObject,
+  MAX_METADATA_TOP_KEYS,
+  MAX_METADATA_DEPTH,
+  MAX_METADATA_TOTAL_VALUES,
+  MAX_METADATA_ARRAY_ITEMS,
+  MAX_METADATA_STRING_LENGTH,
+  MAX_METADATA_SERIALIZED_BYTES
+} from '../../src/tools/memory-tools.ts';
 import type { ScopeIdentifier, CallerContext } from '../../src/domain/types.ts';
 import {
   ValidationError,
@@ -659,4 +671,700 @@ test('memory_propose - coordinator end-to-end task execution with scripted agent
   const activeLookup = env.memoryService.getMemoryByKey(env.adminAlpha, 'ci.build.procedure');
   assert.ok(activeLookup);
   assert.equal(activeLookup.status, 'ACTIVE');
+});
+
+// ============================================================================
+// 9. Bounded Memory Proposal Metadata Validation & Privacy
+// ============================================================================
+
+test('memory_propose - accepts valid nested metadata up to depth 5 and within all bounds', async () => {
+  const env = setupProposalTestEnv();
+  const context = {
+    taskId: env.taskAlpha.id,
+    stepId: 'step-meta-valid',
+    workspaceRoot: 'C:\\fake\\workspace'
+  };
+
+  // Valid deeply nested structure (depth 5):
+  // 1 (root) -> 2 (l2) -> 3 (l3) -> 4 (l4) -> 5 (l5)
+  const validMetadata = {
+    version: 1,
+    flags: [true, false, null],
+    notes: 'A'.repeat(4096), // string at boundary length
+    l2: {
+      num: 42.5,
+      items: Array.from({ length: 100 }, (_, i) => i), // array at boundary 100 items
+      l3: {
+        active: true,
+        l4: {
+          tag: 'deep-tag',
+          l5: {
+            deepestValue: 'nested_success'
+          }
+        }
+      }
+    }
+  };
+
+  const result = await env.toolRegistry.execute(
+    MEMORY_PROPOSE_TOOL_NAME,
+    {
+      key: 'valid.nested.meta.key',
+      content: 'Memory content with valid metadata',
+      category: 'PROJECT_FACT',
+      metadata: validMetadata
+    },
+    context,
+    env.policyEngine
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.output.success, true);
+  const proposalId = result.output.proposalId as string;
+  const persisted = env.memoryRepo.getMemoryById(proposalId, env.scopeAlpha);
+  assert.ok(persisted);
+  const parsedMeta = JSON.parse(persisted.metadataJson);
+  assert.equal(parsedMeta.version, 1);
+  assert.equal(parsedMeta.l2.l3.l4.l5.deepestValue, 'nested_success');
+  assert.equal(parsedMeta.l2.items.length, 100);
+});
+
+test('memory_propose - rejects metadata exceeding maximum nesting depth of 5', async () => {
+  const env = setupProposalTestEnv();
+  const context = {
+    taskId: env.taskAlpha.id,
+    stepId: 'step-meta-depth',
+    workspaceRoot: 'C:\\fake\\workspace'
+  };
+
+  // Nesting depth 6 with objects:
+  // 1 (root) -> 2 (l2) -> 3 (l3) -> 4 (l4) -> 5 (l5) -> 6 (l6)
+  const tooDeepObj = {
+    l2: {
+      l3: {
+        l4: {
+          l5: {
+            l6: {
+              tooDeep: true
+            }
+          }
+        }
+      }
+    }
+  };
+
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'too.deep.obj.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: tooDeepObj
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('exceeds maximum nesting depth of 5')
+  );
+
+  // Nesting depth 6 with arrays:
+  // 1 (root) -> 2 (arr1) -> 3 (arr2) -> 4 (arr3) -> 5 (arr4) -> 6 (arr5)
+  const tooDeepArr = {
+    nested: [[[[[1]]]]]
+  };
+
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'too.deep.arr.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: tooDeepArr
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('exceeds maximum nesting depth of 5')
+  );
+});
+
+test('memory_propose - rejects metadata exceeding maximum 50 top-level keys', async () => {
+  const env = setupProposalTestEnv();
+  const context = {
+    taskId: env.taskAlpha.id,
+    stepId: 'step-meta-top-keys',
+    workspaceRoot: 'C:\\fake\\workspace'
+  };
+
+  const tooManyTopKeys: Record<string, number> = {};
+  for (let i = 0; i < 51; i++) {
+    tooManyTopKeys[`k_${i}`] = i;
+  }
+
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'too.many.keys.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: tooManyTopKeys
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('exceeds maximum limit of 50 keys (51 > 50)')
+  );
+});
+
+test('memory_propose - rejects metadata exceeding maximum 500 total visited values', async () => {
+  const env = setupProposalTestEnv();
+  const context = {
+    taskId: env.taskAlpha.id,
+    stepId: 'step-meta-total-vals',
+    workspaceRoot: 'C:\\fake\\workspace'
+  };
+
+  // 6 arrays of 100 items each = 600 items + 6 array nodes + 1 root node = 607 visited values (> 500)
+  const tooManyValues: Record<string, number[]> = {};
+  for (let a = 0; a < 6; a++) {
+    tooManyValues[`arr_${a}`] = Array.from({ length: 100 }, (_, i) => i);
+  }
+
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'too.many.values.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: tooManyValues
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('exceeds maximum limit of 500 total visited values')
+  );
+});
+
+test('memory_propose - rejects metadata array exceeding maximum 100 items', async () => {
+  const env = setupProposalTestEnv();
+  const context = {
+    taskId: env.taskAlpha.id,
+    stepId: 'step-meta-arr-items',
+    workspaceRoot: 'C:\\fake\\workspace'
+  };
+
+  const tooLongArray = {
+    list: Array.from({ length: 101 }, (_, i) => i)
+  };
+
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'too.long.arr.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: tooLongArray
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('exceeds maximum limit of 100 items (101 > 100)')
+  );
+});
+
+test('memory_propose - rejects metadata string exceeding maximum 4,096 characters', async () => {
+  const env = setupProposalTestEnv();
+  const context = {
+    taskId: env.taskAlpha.id,
+    stepId: 'step-meta-str-len',
+    workspaceRoot: 'C:\\fake\\workspace'
+  };
+
+  const tooLongString = {
+    text: 'x'.repeat(4097)
+  };
+
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'too.long.str.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: tooLongString
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('exceeds maximum limit of 4096 characters (4097 > 4096)')
+  );
+});
+
+test('memory_propose - rejects serialized metadata exceeding maximum 16 KiB after sanitization', async () => {
+  const env = setupProposalTestEnv();
+  const context = {
+    taskId: env.taskAlpha.id,
+    stepId: 'step-meta-bytes',
+    workspaceRoot: 'C:\\fake\\workspace'
+  };
+
+  // 5 strings of 3,500 characters each = ~17.5 KiB serialized (> 16 KiB / 16384 bytes)
+  const oversizedSerialized = {
+    f1: 'a'.repeat(3500),
+    f2: 'b'.repeat(3500),
+    f3: 'c'.repeat(3500),
+    f4: 'd'.repeat(3500),
+    f5: 'e'.repeat(3500)
+  };
+
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'too.many.bytes.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: oversizedSerialized
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('exceeds maximum limit of 16 KiB (16384 bytes)')
+  );
+});
+
+test('memory_propose - rejects cyclic structures safely with ValidationError and zero recursion overflow', async () => {
+  const env = setupProposalTestEnv();
+  const context = {
+    taskId: env.taskAlpha.id,
+    stepId: 'step-meta-cycle',
+    workspaceRoot: 'C:\\fake\\workspace'
+  };
+
+  // Direct cyclic reference in object
+  const cycleObj: Record<string, unknown> = { name: 'self_cycle' };
+  cycleObj.self = cycleObj;
+
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'cycle.obj.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: cycleObj
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('cyclic references')
+  );
+
+  // Indirect cyclic reference (a -> b -> a)
+  const cycleA: Record<string, unknown> = { name: 'cycle_a' };
+  const cycleB: Record<string, unknown> = { name: 'cycle_b', refA: cycleA };
+  cycleA.refB = cycleB;
+
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'cycle.indirect.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: { a: cycleA }
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('cyclic references')
+  );
+
+  // Cyclic reference in array
+  const cycleArr: unknown[] = ['start'];
+  cycleArr.push(cycleArr);
+
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'cycle.arr.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: { list: cycleArr }
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('cyclic references')
+  );
+});
+
+test('memory_propose - rejects non-plain objects safely with ValidationError', async () => {
+  const env = setupProposalTestEnv();
+  const context = {
+    taskId: env.taskAlpha.id,
+    stepId: 'step-meta-nonplain',
+    workspaceRoot: 'C:\\fake\\workspace'
+  };
+
+  // Top-level Date instance
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'nonplain.top.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: new Date() as any
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('plain object')
+  );
+
+  // Nested Date instance
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'nonplain.nested.date.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: { timestamp: new Date() }
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('non-plain object')
+  );
+
+  // Nested RegExp instance
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'nonplain.nested.regex.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: { pattern: /regex/ }
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('non-plain object')
+  );
+
+  // Nested Map instance
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'nonplain.nested.map.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: { mapping: new Map() }
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('non-plain object')
+  );
+
+  // Custom class instance
+  class CustomMeta {
+    prop = 123;
+  }
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'nonplain.nested.class.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: { instance: new CustomMeta() }
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('non-plain object')
+  );
+});
+
+test('memory_propose - rejects unsupported primitive types safely with ValidationError', async () => {
+  const env = setupProposalTestEnv();
+  const context = {
+    taskId: env.taskAlpha.id,
+    stepId: 'step-meta-unsupported-types',
+    workspaceRoot: 'C:\\fake\\workspace'
+  };
+
+  // undefined value
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'unsupported.undefined.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: { field: undefined }
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('unsupported undefined value')
+  );
+
+  // symbol value
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'unsupported.symbol.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: { field: Symbol('token') }
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('unsupported symbol value')
+  );
+
+  // bigint value
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'unsupported.bigint.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: { field: 9007199254740993n }
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('unsupported bigint value')
+  );
+
+  // function value
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'unsupported.func.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: { handler: () => {} }
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('unsupported function value')
+  );
+
+  // NaN value
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'unsupported.nan.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: { num: NaN }
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('unsupported non-finite number')
+  );
+
+  // Infinity value
+  await assert.rejects(
+    () => env.toolRegistry.execute(
+      MEMORY_PROPOSE_TOOL_NAME,
+      {
+        key: 'unsupported.infinity.key',
+        content: 'Content',
+        category: 'PROJECT_FACT',
+        metadata: { num: Infinity }
+      },
+      context,
+      env.policyEngine
+    ),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('unsupported non-finite number')
+  );
+});
+
+test('memory_propose - preserves secret scrubbing in nested metadata and respects error privacy', async () => {
+  const env = setupProposalTestEnv();
+  const context = {
+    taskId: env.taskAlpha.id,
+    stepId: 'step-meta-secret-scrubbing',
+    workspaceRoot: 'C:\\fake\\workspace'
+  };
+
+  const passwordSecret = 'password_secret_123456';
+  const apiTokenSecret = 'api_token_secret_789012';
+  const githubSecret = 'ghp_111111111122222222223333333333444444';
+  const bearerSecret = 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9token999';
+
+  const rawMetadataWithSecret = {
+    normalConfig: 'standard-value',
+    nestedSection: {
+      password: passwordSecret, // sensitive key -> must be stripped
+      apiToken: apiTokenSecret, // sensitive key -> must be stripped
+      safeNote: `User authorized with ${githubSecret} and ${bearerSecret}` // sensitive string values -> scrubbed
+    }
+  };
+
+  const res = await env.toolRegistry.execute(
+    MEMORY_PROPOSE_TOOL_NAME,
+    {
+      key: 'nested.scrubbed.meta.key',
+      content: 'Proposing memory with nested credentials in metadata',
+      category: 'PROJECT_FACT',
+      metadata: rawMetadataWithSecret
+    },
+    context,
+    env.policyEngine
+  );
+
+  assert.equal(res.exitCode, 0);
+  const proposalId = res.output.proposalId as string;
+  const memoryRow = env.memoryRepo.getMemoryById(proposalId, env.scopeAlpha);
+  assert.ok(memoryRow);
+
+  const persistedMetadata = JSON.parse(memoryRow.metadataJson);
+  assert.equal(persistedMetadata.normalConfig, 'standard-value');
+  assert.equal('password' in persistedMetadata.nestedSection, false, 'password key must be stripped');
+  assert.equal('apiToken' in persistedMetadata.nestedSection, false, 'apiToken key must be stripped');
+
+  // Verify secret keys and raw tokens never appear in persisted metadata JSON
+  assert.equal(memoryRow.metadataJson.includes(passwordSecret), false, 'Password secret must not appear');
+  assert.equal(memoryRow.metadataJson.includes(apiTokenSecret), false, 'API token secret must not appear');
+  assert.equal(memoryRow.metadataJson.includes(githubSecret), false, 'GitHub token must be scrubbed');
+  assert.equal(memoryRow.metadataJson.includes('token999'), false, 'Bearer token body must be scrubbed');
+
+  // Verify scrubber redaction tags exist in scrubbed note
+  assert.ok(persistedMetadata.nestedSection.safeNote.includes('[REDACTED_GITHUB_TOKEN]'));
+  assert.ok(persistedMetadata.nestedSection.safeNote.includes('Bearer [REDACTED_TOKEN]'));
+});
+
+test('validateProposalMetadata & validateSerializedMetadataSize - direct boundary and edge cases', () => {
+  // 1. isPlainObject edge cases
+  assert.equal(isPlainObject({}), true);
+  assert.equal(isPlainObject(Object.create(null)), true);
+  assert.equal(isPlainObject(null), false);
+  assert.equal(isPlainObject([]), false);
+  assert.equal(isPlainObject('string'), false);
+  assert.equal(isPlainObject(123), false);
+  assert.equal(isPlainObject(true), false);
+  assert.equal(isPlainObject(new Date()), false);
+  assert.equal(isPlainObject(/regex/), false);
+  assert.equal(isPlainObject(new Map()), false);
+  assert.equal(isPlainObject(new Set()), false);
+
+  // 2. validateProposalMetadata: non-plain object root throws
+  assert.throws(
+    () => validateProposalMetadata(null),
+    (err: unknown) => err instanceof ValidationError && err.message === 'Memory metadata must be a plain object.'
+  );
+  assert.throws(
+    () => validateProposalMetadata(['array']),
+    (err: unknown) => err instanceof ValidationError && err.message === 'Memory metadata must be a plain object.'
+  );
+  assert.throws(
+    () => validateProposalMetadata('primitive'),
+    (err: unknown) => err instanceof ValidationError && err.message === 'Memory metadata must be a plain object.'
+  );
+
+  // 3. Exact boundary: 50 top-level keys passes, 51 throws
+  const top50: Record<string, number> = {};
+  for (let i = 0; i < 50; i++) top50[`k_${i}`] = i;
+  assert.doesNotThrow(() => validateProposalMetadata(top50));
+  top50['k_50'] = 50;
+  assert.throws(
+    () => validateProposalMetadata(top50),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('51 > 50')
+  );
+
+  // 4. Exact boundary: depth 5 passes, depth 6 throws
+  const depth5 = { a: { b: { c: { d: { e: 'val' } } } } };
+  assert.doesNotThrow(() => validateProposalMetadata(depth5));
+  const depth6 = { a: { b: { c: { d: { e: { f: 'val' } } } } } };
+  assert.throws(
+    () => validateProposalMetadata(depth6),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('maximum nesting depth of 5')
+  );
+
+  // 5. Exact boundary: string length 4096 passes, 4097 throws
+  assert.doesNotThrow(() => validateProposalMetadata({ s: 'x'.repeat(4096) }));
+  assert.throws(
+    () => validateProposalMetadata({ s: 'x'.repeat(4097) }),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('4097 > 4096')
+  );
+
+  // 6. Object key length > 4096 throws
+  const longKeyObj: Record<string, string> = {};
+  longKeyObj['k'.repeat(4097)] = 'val';
+  assert.throws(
+    () => validateProposalMetadata(longKeyObj),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('exceeds maximum limit of 4096 characters')
+  );
+
+  // 7. Exact boundary: array length 100 passes, 101 throws
+  assert.doesNotThrow(() => validateProposalMetadata({ arr: Array.from({ length: 100 }, (_, i) => i) }));
+  assert.throws(
+    () => validateProposalMetadata({ arr: Array.from({ length: 101 }, (_, i) => i) }),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('101 > 100')
+  );
+
+  // 8. DAG (shared reference across separate branches) is allowed and does not falsely trigger cycle error
+  const sharedLeaf = { leaf: 'valid' };
+  const dag = { branchA: sharedLeaf, branchB: sharedLeaf };
+  assert.doesNotThrow(() => validateProposalMetadata(dag));
+
+  // 9. Object with throwing getter safely produces ValidationError without crashing
+  const badObject = {};
+  Object.defineProperty(badObject, 'explosiveProp', {
+    get() {
+      throw new Error('Getter failed intentionally');
+    },
+    enumerable: true
+  });
+  assert.throws(
+    () => validateProposalMetadata(badObject),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('unreadable properties')
+  );
+
+  // 10. validateSerializedMetadataSize boundary: <= 16384 bytes passes, > 16384 bytes throws
+  // Empty object is 2 bytes "{}"
+  assert.doesNotThrow(() => validateSerializedMetadataSize({}));
+  // String of length that serialized is exactly 16384 bytes:
+  // {"k":""} -> 8 bytes boilerplate + 16376 chars = 16384 bytes
+  const exact16KiB = { k: 'y'.repeat(16376) };
+  assert.equal(Buffer.byteLength(JSON.stringify(exact16KiB), 'utf8'), 16384);
+  assert.doesNotThrow(() => validateSerializedMetadataSize(exact16KiB));
+
+  const over16KiB = { k: 'y'.repeat(16377) };
+  assert.equal(Buffer.byteLength(JSON.stringify(over16KiB), 'utf8'), 16385);
+  assert.throws(
+    () => validateSerializedMetadataSize(over16KiB),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('16385 > 16384')
+  );
+
+  // 11. Error message privacy guarantee:
+  // Thrown error messages never contain raw property values or sensitive tokens
+  try {
+    validateProposalMetadata({ mySecret: 'TOP_SECRET_PROPRIETARY_DATA_XYZ_999' });
+  } catch (err: any) {
+    assert.equal(err.message.includes('TOP_SECRET_PROPRIETARY_DATA_XYZ_999'), false);
+  }
 });

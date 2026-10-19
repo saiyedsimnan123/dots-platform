@@ -32,6 +32,13 @@ import { defaultSecretScrubber } from '../model/secret-scrubber.ts';
 
 export const MEMORY_PROPOSE_TOOL_NAME = 'memory_propose';
 
+export const MAX_METADATA_TOP_KEYS = 50;
+export const MAX_METADATA_DEPTH = 5;
+export const MAX_METADATA_TOTAL_VALUES = 500;
+export const MAX_METADATA_ARRAY_ITEMS = 100;
+export const MAX_METADATA_STRING_LENGTH = 4096;
+export const MAX_METADATA_SERIALIZED_BYTES = 16384; // 16 KiB
+
 const VALID_CATEGORIES: ReadonlySet<MemoryCategory> = new Set([
   'USER_PREFERENCE',
   'PROJECT_FACT',
@@ -122,6 +129,161 @@ function sanitizeProposalMetadata(metadata?: Record<string, unknown>): Record<st
   return sanitized;
 }
 
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(value);
+  return proto === null || proto === Object.prototype;
+}
+
+export function validateProposalMetadata(metadata: unknown): void {
+  if (!isPlainObject(metadata)) {
+    throw new ValidationError('Memory metadata must be a plain object.');
+  }
+
+  let topEntries: [string, unknown][];
+  try {
+    topEntries = Object.entries(metadata);
+  } catch {
+    throw new ValidationError('Memory metadata contains unreadable properties.');
+  }
+
+  if (topEntries.length > MAX_METADATA_TOP_KEYS) {
+    throw new ValidationError(
+      `Memory metadata exceeds maximum limit of ${MAX_METADATA_TOP_KEYS} keys (${topEntries.length} > ${MAX_METADATA_TOP_KEYS}).`
+    );
+  }
+
+  let visitedCount = 1; // Root object counts as 1 visited value
+  const activeAncestors = new Set<object>();
+  activeAncestors.add(metadata);
+
+  function validateNode(val: unknown, depth: number): void {
+    visitedCount++;
+    if (visitedCount > MAX_METADATA_TOTAL_VALUES) {
+      throw new ValidationError(
+        `Memory metadata exceeds maximum limit of ${MAX_METADATA_TOTAL_VALUES} total visited values.`
+      );
+    }
+
+    if (val === null || typeof val === 'boolean') {
+      return;
+    }
+
+    if (typeof val === 'number') {
+      if (!Number.isFinite(val)) {
+        throw new ValidationError('Memory metadata contains unsupported non-finite number.');
+      }
+      return;
+    }
+
+    if (typeof val === 'string') {
+      if (val.length > MAX_METADATA_STRING_LENGTH) {
+        throw new ValidationError(
+          `Memory metadata string exceeds maximum limit of ${MAX_METADATA_STRING_LENGTH} characters (${val.length} > ${MAX_METADATA_STRING_LENGTH}).`
+        );
+      }
+      return;
+    }
+
+    if (typeof val === 'undefined') {
+      throw new ValidationError('Memory metadata contains unsupported undefined value.');
+    }
+
+    if (typeof val === 'symbol') {
+      throw new ValidationError('Memory metadata contains unsupported symbol value.');
+    }
+
+    if (typeof val === 'bigint') {
+      throw new ValidationError('Memory metadata contains unsupported bigint value.');
+    }
+
+    if (typeof val === 'function') {
+      throw new ValidationError('Memory metadata contains unsupported function value.');
+    }
+
+    if (typeof val === 'object') {
+      if (activeAncestors.has(val)) {
+        throw new ValidationError('Memory metadata contains cyclic references.');
+      }
+
+      if (depth > MAX_METADATA_DEPTH) {
+        throw new ValidationError(
+          `Memory metadata exceeds maximum nesting depth of ${MAX_METADATA_DEPTH}.`
+        );
+      }
+
+      if (Array.isArray(val)) {
+        if (val.length > MAX_METADATA_ARRAY_ITEMS) {
+          throw new ValidationError(
+            `Memory metadata array exceeds maximum limit of ${MAX_METADATA_ARRAY_ITEMS} items (${val.length} > ${MAX_METADATA_ARRAY_ITEMS}).`
+          );
+        }
+        activeAncestors.add(val);
+        try {
+          for (const item of val) {
+            validateNode(item, depth + 1);
+          }
+        } finally {
+          activeAncestors.delete(val);
+        }
+        return;
+      }
+
+      if (isPlainObject(val)) {
+        activeAncestors.add(val);
+        try {
+          let childEntries: [string, unknown][];
+          try {
+            childEntries = Object.entries(val);
+          } catch {
+            throw new ValidationError('Memory metadata contains unreadable properties.');
+          }
+          for (const [propKey, propVal] of childEntries) {
+            if (typeof propKey !== 'string' || propKey.length > MAX_METADATA_STRING_LENGTH) {
+              throw new ValidationError(
+                `Memory metadata key exceeds maximum limit of ${MAX_METADATA_STRING_LENGTH} characters.`
+              );
+            }
+            validateNode(propVal, depth + 1);
+          }
+        } finally {
+          activeAncestors.delete(val);
+        }
+        return;
+      }
+
+      throw new ValidationError('Memory metadata contains non-plain object.');
+    }
+
+    throw new ValidationError('Memory metadata contains unsupported value.');
+  }
+
+  try {
+    for (const [key, val] of topEntries) {
+      if (typeof key !== 'string' || key.length > MAX_METADATA_STRING_LENGTH) {
+        throw new ValidationError(
+          `Memory metadata key exceeds maximum limit of ${MAX_METADATA_STRING_LENGTH} characters.`
+        );
+      }
+      validateNode(val, 2);
+    }
+  } finally {
+    activeAncestors.delete(metadata);
+  }
+}
+
+export function validateSerializedMetadataSize(sanitized: Record<string, unknown>): void {
+  const json = JSON.stringify(sanitized);
+  const byteLength = Buffer.byteLength(json, 'utf8');
+  if (byteLength > MAX_METADATA_SERIALIZED_BYTES) {
+    throw new ValidationError(
+      `Serialized memory metadata exceeds maximum limit of 16 KiB (16384 bytes) (${byteLength} > ${MAX_METADATA_SERIALIZED_BYTES}).`
+    );
+  }
+}
+
 /**
  * Creates a registered tool definition and execution handler for agent memory proposal.
  */
@@ -164,7 +326,7 @@ export function createMemoryProposeTool(
         },
         metadata: {
           type: 'object',
-          description: 'Optional key-value metadata dictionary (max 50 keys).'
+          description: 'Optional key-value metadata dictionary (max 50 top-level keys, max nesting depth 5, max 16 KiB serialized).'
         }
       },
       required: ['key', 'content', 'category']
@@ -260,14 +422,11 @@ export function createMemoryProposeTool(
       // Metadata validation
       let metadata: Record<string, unknown> | undefined;
       if (rawArgs.metadata !== undefined) {
-        if (!rawArgs.metadata || typeof rawArgs.metadata !== 'object' || Array.isArray(rawArgs.metadata)) {
-          throw new ValidationError('Memory metadata must be a plain object.');
-        }
-        const entries = Object.entries(rawArgs.metadata);
-        if (entries.length > 50) {
-          throw new ValidationError(`Memory metadata exceeds maximum limit of 50 keys (${entries.length} > 50).`);
-        }
+        validateProposalMetadata(rawArgs.metadata);
         metadata = sanitizeProposalMetadata(rawArgs.metadata as Record<string, unknown>);
+        if (metadata !== undefined) {
+          validateSerializedMetadataSize(metadata);
+        }
       }
 
       // Status gate: Reject any attempt to propose directly as ACTIVE
