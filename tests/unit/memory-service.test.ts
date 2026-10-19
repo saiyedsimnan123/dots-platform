@@ -1079,7 +1079,7 @@ test('MemoryService - Audit privacy guarantee: raw memory content is never logge
     assert.ok(eventTypes.has('MEMORY_ARCHIVED'));
     assert.ok(eventTypes.has('MEMORY_DELETED'));
 
-    // STRICT PRIVACY ASSERTION: Neither secret ever appears anywhere in any audit detailsJson
+    // STRICT PRIVACY ASSERTION: Neither secret nor keys ever appear anywhere in any audit detailsJson
     for (const event of allEvents) {
       assert.equal(
         event.detailsJson.includes(sensitiveUserSecret),
@@ -1096,6 +1096,21 @@ test('MemoryService - Audit privacy guarantee: raw memory content is never logge
         false,
         `Audit event ${event.eventType} leaked sensitive agent content in detailsJson!`
       );
+      assert.equal(
+        event.detailsJson.includes('user.password.pattern'),
+        false,
+        `Audit event ${event.eventType} leaked user memory key in detailsJson!`
+      );
+      assert.equal(
+        event.detailsJson.includes('model.weight.config'),
+        false,
+        `Audit event ${event.eventType} leaked agent proposed key in detailsJson!`
+      );
+      const details = JSON.parse(event.detailsJson);
+      assert.equal('key' in details, false, `Audit event ${event.eventType} must not contain 'key' property`);
+      assert.equal('content' in details, false, `Audit event ${event.eventType} must not contain 'content' property`);
+      assert.equal('tags' in details, false, `Audit event ${event.eventType} must not contain 'tags' property`);
+      assert.equal('metadata' in details, false, `Audit event ${event.eventType} must not contain 'metadata' property`);
     }
   } finally {
     db.close();
@@ -1973,6 +1988,125 @@ test('MemoryService.decideProposal - audit privacy: MEMORY_PROPOSAL_DECIDED neve
     assert.equal(event.detailsJson.includes(distinctTag2), false, 'Audit event leaked tag 2');
     assert.equal(event.detailsJson.includes(distinctMetaVal), false, 'Audit event leaked metadata value');
     assert.equal(event.detailsJson.includes(distinctMetaFlag), false, 'Audit event leaked metadata flag');
+  } finally {
+    db.close();
+  }
+});
+
+test('MemoryService - audit privacy: MEMORY_CREATED, MEMORY_UPDATED, MEMORY_ARCHIVED, MEMORY_DELETED, and MEMORY_RETRIEVED never leak key, content, tags, or metadata', () => {
+  const { db, hostAuthority, authorizer, memoryService, taskRepo, auditRepo, workspaceA } = setupServiceTest();
+
+  try {
+    const task = hostAuthority.createTask(taskRepo, {
+      goal: 'Audit privacy verification task for memory lifecycle events',
+      scope: workspaceA
+    });
+    const adminCaller = authorizer.authorizeUser({
+      credentials: 'token-admin-alpha',
+      requestedScope: workspaceA,
+      taskId: task.id
+    });
+
+    const distinctKey = 'SENTINEL_ALPHA_PRIVACY_KEY_12345';
+    const distinctContent = 'SENTINEL_BRAVO_SECRET_CONTENT_67890';
+    const distinctUpdatedContent = 'SENTINEL_CHARLIE_UPDATED_CONTENT_11223';
+    const distinctTag1 = 'SENTINEL_TAG_DELTA_44556';
+    const distinctTag2 = 'SENTINEL_TAG_ECHO_77889';
+    const distinctMetaVal = 'SENTINEL_META_FOXTROT_99001';
+    const distinctMetaFlag = 'SENTINEL_FLAG_GOLF_22334';
+
+    // 1. Create active memory -> MEMORY_CREATED
+    const mem = memoryService.createMemory(adminCaller, {
+      key: distinctKey,
+      content: distinctContent,
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceA.scopeId,
+      tags: [distinctTag1, distinctTag2],
+      metadata: { val: distinctMetaVal, flag: distinctMetaFlag }
+    });
+    assert.equal(mem.status, 'ACTIVE');
+
+    // 2. Read memory by ID -> MEMORY_RETRIEVED
+    memoryService.getMemoryById(adminCaller, mem.id);
+
+    // 3. Read memory by key -> MEMORY_RETRIEVED
+    memoryService.getMemoryByKey(adminCaller, distinctKey);
+
+    // 4. Update memory -> MEMORY_UPDATED
+    memoryService.updateMemory(adminCaller, mem.id, {
+      content: distinctUpdatedContent,
+      tags: [distinctTag1],
+      metadata: { val: distinctMetaVal }
+    });
+
+    // 5. Archive memory -> MEMORY_ARCHIVED
+    memoryService.archiveMemory(adminCaller, mem.id);
+
+    // 6. Delete memory -> MEMORY_DELETED
+    memoryService.deleteMemory(adminCaller, mem.id);
+
+    // 7. Inspect all audit events for the task
+    const allEvents = auditRepo.getEventsByTaskId(task.id);
+    const eventTypes = allEvents.map((e) => e.eventType);
+
+    assert.ok(eventTypes.includes('MEMORY_CREATED'), 'Must record MEMORY_CREATED');
+    assert.ok(eventTypes.includes('MEMORY_RETRIEVED'), 'Must record MEMORY_RETRIEVED');
+    assert.ok(eventTypes.includes('MEMORY_UPDATED'), 'Must record MEMORY_UPDATED');
+    assert.ok(eventTypes.includes('MEMORY_ARCHIVED'), 'Must record MEMORY_ARCHIVED');
+    assert.ok(eventTypes.includes('MEMORY_DELETED'), 'Must record MEMORY_DELETED');
+
+    const sensitiveSentinels = [
+      distinctKey,
+      distinctContent,
+      distinctUpdatedContent,
+      distinctTag1,
+      distinctTag2,
+      distinctMetaVal,
+      distinctMetaFlag
+    ];
+
+    for (const event of allEvents) {
+      const details = JSON.parse(event.detailsJson);
+
+      // Verify forbidden sensitive properties are absent from parsed details
+      assert.equal('key' in details, false, `Event ${event.eventType} must not have 'key' property`);
+      assert.equal('content' in details, false, `Event ${event.eventType} must not have 'content' property`);
+      assert.equal('tags' in details, false, `Event ${event.eventType} must not have 'tags' property`);
+      assert.equal('metadata' in details, false, `Event ${event.eventType} must not have 'metadata' property`);
+
+      // Verify no sensitive sentinel string appears in the serialized detailsJson
+      for (const sentinel of sensitiveSentinels) {
+        assert.equal(
+          event.detailsJson.includes(sentinel),
+          false,
+          `Event ${event.eventType} leaked sensitive sentinel string '${sentinel}' in detailsJson!`
+        );
+      }
+    }
+
+    // Verify safe operational metadata in specific events
+    const createdEvent = allEvents.find((e) => e.eventType === 'MEMORY_CREATED')!;
+    const createdDetails = JSON.parse(createdEvent.detailsJson);
+    assert.equal(createdDetails.memoryId, mem.id);
+    assert.equal(createdDetails.category, 'PROJECT_FACT');
+    assert.equal(createdDetails.status, 'ACTIVE');
+
+    const updatedEvent = allEvents.find((e) => e.eventType === 'MEMORY_UPDATED')!;
+    const updatedDetails = JSON.parse(updatedEvent.detailsJson);
+    assert.equal(updatedDetails.memoryId, mem.id);
+    assert.equal(updatedDetails.category, 'PROJECT_FACT');
+    assert.deepEqual(updatedDetails.updatedFields, ['content', 'tags', 'metadata']);
+
+    const archivedEvent = allEvents.find((e) => e.eventType === 'MEMORY_ARCHIVED')!;
+    const archivedDetails = JSON.parse(archivedEvent.detailsJson);
+    assert.equal(archivedDetails.memoryId, mem.id);
+    assert.equal(archivedDetails.category, 'PROJECT_FACT');
+
+    const deletedEvent = allEvents.find((e) => e.eventType === 'MEMORY_DELETED')!;
+    const deletedDetails = JSON.parse(deletedEvent.detailsJson);
+    assert.equal(deletedDetails.memoryId, mem.id);
+    assert.equal(deletedDetails.category, 'PROJECT_FACT');
   } finally {
     db.close();
   }

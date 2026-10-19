@@ -254,7 +254,6 @@ export class MemoryService {
       if (memory) {
         this.audit(caller, 'MEMORY_RETRIEVED', {
           memoryId: memory.id,
-          key: memory.key,
           category: memory.category,
           scopeType: memory.scopeType,
           scopeId: memory.scopeId
@@ -286,7 +285,6 @@ export class MemoryService {
     if (memory) {
       this.audit(caller, 'MEMORY_RETRIEVED', {
         memoryId: memory.id,
-        key: memory.key,
         category: memory.category,
         scopeType: memory.scopeType,
         scopeId: memory.scopeId
@@ -363,7 +361,6 @@ export class MemoryService {
       if (status === 'ACTIVE') {
         this.audit(caller, 'MEMORY_CREATED', {
           memoryId: memory.id,
-          key: memory.key,
           category: memory.category,
           scopeType: memory.scopeType,
           scopeId: memory.scopeId,
@@ -521,7 +518,7 @@ export class MemoryService {
       // Mandatory audit write for state update
       this.audit(caller, 'MEMORY_UPDATED', {
         memoryId: updated.id,
-        key: updated.key,
+        category: updated.category,
         scopeType: updated.scopeType,
         scopeId: updated.scopeId,
         updatedFields: Object.keys(input)
@@ -616,7 +613,7 @@ export class MemoryService {
       const archived = this.memoryRepo.archiveMemory(id, caller.scope);
       this.audit(caller, 'MEMORY_ARCHIVED', {
         memoryId: archived.id,
-        key: archived.key,
+        category: archived.category,
         scopeType: archived.scopeType,
         scopeId: archived.scopeId
       }, true);
@@ -700,7 +697,7 @@ export class MemoryService {
       // Mandatory audit write for hard deletion
       this.audit(caller, 'MEMORY_DELETED', {
         memoryId: existing.id,
-        key: existing.key,
+        category: existing.category,
         scopeType: existing.scopeType,
         scopeId: existing.scopeId
       }, true);
