@@ -29,6 +29,7 @@ import { VerificationEngine } from '../../src/verification/verifier.ts';
 import { TokenBudgetTracker } from '../../src/model/budget-tracker.ts';
 import { MEMORY_PROPOSE_TOOL_NAME } from '../../src/tools/memory-tools.ts';
 import { verifyBundleChecksum } from '../../src/memory/canonical-json.ts';
+import { isMemoryAuditEvent } from '../../src/storage/audit-policy.ts';
 import {
   ValidationError,
   SecurityViolationError,
@@ -64,6 +65,9 @@ test('Phase 7.5 Integration - Full memory lifecycle: proposal, isolation, human 
   const sentinelKey = 'infra.db.cluster_endpoint';
   const sentinelMarker = 'UNIQUE_TEST_SENTINEL_PAYLOAD_CLUSTER_9941';
   const sentinelContent = `Primary backend cluster endpoint is https://db-cluster-9941.internal.net:5432 with ${sentinelMarker}`;
+  const sentinelTag = 'SENTINEL_TAG_CLUSTER_DISCOVERY_9941';
+  const sentinelMetaKey = 'sentinelSecretDiagnostic';
+  const sentinelMetaVal = 'SENTINEL_METADATA_SECRET_TOKEN_9941';
 
   try {
     testDir = mkdtempSync(join(tmpdir(), 'dots-p75-lifecycle-'));
@@ -153,7 +157,11 @@ test('Phase 7.5 Integration - Full memory lifecycle: proposal, isolation, human 
           key: sentinelKey,
           content: sentinelContent,
           category: 'PROJECT_FACT',
-          tags: ['database', 'cluster', 'endpoint'],
+          tags: ['database', 'cluster', sentinelTag],
+          metadata: {
+            clusterRegion: 'us-east-1',
+            [sentinelMetaKey]: sentinelMetaVal
+          },
           priority: 85
         },
         expectedOutcome: 'Proposal registered with pending approval'
@@ -393,14 +401,14 @@ test('Phase 7.5 Integration - Full memory lifecycle: proposal, isolation, human 
     assert.ok(eventTypesPersisted.has('MEMORY_ARCHIVED'), 'Audit log must record MEMORY_ARCHIVED');
     assert.ok(eventTypesPersisted.has('MEMORIES_PURGED'), 'Audit log must record MEMORIES_PURGED');
 
-    // Privacy Guarantee: zero credentials leaked across any audit row, and zero raw content/keys in memory lifecycle audit rows
+    // Privacy Guarantee: zero credentials leaked across any audit row, and zero raw content/keys/tags/metadata in memory lifecycle audit rows
     for (const row of allAuditRows) {
       assert.equal(
         row.details_json.includes(sentinelToken),
         false,
         `Audit row ${row.id} (${row.event_type}) leaked auth token credential: ${row.details_json}`
       );
-      if (row.event_type.startsWith('MEMORY')) {
+      if (isMemoryAuditEvent(row.event_type)) {
         assert.equal(
           row.details_json.includes(sentinelMarker),
           false,
@@ -411,8 +419,38 @@ test('Phase 7.5 Integration - Full memory lifecycle: proposal, isolation, human 
           false,
           `Memory audit row ${row.id} (${row.event_type}) leaked raw memory key: ${row.details_json}`
         );
+        assert.equal(
+          row.details_json.includes(sentinelTag),
+          false,
+          `Memory audit row ${row.id} (${row.event_type}) leaked sentinel tag: ${row.details_json}`
+        );
+        assert.equal(
+          row.details_json.includes(sentinelMetaVal),
+          false,
+          `Memory audit row ${row.id} (${row.event_type}) leaked sentinel metadata value: ${row.details_json}`
+        );
+        assert.equal(
+          row.details_json.includes(sentinelMetaKey),
+          false,
+          `Memory audit row ${row.id} (${row.event_type}) leaked sentinel metadata property key: ${row.details_json}`
+        );
       }
     }
+
+    // Explicitly verify the MEMORIES_PURGED audit event structure and privacy
+    const purgeEvent = allAuditRows.find((r) => r.event_type === 'MEMORIES_PURGED');
+    assert.ok(purgeEvent, 'MEMORIES_PURGED audit event must exist in database');
+    assert.equal(purgeEvent.details_json.includes(sentinelMarker), false);
+    assert.equal(purgeEvent.details_json.includes(sentinelKey), false);
+    assert.equal(purgeEvent.details_json.includes(sentinelTag), false);
+    assert.equal(purgeEvent.details_json.includes(sentinelMetaVal), false);
+    assert.equal(purgeEvent.details_json.includes(sentinelMetaKey), false);
+    assert.equal(purgeEvent.details_json.includes(sentinelToken), false);
+    const parsedPurge = JSON.parse(purgeEvent.details_json);
+    assert.equal(parsedPurge.purgedCount, 1);
+    assert.equal(parsedPurge.scopeType, 'WORKSPACE');
+    assert.equal(parsedPurge.scopeId, testScopeId);
+    assert.ok(parsedPurge.cutoffTimestamp);
 
     // -------------------------------------------------------------------------
     // Sequence 10: Close and reopen database (Cold-Start Persistence Verification)
@@ -425,14 +463,34 @@ test('Phase 7.5 Integration - Full memory lifecycle: proposal, isolation, human 
     const auditRepo2 = new AuditRepository(db2);
     const memoryRepo2 = new MemoryRepository(db2);
 
-    // Verify task states persisted
+    // Verify all four task states and plan steps persisted intact
     const persistedTask1 = taskRepo2.getTaskById(task1.id);
-    assert.ok(persistedTask1);
+    assert.ok(persistedTask1, 'Task 1 must exist after restart');
     assert.equal(persistedTask1.status, 'COMPLETED');
+    const stepsTask1 = taskRepo2.getStepsByTaskId(task1.id);
+    assert.equal(stepsTask1.length, 1);
+    assert.equal(stepsTask1[0]!.status, 'VERIFIED');
+
+    const persistedTask2A = taskRepo2.getTaskById(task2A.id);
+    assert.ok(persistedTask2A, 'Task 2A must exist after restart');
+    assert.equal(persistedTask2A.status, 'COMPLETED');
+    const stepsTask2A = taskRepo2.getStepsByTaskId(task2A.id);
+    assert.equal(stepsTask2A.length, 1);
+    assert.equal(stepsTask2A[0]!.status, 'VERIFIED');
 
     const persistedTask2B = taskRepo2.getTaskById(task2B.id);
-    assert.ok(persistedTask2B);
+    assert.ok(persistedTask2B, 'Task 2B must exist after restart');
     assert.equal(persistedTask2B.status, 'COMPLETED');
+    const stepsTask2B = taskRepo2.getStepsByTaskId(task2B.id);
+    assert.equal(stepsTask2B.length, 1);
+    assert.equal(stepsTask2B[0]!.status, 'VERIFIED');
+
+    const persistedTask3 = taskRepo2.getTaskById(task3.id);
+    assert.ok(persistedTask3, 'Task 3 must exist after restart');
+    assert.equal(persistedTask3.status, 'COMPLETED');
+    const stepsTask3 = taskRepo2.getStepsByTaskId(task3.id);
+    assert.equal(stepsTask3.length, 1);
+    assert.equal(stepsTask3[0]!.status, 'VERIFIED');
 
     // Verify purged memory row remains absent after cold reboot
     const persistedMemoryAfterPurge = memoryRepo2.getMemoryById(proposalId, userCaller.scope);
@@ -448,9 +506,12 @@ test('Phase 7.5 Integration - Full memory lifecycle: proposal, isolation, human 
     assert.equal(persistedAuditRows.length, allAuditRows.length, 'Audit event count must match after restart');
     for (const row of persistedAuditRows) {
       assert.equal(row.details_json.includes(sentinelToken), false);
-      if (row.event_type.startsWith('MEMORY')) {
+      if (isMemoryAuditEvent(row.event_type)) {
         assert.equal(row.details_json.includes(sentinelMarker), false);
         assert.equal(row.details_json.includes(sentinelKey), false);
+        assert.equal(row.details_json.includes(sentinelTag), false);
+        assert.equal(row.details_json.includes(sentinelMetaVal), false);
+        assert.equal(row.details_json.includes(sentinelMetaKey), false);
       }
     }
   } finally {
