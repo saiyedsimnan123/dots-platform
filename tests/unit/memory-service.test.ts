@@ -1298,3 +1298,214 @@ test('RelevanceMatcher & MemoryContextBuilder - hardened runtime validation for 
     (err: unknown) => err instanceof ValidationError && err.message.includes('Matcher must be an instance')
   );
 });
+
+// ============================================================================
+// Phase 7.5: Substep 5 - Memory Lifecycle Safety Review Tests
+// ============================================================================
+
+test('MemoryService.archiveMemory - rejects pending proposals and prevents approval bypass', () => {
+  const { db, hostAuthority, authorizer, memoryService, taskRepo, auditRepo, workspaceA } = setupServiceTest();
+
+  try {
+    const task = hostAuthority.createTask(taskRepo, {
+      goal: 'Propose memory via task',
+      scope: workspaceA
+    });
+    const agentCaller = authorizer.authorizeAgent({ taskId: task.id });
+    const adminCaller = authorizer.authorizeUser({
+      credentials: 'token-admin-alpha',
+      requestedScope: workspaceA
+    });
+
+    // 1. Agent submits a proposal
+    const proposal = memoryService.createMemory(agentCaller, {
+      key: 'pending.proposal.key',
+      content: 'Provisional proposal content',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceA.scopeId
+    });
+    assert.equal(proposal.status, 'PENDING_APPROVAL');
+
+    // 2. Caller with DELETE permission attempts to bypass decideProposal via archiveMemory
+    assert.throws(
+      () => memoryService.archiveMemory(adminCaller, proposal.id),
+      (err: unknown) =>
+        err instanceof SecurityViolationError &&
+        err.violationType === 'UNAUTHORIZED_APPROVAL' &&
+        err.message.includes('Cannot archive a pending proposal via archiveMemory')
+    );
+
+    // 3. Proposal status in database remains PENDING_APPROVAL
+    const unchanged = memoryService.getMemoryById(adminCaller, proposal.id);
+    assert.ok(unchanged);
+    assert.equal(unchanged.status, 'PENDING_APPROVAL');
+
+    // 4. Audit trail confirms APPROVAL_BYPASS_ATTEMPT was logged without leaking keys or raw content
+    const deniedEvents = auditRepo.getEventsByTaskId('__system_memory__')
+      .filter((e) => e.eventType === 'MEMORY_ACCESS_DENIED');
+    const bypassEvent = deniedEvents.find((e) => e.detailsJson.includes('APPROVAL_BYPASS_ATTEMPT'));
+    assert.ok(bypassEvent, 'Must audit APPROVAL_BYPASS_ATTEMPT on archiveMemory attempt');
+    const details = JSON.parse(bypassEvent.detailsJson);
+    assert.equal(details.operation, 'archiveMemory');
+    assert.equal(details.memoryId, proposal.id);
+    assert.equal('key' in details, false, 'Audit event must not leak memory key');
+    assert.equal('content' in details, false, 'Audit event must not leak content');
+  } finally {
+    db.close();
+  }
+});
+
+test('MemoryService.archiveMemory - rejects already archived memories (invalid status transition)', () => {
+  const { db, authorizer, memoryService, workspaceA } = setupServiceTest();
+
+  try {
+    const adminCaller = authorizer.authorizeUser({
+      credentials: 'token-admin-alpha',
+      requestedScope: workspaceA
+    });
+
+    // 1. Create an active memory
+    const activeMem = memoryService.createMemory(adminCaller, {
+      key: 'active.to.archive.key',
+      content: 'Content to archive',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceA.scopeId
+    });
+    assert.equal(activeMem.status, 'ACTIVE');
+
+    // 2. Archive it successfully
+    const archived = memoryService.archiveMemory(adminCaller, activeMem.id);
+    assert.equal(archived.status, 'ARCHIVED');
+
+    // 3. Attempting to archive it again is rejected as invalid status transition
+    assert.throws(
+      () => memoryService.archiveMemory(adminCaller, activeMem.id),
+      (err: unknown) =>
+        err instanceof ValidationError &&
+        err.message.includes('record is already archived')
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('MemoryService.archiveMemory - rejects cross-scope memory ID before opening transaction', () => {
+  const { db, authorizer, memoryService, workspaceA, workspaceB } = setupServiceTest();
+
+  try {
+    const adminA = authorizer.authorizeUser({
+      credentials: 'token-admin-alpha',
+      requestedScope: workspaceA
+    });
+    const adminB = authorizer.authorizeUser({
+      credentials: 'token-admin-beta',
+      requestedScope: workspaceB
+    });
+
+    const memB = memoryService.createMemory(adminB, {
+      key: 'workspace.b.memory',
+      content: 'Workspace B content',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceB.scopeId
+    });
+
+    assert.throws(
+      () => memoryService.archiveMemory(adminA, memB.id),
+      (err: unknown) => err instanceof MemoryScopeViolationError
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('MemoryService.deleteMemory - rejects pending proposals and prevents destroying undecided proposals', () => {
+  const { db, hostAuthority, authorizer, memoryService, taskRepo, auditRepo, workspaceA } = setupServiceTest();
+
+  try {
+    const task = hostAuthority.createTask(taskRepo, {
+      goal: 'Propose memory via task',
+      scope: workspaceA
+    });
+    const agentCaller = authorizer.authorizeAgent({ taskId: task.id });
+    const adminCaller = authorizer.authorizeUser({
+      credentials: 'token-admin-alpha',
+      requestedScope: workspaceA
+    });
+
+    // 1. Agent submits proposal
+    const proposal = memoryService.createMemory(agentCaller, {
+      key: 'protected.proposal.key',
+      content: 'Protected proposal content',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceA.scopeId
+    });
+    assert.equal(proposal.status, 'PENDING_APPROVAL');
+
+    // 2. Admin caller attempts deleteMemory directly on pending proposal
+    assert.throws(
+      () => memoryService.deleteMemory(adminCaller, proposal.id),
+      (err: unknown) =>
+        err instanceof SecurityViolationError &&
+        err.violationType === 'UNAUTHORIZED_APPROVAL' &&
+        err.message.includes('Cannot delete a pending proposal via deleteMemory')
+    );
+
+    // 3. Proposal remains untouched in database
+    const row = memoryService.getMemoryById(adminCaller, proposal.id);
+    assert.ok(row);
+    assert.equal(row.status, 'PENDING_APPROVAL');
+
+    // 4. Audit confirms APPROVAL_BYPASS_ATTEMPT was logged
+    const deniedEvents = auditRepo.getEventsByTaskId('__system_memory__')
+      .filter((e) => e.eventType === 'MEMORY_ACCESS_DENIED');
+    const bypassEvent = deniedEvents.find((e) => e.detailsJson.includes('APPROVAL_BYPASS_ATTEMPT'));
+    assert.ok(bypassEvent, 'Must audit APPROVAL_BYPASS_ATTEMPT on deleteMemory attempt');
+  } finally {
+    db.close();
+  }
+});
+
+test('MemoryService - proposal decision workflow transitions properly and enables downstream purge', () => {
+  const { db, hostAuthority, authorizer, memoryService, taskRepo, workspaceA } = setupServiceTest();
+
+  try {
+    const task = hostAuthority.createTask(taskRepo, {
+      goal: 'Propose memory via task',
+      scope: workspaceA
+    });
+    const agentCaller = authorizer.authorizeAgent({ taskId: task.id });
+    const adminCaller = authorizer.authorizeUser({
+      credentials: 'token-admin-alpha',
+      requestedScope: workspaceA
+    });
+
+    // 1. Submit proposal
+    const proposal = memoryService.createMemory(agentCaller, {
+      key: 'flow.proposal.key',
+      content: 'Flow proposal content',
+      category: 'LEARNED_PROCEDURE',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceA.scopeId
+    });
+
+    // 2. Decide proposal with REJECTED -> transitions to ARCHIVED
+    const rejected = memoryService.decideProposal(adminCaller, {
+      memoryId: proposal.id,
+      decision: 'REJECTED'
+    });
+    assert.equal(rejected.status, 'ARCHIVED');
+
+    // 3. Purging the rejected (archived) memory through authorized purge workflow succeeds
+    const purgeResult = memoryService.purgeArchivedMemories(adminCaller, {
+      memoryIds: [rejected.id]
+    });
+    assert.equal(purgeResult.purgedCount, 1);
+    assert.equal(memoryService.getMemoryById(adminCaller, rejected.id), null);
+  } finally {
+    db.close();
+  }
+});
