@@ -37,6 +37,7 @@ import type { HostMemoryAuthority } from '../security/host-authority.ts';
 import { MemoryAuthorizer, validateScope } from '../security/memory-authorizer.ts';
 import { PromptCompiler } from '../model/prompt-compiler.ts';
 import { defaultSecretScrubber } from '../model/secret-scrubber.ts';
+import { createMemoryProposeTool } from '../tools/memory-tools.ts';
 
 const NON_SENSITIVE_PROOF_WORDS = new Set([
   'waterproof',
@@ -233,6 +234,11 @@ export class TaskCoordinator {
     this.hostAuthority = options.hostAuthority;
     this.authorizer = options.hostAuthority ? options.hostAuthority.authorizer : options.authorizer;
     this.promptCompiler = options.promptCompiler ?? new PromptCompiler();
+
+    // Register agent memory proposal tool when memory subsystem and authorizer are configured
+    if (this.memoryService && this.authorizer && !this.toolRegistry.get('memory_propose')) {
+      this.toolRegistry.register(createMemoryProposeTool(this.memoryService, this.authorizer));
+    }
   }
 
 

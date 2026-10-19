@@ -338,12 +338,12 @@ export class MemoryService {
         this.audit(caller, 'MEMORY_ACCESS_DENIED', {
           reason: 'AGENT_DIRECT_ACTIVE_CREATION_DENIED',
           operation: 'createMemory',
-          attemptedKey: input.key
+          category: input.category
         }, false);
         throw new SecurityViolationError(
           'Agents cannot directly create active memories; proposals must be created with status PENDING_APPROVAL.',
           'AGENT_PROPOSAL_REQUIRED',
-          { key: input.key }
+          { category: input.category }
         );
       }
       status = 'PENDING_APPROVAL';
@@ -372,7 +372,6 @@ export class MemoryService {
       } else {
         this.audit(caller, 'MEMORY_PROPOSAL_SUBMITTED', {
           memoryId: memory.id,
-          key: memory.key,
           category: memory.category,
           scopeType: memory.scopeType,
           scopeId: memory.scopeId,

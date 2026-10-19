@@ -43,6 +43,7 @@ export {
 export type * from './tools/types.ts';
 export * from './tools/sandbox-tools.ts';
 export * from './tools/registry.ts';
+export * from './tools/memory-tools.ts';
 
 // Verification Subsystem
 export * from './verification/verifier.ts';
