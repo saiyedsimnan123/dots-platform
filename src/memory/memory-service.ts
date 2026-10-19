@@ -113,10 +113,11 @@ export interface MemoryServiceOptions {
 }
 
 /**
- * Strict ISO 8601 UTC format: YYYY-MM-DDTHH:mm:ss[.sss...]Z
- * Explicit 'Z' required. Timezone offsets (+/-HH:mm), date-only values, and missing timezone indicators are strictly rejected.
+ * Strict ISO 8601 UTC format: YYYY-MM-DDTHH:mm:ss[.sss]Z
+ * Explicit 'Z' required. Timezone offsets (+/-HH:mm), date-only values, missing timezone indicators,
+ * and fractional precision beyond 3 digits (1–3 fractional digits permitted) are strictly rejected.
  */
-const STRICT_ISO_8601_UTC_REGEX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+const STRICT_ISO_8601_UTC_REGEX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
 
 function validateAndNormalizeUtcTimestamp(timestamp: unknown, fieldName: string): string {
   if (typeof timestamp !== 'string' || timestamp.trim() === '') {
@@ -127,7 +128,7 @@ function validateAndNormalizeUtcTimestamp(timestamp: unknown, fieldName: string)
 
   if (!STRICT_ISO_8601_UTC_REGEX.test(timestamp)) {
     throw new ValidationError(
-      `${fieldName} must be a strict ISO 8601 UTC timestamp ending in 'Z' (e.g. '2026-10-15T12:00:00Z' or '2026-10-15T12:00:00.000Z'). Date-only values, timezone offsets, and non-UTC representations are not permitted. Received: '${timestamp}'.`
+      `${fieldName} must be a strict ISO 8601 UTC timestamp ending in 'Z' with up to 3 fractional second digits (e.g. '2026-10-15T12:00:00Z' or '2026-10-15T12:00:00.000Z'). Date-only values, timezone offsets, non-UTC representations, and fractional precision exceeding 3 digits are not permitted. Received: '${timestamp}'.`
     );
   }
 

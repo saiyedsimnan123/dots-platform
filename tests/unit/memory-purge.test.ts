@@ -602,27 +602,43 @@ test('purgeArchivedMemories - cutoff boundaries and invalid timestamp validation
 test('purgeArchivedMemories - strict ISO 8601 UTC format validation on olderThan', () => {
   const env = setupTestEnvironment();
 
-  // 1. Valid formats that must be accepted
-  const validFormats = [
-    '2026-10-15T12:00:00Z',
-    '2026-10-15T12:00:00.000Z',
-    '2026-10-15T12:00:00.123456Z'
+  // 1. Valid formats with 0 or 1–3 fractional digits that must be accepted and normalized without loss of precision
+  const acceptedCases: Array<{ input: string; expectedNormalized: string }> = [
+    { input: '2026-10-15T12:00:00Z', expectedNormalized: '2026-10-15T12:00:00.000Z' },
+    { input: '2026-10-15T12:00:00.1Z', expectedNormalized: '2026-10-15T12:00:00.100Z' },
+    { input: '2026-10-15T12:00:00.12Z', expectedNormalized: '2026-10-15T12:00:00.120Z' },
+    { input: '2026-10-15T12:00:00.123Z', expectedNormalized: '2026-10-15T12:00:00.123Z' },
+    { input: '2026-10-15T12:00:00.000Z', expectedNormalized: '2026-10-15T12:00:00.000Z' }
   ];
 
-  for (const validTs of validFormats) {
+  for (const { input, expectedNormalized } of acceptedCases) {
     const res = env.memoryService.purgeArchivedMemories(env.adminAlpha, {
-      olderThan: validTs,
+      olderThan: input,
       dryRun: true
     });
     assert.equal(res.isDryRun, true);
     assert.equal(res.purgeMode, 'CUTOFF');
-    // Ensure normalized to canonical ISO string ending with Z
-    assert.ok(res.cutoffTimestamp);
-    assert.equal(res.cutoffTimestamp?.endsWith('Z'), true);
-    assert.equal(new Date(res.cutoffTimestamp!).getTime(), new Date(validTs).getTime());
+    // Ensure normalized to canonical ISO string ending with Z without precision loss
+    assert.equal(res.cutoffTimestamp, expectedNormalized);
   }
 
-  // 2. Nonconforming strings, date-only values, missing Z, and timezone offsets that must be rejected
+  // 2. Fractional precision exceeding 3 digits must be strictly rejected to prevent loss of precision
+  const excessiveFractionalInputs = [
+    '2026-10-15T12:00:00.1234Z',
+    '2026-10-15T12:00:00.123456Z'
+  ];
+
+  for (const excessiveTs of excessiveFractionalInputs) {
+    assert.throws(
+      () => env.memoryService.purgeArchivedMemories(env.adminAlpha, {
+        olderThan: excessiveTs
+      }),
+      (err: unknown) => err instanceof ValidationError,
+      `Expected ValidationError for timestamp exceeding 3 fractional digits: '${excessiveTs}'`
+    );
+  }
+
+  // 3. Nonconforming strings, date-only values, missing Z, and timezone offsets that must be rejected
   const invalidInputs = [
     // Date-only values
     '2026-10-15',
