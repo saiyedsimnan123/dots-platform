@@ -2112,3 +2112,67 @@ test('MemoryService - audit privacy: MEMORY_CREATED, MEMORY_UPDATED, MEMORY_ARCH
   }
 });
 
+test('MemoryService - shared boundary intercepts and drops raw keys, content, tags, and metadata even if explicitly injected into audit calls', () => {
+  const { db, hostAuthority, authorizer, memoryService, taskRepo, auditRepo, workspaceA } = setupServiceTest();
+
+  try {
+    const task = hostAuthority.createTask(taskRepo, {
+      goal: 'Shared boundary injection defense test',
+      scope: workspaceA
+    });
+    const adminCaller = authorizer.authorizeUser({
+      credentials: 'token-admin-alpha',
+      requestedScope: workspaceA,
+      taskId: task.id
+    });
+
+    const leakAttemptKey = 'LEAK_ATTEMPT_KEY_999';
+    const leakAttemptContent = 'LEAK_ATTEMPT_CONTENT_888';
+    const leakAttemptTags = ['LEAK_TAG_777'];
+    const leakAttemptMeta = { injectedSecret: 'LEAK_META_666' };
+
+    // Directly invoke private audit method (simulating a compromised or regressed internal call site)
+    (memoryService as any).audit(adminCaller, 'MEMORY_CREATED', {
+      memoryId: 'mem-shared-boundary-test',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceA.scopeId,
+      status: 'ACTIVE',
+      key: leakAttemptKey,
+      content: leakAttemptContent,
+      tags: leakAttemptTags,
+      metadata: leakAttemptMeta,
+      arbitraryInjectedField: 'SHOULD_BE_DROPPED'
+    }, true);
+
+    // Verify row directly in SQLite database
+    const row = db.prepare('SELECT * FROM audit_events WHERE event_type = ?')
+      .get('MEMORY_CREATED') as { details_json: string; payload_hash: string };
+    assert.ok(row, 'Audit record must be persisted in database');
+
+    const details = JSON.parse(row.details_json);
+
+    // Safe fields are preserved
+    assert.equal(details.memoryId, 'mem-shared-boundary-test');
+    assert.equal(details.category, 'PROJECT_FACT');
+    assert.equal(details.scopeType, 'WORKSPACE');
+    assert.equal(details.scopeId, workspaceA.scopeId);
+    assert.equal(details.status, 'ACTIVE');
+
+    // Sensitive/arbitrary fields are completely stripped
+    assert.equal('key' in details, false, 'Shared boundary must strip key');
+    assert.equal('content' in details, false, 'Shared boundary must strip content');
+    assert.equal('tags' in details, false, 'Shared boundary must strip tags');
+    assert.equal('metadata' in details, false, 'Shared boundary must strip metadata');
+    assert.equal('arbitraryInjectedField' in details, false, 'Shared boundary must strip arbitrary fields');
+
+    assert.equal(row.details_json.includes(leakAttemptKey), false);
+    assert.equal(row.details_json.includes(leakAttemptContent), false);
+    assert.equal(row.details_json.includes('LEAK_TAG_777'), false);
+    assert.equal(row.details_json.includes('LEAK_META_666'), false);
+    assert.equal(row.details_json.includes('SHOULD_BE_DROPPED'), false);
+  } finally {
+    db.close();
+  }
+});
+

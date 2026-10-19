@@ -78,6 +78,7 @@ import { MemoryContextBuilder } from './context-builder.ts';
 import { MemoryAuthorizer } from '../security/memory-authorizer.ts';
 import type { HostMemoryAuthority } from '../security/host-authority.ts';
 import { computeCanonicalSha256, verifyBundleChecksum } from './canonical-json.ts';
+import { sanitizeMemoryAuditDetails } from '../storage/audit-policy.ts';
 
 const VALID_SCOPES: ReadonlySet<MemoryScopeType> = new Set([
   'GLOBAL',
@@ -2027,7 +2028,7 @@ export class MemoryService {
         taskId,
         eventType,
         actor: caller.actor,
-        details
+        details: sanitizeMemoryAuditDetails(eventType, details)
       });
     } catch (err) {
       if (mandatory) {

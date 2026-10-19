@@ -11,6 +11,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { DatabaseManager } from './db.ts';
 import type { AuditEvent, AppendAuditEventInput } from '../domain/types.ts';
 import { ValidationError } from '../domain/errors.ts';
+import { sanitizeMemoryAuditDetails } from './audit-policy.ts';
 
 interface AuditDbRow {
   id: string;
@@ -31,6 +32,7 @@ export class AuditRepository {
 
   /**
    * Appends an immutable audit event with a cryptographic SHA-256 digest.
+   * Centralizes and enforces privacy boundaries for all memory audit events.
    */
   public appendEvent(input: AppendAuditEventInput): AuditEvent {
     if (!input.taskId) {
@@ -39,7 +41,8 @@ export class AuditRepository {
 
     const id = input.id ?? randomUUID();
     const now = new Date().toISOString();
-    const detailsJson = JSON.stringify(input.details);
+    const sanitizedDetails = sanitizeMemoryAuditDetails(input.eventType, input.details);
+    const detailsJson = JSON.stringify(sanitizedDetails);
     const payloadHash = createHash('sha256').update(detailsJson, 'utf8').digest('hex');
 
     const stmt = this.db.prepare(`
