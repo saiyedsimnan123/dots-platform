@@ -253,7 +253,7 @@ test('AuditRepository - enforces memory audit privacy policy across all memory a
         scopeType: 'WORKSPACE',
         scopeId: 'ws-1',
         exportedCount: 10,
-        checksum: 'sha256-dummy-checksum',
+        checksum: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
         key: sentinelKey,
         content: sentinelContent
       },
@@ -261,7 +261,7 @@ test('AuditRepository - enforces memory audit privacy policy across all memory a
         scopeType: 'WORKSPACE',
         scopeId: 'ws-1',
         exportedCount: 10,
-        checksum: 'sha256-dummy-checksum'
+        checksum: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
       }
     },
     {
@@ -274,7 +274,7 @@ test('AuditRepository - enforces memory audit privacy policy across all memory a
         skippedCount: 1,
         overwrittenCount: 1,
         conflictStrategy: 'OVERWRITE',
-        checksum: 'sha256-dummy-checksum',
+        checksum: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
         key: sentinelKey,
         content: sentinelContent
       },
@@ -286,7 +286,7 @@ test('AuditRepository - enforces memory audit privacy policy across all memory a
         skippedCount: 1,
         overwrittenCount: 1,
         conflictStrategy: 'OVERWRITE',
-        checksum: 'sha256-dummy-checksum'
+        checksum: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
       }
     },
     {
@@ -809,6 +809,292 @@ test('AuditRepository - value hardening: ignores prototype pollution payloads', 
   assert.equal(Object.hasOwn(parsed, 'prototype'), false);
   assert.equal(event.detailsJson.includes('polluted'), false);
   assert.equal(event.detailsJson.includes('evil'), false);
+
+  db.close();
+});
+
+
+test('AuditRepository - value hardening: validates exact 64-character lowercase hex SHA-256 checksum and drops sentinels passing broad regex', () => {
+  const db = new DatabaseManager(':memory:');
+  const taskRepo = new TaskRepository(db);
+  const auditRepo = new AuditRepository(db);
+  const task = taskRepo.createTask({ goal: 'Value hardening test - checksum' });
+
+  // Sentinels that would have passed the old broad pattern /^[a-zA-Z0-9_-]{1,128}$/
+  const broadSentinels = [
+    'SENTINEL_BROAD_CHECKSUM_PASSES_OLD_REGEX_12345',
+    'sha256-dummy-checksum',
+    'custom_slug_checksum_under_128_chars_long'
+  ];
+
+  for (const sentinel of broadSentinels) {
+    const event = auditRepo.appendEvent({
+      taskId: task.id,
+      eventType: 'MEMORY_EXPORTED',
+      actor: 'USER',
+      details: {
+        scopeType: 'WORKSPACE',
+        scopeId: 'ws-1',
+        exportedCount: 5,
+        checksum: sentinel
+      }
+    });
+
+    const parsed = JSON.parse(event.detailsJson);
+    assert.equal(
+      'checksum' in parsed,
+      false,
+      `Sentinel '${sentinel}' passing old broad pattern must be dropped by strict SHA-256 hex rule`
+    );
+    assert.equal(event.detailsJson.includes(sentinel), false);
+  }
+
+  // Malformed checksums (wrong length, non-hex, uppercase, spaces)
+  const malformedChecksums = [
+    'short',
+    'a'.repeat(63), // 63 chars (too short)
+    'a'.repeat(65), // 65 chars (too long)
+    '0123456789ABCDEF'.repeat(4), // uppercase hex - export produces canonical lowercase
+    '0123456789abcdef'.repeat(3) + '0123456789abcdeg', // non-hex character 'g'
+    'bad checksum with spaces @#$'
+  ];
+
+  for (const malformed of malformedChecksums) {
+    const event = auditRepo.appendEvent({
+      taskId: task.id,
+      eventType: 'MEMORIES_IMPORTED',
+      actor: 'USER',
+      details: {
+        targetScopeType: 'WORKSPACE',
+        targetScopeId: 'ws-1',
+        checksum: malformed
+      }
+    });
+
+    const parsed = JSON.parse(event.detailsJson);
+    assert.equal('checksum' in parsed, false, `Malformed checksum '${malformed}' must be dropped`);
+  }
+
+  // Authentic 64-char lowercase hex checksums must be preserved
+  const validHexChecksums = [
+    'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+  ];
+
+  for (const validChecksum of validHexChecksums) {
+    const event = auditRepo.appendEvent({
+      taskId: task.id,
+      eventType: 'MEMORY_EXPORTED',
+      actor: 'USER',
+      details: {
+        scopeType: 'WORKSPACE',
+        scopeId: 'ws-1',
+        exportedCount: 1,
+        checksum: validChecksum
+      }
+    });
+
+    const parsed = JSON.parse(event.detailsJson);
+    assert.equal(parsed.checksum, validChecksum, 'Valid 64-char lowercase hex checksum must be preserved');
+  }
+
+  db.close();
+});
+
+test('AuditRepository - value hardening: drops arbitrary sentinel strings from reason, operation, and attemptedStatus with zero regex fallback', () => {
+  const db = new DatabaseManager(':memory:');
+  const taskRepo = new TaskRepository(db);
+  const auditRepo = new AuditRepository(db);
+  const task = taskRepo.createTask({ goal: 'Value hardening test - zero regex fallback' });
+
+  // Sentinels that would have passed the old uppercase snake_case or camelCase regex fallbacks
+  const sentinelReason = 'SENTINEL_INJECTED_REASON_PASSES_UPPER_REGEX';
+  const sentinelOperation = 'sentinelInjectedOperationPassesRegex';
+  const sentinelAttemptedStatus = 'SENTINEL_STATUS_PASSES_UPPER_REGEX';
+
+  const event = auditRepo.appendEvent({
+    taskId: task.id,
+    eventType: 'MEMORY_ACCESS_DENIED',
+    actor: 'USER',
+    details: {
+      reason: sentinelReason,
+      operation: sentinelOperation,
+      attemptedStatus: sentinelAttemptedStatus,
+      scopeType: 'WORKSPACE',
+      scopeId: 'ws-1'
+    }
+  });
+
+  const parsed = JSON.parse(event.detailsJson);
+  assert.equal('reason' in parsed, false, 'Sentinel reason must be dropped without regex fallback');
+  assert.equal('operation' in parsed, false, 'Sentinel operation must be dropped without regex fallback');
+  assert.equal('attemptedStatus' in parsed, false, 'Sentinel attemptedStatus must be dropped without regex fallback');
+
+  // Verify none of the sentinel values are present in serialized JSON string
+  assert.equal(event.detailsJson.includes(sentinelReason), false);
+  assert.equal(event.detailsJson.includes(sentinelOperation), false);
+  assert.equal(event.detailsJson.includes(sentinelAttemptedStatus), false);
+
+  // Genuinely valid allowlisted reasons, operations, and statuses must still be preserved
+  const validEvent = auditRepo.appendEvent({
+    taskId: task.id,
+    eventType: 'MEMORY_ACCESS_DENIED',
+    actor: 'USER',
+    details: {
+      reason: 'CROSS_SCOPE_READ_ATTEMPT',
+      operation: 'getMemoryById',
+      attemptedStatus: 'ACTIVE',
+      scopeType: 'WORKSPACE',
+      scopeId: 'ws-1'
+    }
+  });
+
+  const validParsed = JSON.parse(validEvent.detailsJson);
+  assert.equal(validParsed.reason, 'CROSS_SCOPE_READ_ATTEMPT');
+  assert.equal(validParsed.operation, 'getMemoryById');
+  assert.equal(validParsed.attemptedStatus, 'ACTIVE');
+
+  db.close();
+});
+
+test('AuditRepository - value hardening: injected sentinel values in allowlisted fields are never persisted in SQLite', () => {
+  const db = new DatabaseManager(':memory:');
+  const taskRepo = new TaskRepository(db);
+  const auditRepo = new AuditRepository(db);
+  const task = taskRepo.createTask({ goal: 'Value hardening test - persistence verification' });
+
+  const sentinels = {
+    reason: 'SENTINEL_LEAKED_REASON_TEXT_111',
+    operation: 'sentinelLeakedOperationMethod222',
+    category: 'SENTINEL_LEAKED_CATEGORY_333',
+    status: 'SENTINEL_LEAKED_STATUS_444',
+    decision: 'SENTINEL_LEAKED_DECISION_555',
+    actor: 'SENTINEL_LEAKED_ACTOR_666',
+    conflictStrategy: 'SENTINEL_LEAKED_STRATEGY_777',
+    purgeMode: 'SENTINEL_LEAKED_PURGE_MODE_888',
+    requiredPermission: 'SENTINEL_LEAKED_PERMISSION_999',
+    checksum: 'SENTINEL_LEAKED_CHECKSUM_AAA',
+    memoryId: 'SENTINEL_LEAKED_MEM_ID_BBB with invalid spaces',
+    scopeId: 'SENTINEL_LEAKED_SCOPE_ID_CCC with invalid spaces',
+    expectedScope: 'SENTINEL_LEAKED_SCOPE_NO_COLON_DDD',
+    cutoffTimestamp: 'SENTINEL_LEAKED_TIMESTAMP_2026-02-30T00:00:00Z',
+    updatedField: 'SENTINEL_LEAKED_FIELD_EEE',
+    memoryIdsItem: 'SENTINEL_LEAKED_ITEM_FFF with invalid spaces'
+  };
+
+  // Event 1: MEMORY_ACCESS_DENIED with sentinels in allowlisted fields
+  const event1 = auditRepo.appendEvent({
+    taskId: task.id,
+    eventType: 'MEMORY_ACCESS_DENIED',
+    actor: 'USER',
+    details: {
+      reason: sentinels.reason,
+      operation: sentinels.operation,
+      memoryId: sentinels.memoryId,
+      category: sentinels.category,
+      expectedScope: sentinels.expectedScope,
+      scopeId: sentinels.scopeId,
+      requiredPermission: sentinels.requiredPermission,
+      actor: sentinels.actor
+    }
+  });
+
+  // Verify event1 in database row
+  const row1 = auditRepo.getEventById(event1.id);
+  assert.ok(row1);
+  assert.equal(row1.detailsJson, '{}');
+  assert.equal(row1.detailsJson.includes(sentinels.reason), false);
+  assert.equal(row1.detailsJson.includes(sentinels.operation), false);
+  assert.equal(row1.detailsJson.includes(sentinels.memoryId), false);
+  assert.equal(row1.detailsJson.includes(sentinels.category), false);
+  assert.equal(row1.detailsJson.includes(sentinels.expectedScope), false);
+  assert.equal(row1.detailsJson.includes(sentinels.scopeId), false);
+  assert.equal(row1.detailsJson.includes(sentinels.requiredPermission), false);
+  assert.equal(row1.detailsJson.includes(sentinels.actor), false);
+
+  // Event 2: MEMORY_PROPOSAL_DECIDED with sentinels
+  const event2 = auditRepo.appendEvent({
+    taskId: task.id,
+    eventType: 'MEMORY_PROPOSAL_DECIDED',
+    actor: 'USER',
+    details: {
+      memoryId: sentinels.memoryId,
+      category: sentinels.category,
+      decision: sentinels.decision,
+      decidedBy: sentinels.actor,
+      previousStatus: sentinels.status,
+      newStatus: sentinels.status
+    }
+  });
+
+  const row2 = auditRepo.getEventById(event2.id);
+  assert.ok(row2);
+  assert.equal(row2.detailsJson, '{}');
+  assert.equal(row2.detailsJson.includes(sentinels.decision), false);
+  assert.equal(row2.detailsJson.includes(sentinels.status), false);
+
+  // Event 3: MEMORIES_IMPORTED with sentinels
+  const event3 = auditRepo.appendEvent({
+    taskId: task.id,
+    eventType: 'MEMORIES_IMPORTED',
+    actor: 'USER',
+    details: {
+      conflictStrategy: sentinels.conflictStrategy,
+      checksum: sentinels.checksum
+    }
+  });
+
+  const row3 = auditRepo.getEventById(event3.id);
+  assert.ok(row3);
+  assert.equal(row3.detailsJson, '{}');
+  assert.equal(row3.detailsJson.includes(sentinels.conflictStrategy), false);
+  assert.equal(row3.detailsJson.includes(sentinels.checksum), false);
+
+  // Event 4: MEMORIES_PURGED with sentinels
+  const event4 = auditRepo.appendEvent({
+    taskId: task.id,
+    eventType: 'MEMORIES_PURGED',
+    actor: 'USER',
+    details: {
+      purgeMode: sentinels.purgeMode,
+      cutoffTimestamp: sentinels.cutoffTimestamp
+    }
+  });
+
+  const row4 = auditRepo.getEventById(event4.id);
+  assert.ok(row4);
+  assert.equal(row4.detailsJson, '{}');
+  assert.equal(row4.detailsJson.includes(sentinels.purgeMode), false);
+  assert.equal(row4.detailsJson.includes(sentinels.cutoffTimestamp), false);
+
+  // Event 5: MEMORY_UPDATED and MEMORY_RETRIEVED with array sentinels
+  const event5 = auditRepo.appendEvent({
+    taskId: task.id,
+    eventType: 'MEMORY_UPDATED',
+    actor: 'USER',
+    details: {
+      updatedFields: [sentinels.updatedField]
+    }
+  });
+
+  const row5 = auditRepo.getEventById(event5.id);
+  assert.ok(row5);
+  assert.equal(row5.detailsJson.includes(sentinels.updatedField), false);
+  assert.deepEqual(JSON.parse(row5.detailsJson), { updatedFields: [] });
+
+  const event6 = auditRepo.appendEvent({
+    taskId: task.id,
+    eventType: 'MEMORY_RETRIEVED',
+    actor: 'USER',
+    details: {
+      memoryIds: [sentinels.memoryIdsItem]
+    }
+  });
+
+  const row6 = auditRepo.getEventById(event6.id);
+  assert.ok(row6);
+  assert.equal(row6.detailsJson.includes(sentinels.memoryIdsItem), false);
+  assert.equal('memoryIds' in JSON.parse(row6.detailsJson), false);
 
   db.close();
 });
