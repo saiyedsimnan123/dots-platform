@@ -813,7 +813,6 @@ export class MemoryService {
       // Mandatory audit write for proposal decision
       this.audit(caller, 'MEMORY_PROPOSAL_DECIDED', {
         memoryId: updated.id,
-        key: updated.key,
         category: updated.category,
         decision: input.decision,
         decidedBy: caller.actor,

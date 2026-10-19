@@ -1902,3 +1902,79 @@ test('MemoryService.decideProposal - two-way atomicity guarantees rollback of de
     db.close();
   }
 });
+
+test('MemoryService.decideProposal - audit privacy: MEMORY_PROPOSAL_DECIDED never leaks key, content, tags, or metadata', () => {
+  const { db, hostAuthority, authorizer, memoryService, taskRepo, auditRepo, workspaceA } = setupServiceTest();
+
+  try {
+    const task = hostAuthority.createTask(taskRepo, {
+      goal: 'Proposal privacy audit task',
+      scope: workspaceA
+    });
+    const agentCaller = authorizer.authorizeAgent({ taskId: task.id });
+    const adminCaller = authorizer.authorizeUser({
+      credentials: 'token-admin-alpha',
+      requestedScope: workspaceA,
+      taskId: task.id
+    });
+
+    const distinctKey = 'CONFIDENTIAL_PROPOSAL_KEY_XYZZY_999';
+    const distinctContent = 'TOP_SECRET_PROPOSAL_PAYLOAD_BODY_777';
+    const distinctTag1 = 'SECRET_TAG_ALPHA_999';
+    const distinctTag2 = 'CLASSIFIED_TAG_BETA_888';
+    const distinctMetaVal = 'SECRET_METADATA_VAL_333';
+    const distinctMetaFlag = 'SECRET_META_FLAG_444';
+
+    // 1. Submit proposal with distinctive key, content, tags, and metadata
+    const proposal = memoryService.createMemory(agentCaller, {
+      key: distinctKey,
+      content: distinctContent,
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceA.scopeId,
+      tags: [distinctTag1, distinctTag2],
+      metadata: { secretToken: distinctMetaVal, internalFlag: distinctMetaFlag }
+    });
+    assert.equal(proposal.status, 'PENDING_APPROVAL');
+
+    // 2. Decide proposal (APPROVED)
+    const approved = memoryService.decideProposal(adminCaller, {
+      memoryId: proposal.id,
+      decision: 'APPROVED'
+    });
+    assert.equal(approved.status, 'ACTIVE');
+
+    // 3. Inspect audit events in auditRepo / database
+    const decidedEvents = auditRepo.getEventsByTaskId(task.id)
+      .filter((e) => e.eventType === 'MEMORY_PROPOSAL_DECIDED');
+    assert.equal(decidedEvents.length, 1, 'Exactly one MEMORY_PROPOSAL_DECIDED audit event should exist');
+
+    const event = decidedEvents[0];
+    const details = JSON.parse(event.detailsJson);
+
+    // Verify allowed metadata fields
+    assert.equal(details.memoryId, proposal.id);
+    assert.equal(details.decision, 'APPROVED');
+    assert.equal(details.newStatus, 'ACTIVE');
+    assert.equal(details.previousStatus, 'PENDING_APPROVAL');
+    assert.equal(details.category, 'PROJECT_FACT');
+    assert.equal(details.decidedBy, 'USER');
+
+    // Verify sensitive fields are NOT present in details object
+    assert.equal('key' in details, false, 'Audit event must not contain raw memory key property');
+    assert.equal('content' in details, false, 'Audit event must not contain content property');
+    assert.equal('tags' in details, false, 'Audit event must not contain tags property');
+    assert.equal('metadata' in details, false, 'Audit event must not contain metadata property');
+
+    // Verify distinctive sensitive values do not appear anywhere in detailsJson string
+    assert.equal(event.detailsJson.includes(distinctKey), false, 'Audit event leaked proposal key');
+    assert.equal(event.detailsJson.includes(distinctContent), false, 'Audit event leaked proposal content');
+    assert.equal(event.detailsJson.includes(distinctTag1), false, 'Audit event leaked tag 1');
+    assert.equal(event.detailsJson.includes(distinctTag2), false, 'Audit event leaked tag 2');
+    assert.equal(event.detailsJson.includes(distinctMetaVal), false, 'Audit event leaked metadata value');
+    assert.equal(event.detailsJson.includes(distinctMetaFlag), false, 'Audit event leaked metadata flag');
+  } finally {
+    db.close();
+  }
+});
+
