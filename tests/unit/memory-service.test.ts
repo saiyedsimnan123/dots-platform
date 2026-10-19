@@ -1391,8 +1391,8 @@ test('MemoryService.archiveMemory - rejects already archived memories (invalid s
   }
 });
 
-test('MemoryService.archiveMemory - rejects cross-scope memory ID before opening transaction', () => {
-  const { db, authorizer, memoryService, workspaceA, workspaceB } = setupServiceTest();
+test('MemoryService.archiveMemory - rejects cross-scope memory ID within transaction and commits denial audit', () => {
+  const { db, authorizer, memoryService, auditRepo, workspaceA, workspaceB } = setupServiceTest();
 
   try {
     const adminA = authorizer.authorizeUser({
@@ -1416,6 +1416,56 @@ test('MemoryService.archiveMemory - rejects cross-scope memory ID before opening
       () => memoryService.archiveMemory(adminA, memB.id),
       (err: unknown) => err instanceof MemoryScopeViolationError
     );
+
+    // Verify denial audit was committed inside the transaction via discriminated outcome
+    const deniedEvents = auditRepo.getEventsByTaskId('__system_memory__')
+      .filter((e) => e.eventType === 'MEMORY_ACCESS_DENIED');
+    const crossScopeEvent = deniedEvents.find((e) => e.detailsJson.includes('CROSS_SCOPE_ARCHIVE_ATTEMPT'));
+    assert.ok(crossScopeEvent, 'Cross-scope denial audit event must be committed to audit repository');
+    const details = JSON.parse(crossScopeEvent.detailsJson);
+    assert.equal(details.memoryId, memB.id);
+    assert.equal('key' in details, false, 'Audit event must not leak memory key');
+    assert.equal('content' in details, false, 'Audit event must not leak content');
+  } finally {
+    db.close();
+  }
+});
+
+test('MemoryService.deleteMemory - rejects cross-scope memory ID within transaction and commits denial audit', () => {
+  const { db, authorizer, memoryService, auditRepo, workspaceA, workspaceB } = setupServiceTest();
+
+  try {
+    const adminA = authorizer.authorizeUser({
+      credentials: 'token-admin-alpha',
+      requestedScope: workspaceA
+    });
+    const adminB = authorizer.authorizeUser({
+      credentials: 'token-admin-beta',
+      requestedScope: workspaceB
+    });
+
+    const memB = memoryService.createMemory(adminB, {
+      key: 'workspace.b.memory.del',
+      content: 'Workspace B content to delete',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceB.scopeId
+    });
+
+    assert.throws(
+      () => memoryService.deleteMemory(adminA, memB.id),
+      (err: unknown) => err instanceof MemoryScopeViolationError
+    );
+
+    // Verify denial audit was committed inside the transaction via discriminated outcome
+    const deniedEvents = auditRepo.getEventsByTaskId('__system_memory__')
+      .filter((e) => e.eventType === 'MEMORY_ACCESS_DENIED');
+    const crossScopeEvent = deniedEvents.find((e) => e.detailsJson.includes('CROSS_SCOPE_DELETE_ATTEMPT'));
+    assert.ok(crossScopeEvent, 'Cross-scope denial audit event must be committed to audit repository');
+    const details = JSON.parse(crossScopeEvent.detailsJson);
+    assert.equal(details.memoryId, memB.id);
+    assert.equal('key' in details, false, 'Audit event must not leak memory key');
+    assert.equal('content' in details, false, 'Audit event must not leak content');
   } finally {
     db.close();
   }
@@ -1459,11 +1509,114 @@ test('MemoryService.deleteMemory - rejects pending proposals and prevents destro
     assert.ok(row);
     assert.equal(row.status, 'PENDING_APPROVAL');
 
-    // 4. Audit confirms APPROVAL_BYPASS_ATTEMPT was logged
+    // 4. Audit confirms APPROVAL_BYPASS_ATTEMPT was committed without leaking keys or raw content
     const deniedEvents = auditRepo.getEventsByTaskId('__system_memory__')
       .filter((e) => e.eventType === 'MEMORY_ACCESS_DENIED');
     const bypassEvent = deniedEvents.find((e) => e.detailsJson.includes('APPROVAL_BYPASS_ATTEMPT'));
     assert.ok(bypassEvent, 'Must audit APPROVAL_BYPASS_ATTEMPT on deleteMemory attempt');
+    const details = JSON.parse(bypassEvent.detailsJson);
+    assert.equal(details.operation, 'deleteMemory');
+    assert.equal(details.memoryId, proposal.id);
+    assert.equal('key' in details, false, 'Audit event must not leak memory key');
+    assert.equal('content' in details, false, 'Audit event must not leak content');
+  } finally {
+    db.close();
+  }
+});
+
+test('MemoryService.archiveMemory - two-way atomicity guarantees rollback of state mutation and audit on failure', () => {
+  let shouldFail = false;
+  const { db, authorizer, memoryService, workspaceA } = setupServiceTest({
+    _testPostAuditHook: () => {
+      if (shouldFail) {
+        throw new Error('SIMULATED_POST_AUDIT_CRASH');
+      }
+    }
+  });
+
+  try {
+    const adminCaller = authorizer.authorizeUser({
+      credentials: 'token-admin-alpha',
+      requestedScope: workspaceA
+    });
+
+    // 1. Create an active memory
+    const mem = memoryService.createMemory(adminCaller, {
+      key: 'archive.atomic.rollback.key',
+      content: 'Rollback test content',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceA.scopeId
+    });
+    assert.equal(mem.status, 'ACTIVE');
+
+    // 2. Enable simulated failure in post-audit hook
+    shouldFail = true;
+
+    assert.throws(
+      () => memoryService.archiveMemory(adminCaller, mem.id),
+      (err: unknown) => err instanceof Error && err.message.includes('SIMULATED_POST_AUDIT_CRASH')
+    );
+
+    // 3. Verify memory status was rolled back to ACTIVE (not left as ARCHIVED)
+    const memInDb = memoryService.getMemoryById(adminCaller, mem.id);
+    assert.ok(memInDb);
+    assert.equal(memInDb.status, 'ACTIVE', 'Memory status must roll back to ACTIVE');
+
+    // 4. Verify MEMORY_ARCHIVED audit event was rolled back
+    const auditRows = db.prepare('SELECT * FROM audit_events WHERE details_json LIKE ?')
+      .all(`%"${mem.id}"%`) as Array<{ event_type: string }>;
+    const archiveEvents = auditRows.filter((r) => r.event_type === 'MEMORY_ARCHIVED');
+    assert.equal(archiveEvents.length, 0, 'MEMORY_ARCHIVED audit event must be rolled back on transaction failure');
+  } finally {
+    db.close();
+  }
+});
+
+test('MemoryService.deleteMemory - two-way atomicity guarantees rollback of state mutation and audit on failure', () => {
+  let shouldFail = false;
+  const { db, authorizer, memoryService, workspaceA } = setupServiceTest({
+    _testPostAuditHook: () => {
+      if (shouldFail) {
+        throw new Error('SIMULATED_DELETE_POST_AUDIT_CRASH');
+      }
+    }
+  });
+
+  try {
+    const adminCaller = authorizer.authorizeUser({
+      credentials: 'token-admin-alpha',
+      requestedScope: workspaceA
+    });
+
+    // 1. Create an active memory
+    const mem = memoryService.createMemory(adminCaller, {
+      key: 'delete.atomic.rollback.key',
+      content: 'Delete rollback test content',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceA.scopeId
+    });
+    assert.equal(mem.status, 'ACTIVE');
+
+    // 2. Enable simulated failure in post-audit hook
+    shouldFail = true;
+
+    assert.throws(
+      () => memoryService.deleteMemory(adminCaller, mem.id),
+      (err: unknown) => err instanceof Error && err.message.includes('SIMULATED_DELETE_POST_AUDIT_CRASH')
+    );
+
+    // 3. Verify memory record was NOT deleted and remains intact in database
+    const memInDb = memoryService.getMemoryById(adminCaller, mem.id);
+    assert.ok(memInDb, 'Memory record must not be deleted on transaction failure');
+    assert.equal(memInDb.status, 'ACTIVE');
+
+    // 4. Verify MEMORY_DELETED audit event was rolled back
+    const auditRows = db.prepare('SELECT * FROM audit_events WHERE details_json LIKE ?')
+      .all(`%"${mem.id}"%`) as Array<{ event_type: string }>;
+    const deleteEvents = auditRows.filter((r) => r.event_type === 'MEMORY_DELETED');
+    assert.equal(deleteEvents.length, 0, 'MEMORY_DELETED audit event must be rolled back on transaction failure');
   } finally {
     db.close();
   }

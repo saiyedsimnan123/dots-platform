@@ -490,11 +490,15 @@ export class MemoryService {
    * Archives an active memory within the caller's scope, requiring DELETE permission.
    * State mutation audit logging is mandatory (fail-closed).
    * 
-   * Strict Lifecycle & Status Gates:
-   * 1. Only records in status 'ACTIVE' can be archived via archiveMemory.
-   * 2. Pending proposals ('PENDING_APPROVAL') cannot be archived via archiveMemory;
+   * Atomic Lifecycle & Status Gates:
+   * 1. The record lookup, scope validation, status validation, mutation, and mandatory
+   *    audit write all execute within ONE atomic transaction boundary.
+   * 2. Only records in status 'ACTIVE' can be archived via archiveMemory.
+   * 3. Pending proposals ('PENDING_APPROVAL') cannot be archived via archiveMemory;
    *    proposals can only be resolved through decideProposal with APPROVE permission.
-   * 3. Already archived memories ('ARCHIVED') cannot be re-archived.
+   * 4. Already archived memories ('ARCHIVED') cannot be re-archived.
+   * 5. Discriminated outcome pattern ensures denial audit events are committed to the
+   *    database without rollback before the public method throws.
    */
   public archiveMemory(caller: CallerContext, id: string): Memory {
     this.validateCaller(caller, 'DELETE');
@@ -502,47 +506,58 @@ export class MemoryService {
       throw new ValidationError('Memory ID must be a non-empty string.');
     }
 
-    let existing: Memory | null;
-    try {
-      existing = this.memoryRepo.getMemoryById(id, caller.scope);
-    } catch (err) {
-      if (err instanceof MemoryScopeViolationError) {
-        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
-          reason: 'CROSS_SCOPE_ARCHIVE_ATTEMPT',
-          memoryId: id,
-          expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
-        }, false);
+    type ArchiveOutcome =
+      | { ok: true; memory: Memory }
+      | { ok: false; error: Error };
+
+    const outcome = this.memoryRepo.transaction((): ArchiveOutcome => {
+      let existing: Memory | null;
+      try {
+        existing = this.memoryRepo.getMemoryById(id, caller.scope);
+      } catch (err) {
+        if (err instanceof MemoryScopeViolationError) {
+          this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+            reason: 'CROSS_SCOPE_ARCHIVE_ATTEMPT',
+            memoryId: id,
+            expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+          }, false);
+          return { ok: false, error: err };
+        }
+        throw err;
       }
-      throw err;
-    }
 
-    if (!existing) {
-      throw new MemoryNotFoundError(id);
-    }
+      if (!existing) {
+        return { ok: false, error: new MemoryNotFoundError(id) };
+      }
 
-    // STRICT APPROVAL GATE: pending proposals must not be archived via archiveMemory
-    if (existing.status === 'PENDING_APPROVAL') {
-      this.audit(caller, 'MEMORY_ACCESS_DENIED', {
-        reason: 'APPROVAL_BYPASS_ATTEMPT',
-        operation: 'archiveMemory',
-        memoryId: id,
-        attemptedStatus: 'ARCHIVED'
-      }, false);
-      throw new SecurityViolationError(
-        'Cannot archive a pending proposal via archiveMemory. Only the trusted decideProposal path with APPROVE permission may decide proposals.',
-        'UNAUTHORIZED_APPROVAL',
-        { memoryId: id, attemptedStatus: 'ARCHIVED' }
-      );
-    }
+      // STRICT APPROVAL GATE: pending proposals must not be archived via archiveMemory
+      if (existing.status === 'PENDING_APPROVAL') {
+        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+          reason: 'APPROVAL_BYPASS_ATTEMPT',
+          operation: 'archiveMemory',
+          memoryId: id,
+          attemptedStatus: 'ARCHIVED'
+        }, false);
+        return {
+          ok: false,
+          error: new SecurityViolationError(
+            'Cannot archive a pending proposal via archiveMemory. Only the trusted decideProposal path with APPROVE permission may decide proposals.',
+            'UNAUTHORIZED_APPROVAL',
+            { memoryId: id, attemptedStatus: 'ARCHIVED' }
+          )
+        };
+      }
 
-    // INVALID STATUS TRANSITION: cannot re-archive an already archived record
-    if (existing.status === 'ARCHIVED') {
-      throw new ValidationError(
-        `Cannot archive memory '${id}': record is already archived.`
-      );
-    }
+      // INVALID STATUS TRANSITION: cannot re-archive an already archived record
+      if (existing.status === 'ARCHIVED') {
+        return {
+          ok: false,
+          error: new ValidationError(
+            `Cannot archive memory '${id}': record is already archived.`
+          )
+        };
+      }
 
-    return this.memoryRepo.transaction(() => {
       const archived = this.memoryRepo.archiveMemory(id, caller.scope);
       this.audit(caller, 'MEMORY_ARCHIVED', {
         memoryId: archived.id,
@@ -550,8 +565,19 @@ export class MemoryService {
         scopeType: archived.scopeType,
         scopeId: archived.scopeId
       }, true);
-      return archived;
+
+      if (this._testPostAuditHook) {
+        this._testPostAuditHook();
+      }
+
+      return { ok: true, memory: archived };
     });
+
+    if (!outcome.ok) {
+      throw outcome.error;
+    }
+
+    return outcome.memory;
   }
 
   /**
@@ -559,9 +585,13 @@ export class MemoryService {
    * foreign keys in injection provenance records. Requires DELETE permission.
    * State mutation audit logging is mandatory (fail-closed).
    * 
-   * Strict Lifecycle Gate:
-   * Pending proposals ('PENDING_APPROVAL') cannot be deleted via deleteMemory;
-   * proposals must be decided through the trusted decideProposal path.
+   * Atomic Lifecycle Gate:
+   * 1. The record lookup, scope validation, status validation, mutation, and mandatory
+   *    audit write all execute within ONE atomic transaction boundary.
+   * 2. Pending proposals ('PENDING_APPROVAL') cannot be deleted via deleteMemory;
+   *    proposals must be decided through the trusted decideProposal path.
+   * 3. Discriminated outcome pattern ensures denial audit events are committed to the
+   *    database without rollback before the public method throws.
    */
   public deleteMemory(caller: CallerContext, id: string): boolean {
     this.validateCaller(caller, 'DELETE');
@@ -569,39 +599,47 @@ export class MemoryService {
       throw new ValidationError('Memory ID must be a non-empty string.');
     }
 
-    let existing: Memory | null;
-    try {
-      existing = this.memoryRepo.getMemoryById(id, caller.scope);
-    } catch (err) {
-      if (err instanceof MemoryScopeViolationError) {
-        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
-          reason: 'CROSS_SCOPE_DELETE_ATTEMPT',
-          memoryId: id,
-          expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
-        }, false);
+    type DeleteOutcome =
+      | { ok: true; deleted: boolean }
+      | { ok: false; error: Error };
+
+    const outcome = this.memoryRepo.transaction((): DeleteOutcome => {
+      let existing: Memory | null;
+      try {
+        existing = this.memoryRepo.getMemoryById(id, caller.scope);
+      } catch (err) {
+        if (err instanceof MemoryScopeViolationError) {
+          this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+            reason: 'CROSS_SCOPE_DELETE_ATTEMPT',
+            memoryId: id,
+            expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+          }, false);
+          return { ok: false, error: err };
+        }
+        throw err;
       }
-      throw err;
-    }
 
-    if (!existing) {
-      throw new MemoryNotFoundError(id);
-    }
+      if (!existing) {
+        return { ok: false, error: new MemoryNotFoundError(id) };
+      }
 
-    // STRICT APPROVAL GATE: pending proposals must not be deleted directly
-    if (existing.status === 'PENDING_APPROVAL') {
-      this.audit(caller, 'MEMORY_ACCESS_DENIED', {
-        reason: 'APPROVAL_BYPASS_ATTEMPT',
-        operation: 'deleteMemory',
-        memoryId: id
-      }, false);
-      throw new SecurityViolationError(
-        'Cannot delete a pending proposal via deleteMemory. Only the trusted decideProposal path with APPROVE permission may decide proposals.',
-        'UNAUTHORIZED_APPROVAL',
-        { memoryId: id }
-      );
-    }
+      // STRICT APPROVAL GATE: pending proposals must not be deleted directly
+      if (existing.status === 'PENDING_APPROVAL') {
+        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+          reason: 'APPROVAL_BYPASS_ATTEMPT',
+          operation: 'deleteMemory',
+          memoryId: id
+        }, false);
+        return {
+          ok: false,
+          error: new SecurityViolationError(
+            'Cannot delete a pending proposal via deleteMemory. Only the trusted decideProposal path with APPROVE permission may decide proposals.',
+            'UNAUTHORIZED_APPROVAL',
+            { memoryId: id }
+          )
+        };
+      }
 
-    return this.memoryRepo.transaction(() => {
       const deleted = this.memoryRepo.deleteMemory(id, caller.scope);
 
       // Mandatory audit write for hard deletion
@@ -612,8 +650,18 @@ export class MemoryService {
         scopeId: existing.scopeId
       }, true);
 
-      return deleted;
+      if (this._testPostAuditHook) {
+        this._testPostAuditHook();
+      }
+
+      return { ok: true, deleted };
     });
+
+    if (!outcome.ok) {
+      throw outcome.error;
+    }
+
+    return outcome.deleted;
   }
 
   /**
