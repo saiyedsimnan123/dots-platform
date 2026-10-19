@@ -466,3 +466,349 @@ test('AuditRepository - filters non-schema property names from updatedFields in 
 
   db.close();
 });
+
+
+test('AuditRepository - value hardening: drops nested objects and non-primitive values from memory audit fields', () => {
+  const db = new DatabaseManager(':memory:');
+  const taskRepo = new TaskRepository(db);
+  const auditRepo = new AuditRepository(db);
+  const task = taskRepo.createTask({ goal: 'Value hardening test - nested objects' });
+
+  const event = auditRepo.appendEvent({
+    taskId: task.id,
+    eventType: 'MEMORY_CREATED',
+    actor: 'USER',
+    details: {
+      memoryId: { leaked: 'nested-object-payload' },
+      category: { subKey: 'PROJECT_FACT' },
+      scopeType: ['WORKSPACE'],
+      scopeId: { nested: 'ws-1' },
+      status: { status: 'ACTIVE' }
+    }
+  });
+
+  const parsed = JSON.parse(event.detailsJson);
+  assert.deepEqual(parsed, {}, 'All nested objects or non-primitive values must be dropped');
+  assert.equal('memoryId' in parsed, false);
+  assert.equal('category' in parsed, false);
+  assert.equal('scopeType' in parsed, false);
+  assert.equal('scopeId' in parsed, false);
+  assert.equal('status' in parsed, false);
+
+  db.close();
+});
+
+test('AuditRepository - value hardening: drops non-enum strings for finite allowlisted properties', () => {
+  const db = new DatabaseManager(':memory:');
+  const taskRepo = new TaskRepository(db);
+  const auditRepo = new AuditRepository(db);
+  const task = taskRepo.createTask({ goal: 'Value hardening test - finite enums' });
+
+  // Test MEMORY_PROPOSAL_DECIDED with invalid enums
+  const event1 = auditRepo.appendEvent({
+    taskId: task.id,
+    eventType: 'MEMORY_PROPOSAL_DECIDED',
+    actor: 'USER',
+    details: {
+      memoryId: 'mem-dec-valid',
+      category: 'INVALID_CATEGORY_XYZ',
+      decision: 'MAYBE_APPROVE',
+      decidedBy: 'UNKNOWN_ACTOR',
+      scopeType: 'INVALID_SCOPE',
+      scopeId: 'ws-1',
+      previousStatus: 'NOT_A_STATUS',
+      newStatus: 'SUPER_ACTIVE'
+    }
+  });
+
+  const parsed1 = JSON.parse(event1.detailsJson);
+  assert.deepEqual(parsed1, {
+    memoryId: 'mem-dec-valid',
+    scopeId: 'ws-1'
+  }, 'Invalid enums must be dropped while valid fields are retained');
+
+  // Test MEMORIES_IMPORTED with invalid conflict strategy
+  const event2 = auditRepo.appendEvent({
+    taskId: task.id,
+    eventType: 'MEMORIES_IMPORTED',
+    actor: 'USER',
+    details: {
+      targetScopeType: 'WORKSPACE',
+      targetScopeId: 'ws-1',
+      conflictStrategy: 'INVALID_MERGE_STRATEGY',
+      totalInBundle: 1,
+      importedCount: 1
+    }
+  });
+
+  const parsed2 = JSON.parse(event2.detailsJson);
+  assert.equal('conflictStrategy' in parsed2, false);
+  assert.equal(parsed2.targetScopeType, 'WORKSPACE');
+  assert.equal(parsed2.totalInBundle, 1);
+
+  // Test MEMORIES_PURGED with invalid purgeMode
+  const event3 = auditRepo.appendEvent({
+    taskId: task.id,
+    eventType: 'MEMORIES_PURGED',
+    actor: 'USER',
+    details: {
+      scopeType: 'WORKSPACE',
+      scopeId: 'ws-1',
+      purgeMode: 'NUKE_ALL',
+      purgedCount: 0
+    }
+  });
+
+  const parsed3 = JSON.parse(event3.detailsJson);
+  assert.equal('purgeMode' in parsed3, false);
+  assert.equal(parsed3.purgedCount, 0);
+
+  db.close();
+});
+
+test('AuditRepository - value hardening: enforces strict ID and scope formats', () => {
+  const db = new DatabaseManager(':memory:');
+  const taskRepo = new TaskRepository(db);
+  const auditRepo = new AuditRepository(db);
+  const task = taskRepo.createTask({ goal: 'Value hardening test - ID formats' });
+
+  const event = auditRepo.appendEvent({
+    taskId: task.id,
+    eventType: 'MEMORY_ACCESS_DENIED',
+    actor: 'AGENT',
+    details: {
+      memoryId: 'mem-1; DROP TABLE users;--',
+      taskId: 'task/with/slashes',
+      scopeId: 'ws space invalid',
+      expectedScope: 'INVALID_SCOPE_NO_COLON',
+      callerScope: 'WORKSPACE:valid-scope-1',
+      reason: 'CROSS_SCOPE_READ_ATTEMPT',
+      operation: 'getMemoryById',
+      checksum: 'bad checksum with spaces @#$'
+    }
+  });
+
+  const parsed = JSON.parse(event.detailsJson);
+  assert.equal('memoryId' in parsed, false, 'Malformed memoryId with SQL injection must be dropped');
+  assert.equal('taskId' in parsed, false, 'Malformed taskId with slashes must be dropped');
+  assert.equal('scopeId' in parsed, false, 'Malformed scopeId with spaces must be dropped');
+  assert.equal('expectedScope' in parsed, false, 'Malformed scope string without colon must be dropped');
+  assert.equal('checksum' in parsed, false, 'Malformed checksum with special characters must be dropped');
+  assert.equal(parsed.callerScope, 'WORKSPACE:valid-scope-1');
+  assert.equal(parsed.reason, 'CROSS_SCOPE_READ_ATTEMPT');
+  assert.equal(parsed.operation, 'getMemoryById');
+
+  db.close();
+});
+
+test('AuditRepository - value hardening: enforces strict numeric bounds for counts and batch limits', () => {
+  const db = new DatabaseManager(':memory:');
+  const taskRepo = new TaskRepository(db);
+  const auditRepo = new AuditRepository(db);
+  const task = taskRepo.createTask({ goal: 'Value hardening test - numerics' });
+
+  const event = auditRepo.appendEvent({
+    taskId: task.id,
+    eventType: 'MEMORIES_PURGED',
+    actor: 'USER',
+    details: {
+      scopeType: 'WORKSPACE',
+      scopeId: 'ws-1',
+      purgeMode: 'CUTOFF',
+      purgedCount: -1,
+      batchSizeLimit: 0
+    }
+  });
+
+  const parsed = JSON.parse(event.detailsJson);
+  assert.equal('purgedCount' in parsed, false, 'Negative purgedCount must be dropped');
+  assert.equal('batchSizeLimit' in parsed, false, 'Zero batchSizeLimit must be dropped');
+  assert.equal(parsed.scopeType, 'WORKSPACE');
+  assert.equal(parsed.purgeMode, 'CUTOFF');
+
+  // Verify non-negative 0 is accepted for counts, and positive integers are accepted for batchSizeLimit
+  const validEvent = auditRepo.appendEvent({
+    taskId: task.id,
+    eventType: 'MEMORIES_PURGED',
+    actor: 'USER',
+    details: {
+      scopeType: 'WORKSPACE',
+      scopeId: 'ws-1',
+      purgeMode: 'CUTOFF',
+      purgedCount: 0,
+      batchSizeLimit: 100
+    }
+  });
+
+  const validParsed = JSON.parse(validEvent.detailsJson);
+  assert.equal(validParsed.purgedCount, 0, 'Zero count must be preserved');
+  assert.equal(validParsed.batchSizeLimit, 100, 'Valid positive batch limit must be preserved');
+
+  // Verify non-integers and string numbers are dropped
+  const nonIntEvent = auditRepo.appendEvent({
+    taskId: task.id,
+    eventType: 'MEMORY_RETRIEVED',
+    actor: 'USER',
+    details: {
+      memoryId: 'mem-1',
+      count: 3.14,
+      totalInjections: '5'
+    }
+  });
+
+  const nonIntParsed = JSON.parse(nonIntEvent.detailsJson);
+  assert.equal('count' in nonIntParsed, false, 'Float count must be dropped');
+  assert.equal('totalInjections' in nonIntParsed, false, 'String totalInjections must be dropped');
+  assert.equal(nonIntParsed.memoryId, 'mem-1');
+
+  db.close();
+});
+
+test('AuditRepository - value hardening: enforces strict ISO 8601 UTC timestamp format and prevents calendar rollover', () => {
+  const db = new DatabaseManager(':memory:');
+  const taskRepo = new TaskRepository(db);
+  const auditRepo = new AuditRepository(db);
+  const task = taskRepo.createTask({ goal: 'Value hardening test - timestamps' });
+
+  const invalidTimestamps = [
+    '2026-01-01',
+    '2026-01-01T12:00:00',
+    '2026-01-01T12:00:00+02:00',
+    '2026-01-01T12:00:00.1234Z',
+    '2026-02-30T00:00:00Z',
+    '2026-13-01T00:00:00Z',
+    'not-a-timestamp',
+    '2026-01-01T25:00:00Z'
+  ];
+
+  for (const invalidTs of invalidTimestamps) {
+    const event = auditRepo.appendEvent({
+      taskId: task.id,
+      eventType: 'MEMORIES_PURGED',
+      actor: 'USER',
+      details: {
+        scopeType: 'WORKSPACE',
+        scopeId: 'ws-1',
+        purgeMode: 'CUTOFF',
+        cutoffTimestamp: invalidTs
+      }
+    });
+
+    const parsed = JSON.parse(event.detailsJson);
+    assert.equal(
+      'cutoffTimestamp' in parsed,
+      false,
+      `Invalid timestamp '${invalidTs}' must be dropped`
+    );
+  }
+
+  // Valid timestamps must be preserved
+  const validTimestamps = [
+    '2026-01-01T00:00:00Z',
+    '2026-01-01T00:00:00.1Z',
+    '2026-01-01T00:00:00.12Z',
+    '2026-01-01T00:00:00.123Z'
+  ];
+
+  for (const validTs of validTimestamps) {
+    const event = auditRepo.appendEvent({
+      taskId: task.id,
+      eventType: 'MEMORIES_PURGED',
+      actor: 'USER',
+      details: {
+        scopeType: 'WORKSPACE',
+        scopeId: 'ws-1',
+        purgeMode: 'CUTOFF',
+        cutoffTimestamp: validTs
+      }
+    });
+
+    const parsed = JSON.parse(event.detailsJson);
+    assert.equal(
+      parsed.cutoffTimestamp,
+      validTs,
+      `Valid timestamp '${validTs}' must be preserved`
+    );
+  }
+
+  db.close();
+});
+
+test('AuditRepository - value hardening: validates every array element in memoryIds', () => {
+  const db = new DatabaseManager(':memory:');
+  const taskRepo = new TaskRepository(db);
+  const auditRepo = new AuditRepository(db);
+  const task = taskRepo.createTask({ goal: 'Value hardening test - memoryIds array' });
+
+  // Mixed array: valid IDs retained, invalid elements (objects, malformed strings) dropped
+  const event = auditRepo.appendEvent({
+    taskId: task.id,
+    eventType: 'MEMORY_RETRIEVED',
+    actor: 'USER',
+    details: {
+      memoryIds: [
+        'valid-mem-1',
+        { malicious: 'object-payload' },
+        'invalid id with spaces',
+        'valid-mem-2',
+        12345
+      ]
+    }
+  });
+
+  const parsed = JSON.parse(event.detailsJson);
+  assert.deepEqual(
+    parsed.memoryIds,
+    ['valid-mem-1', 'valid-mem-2'],
+    'Only valid ID strings should be retained in memoryIds'
+  );
+
+  // Array of only objects: entire property should be dropped
+  const allInvalidEvent = auditRepo.appendEvent({
+    taskId: task.id,
+    eventType: 'MEMORY_RETRIEVED',
+    actor: 'USER',
+    details: {
+      memoryIds: [{ malicious: 'payload1' }, { malicious: 'payload2' }]
+    }
+  });
+
+  const allInvalidParsed = JSON.parse(allInvalidEvent.detailsJson);
+  assert.equal('memoryIds' in allInvalidParsed, false, 'Array of only invalid elements must be dropped');
+
+  db.close();
+});
+
+test('AuditRepository - value hardening: ignores prototype pollution payloads', () => {
+  const db = new DatabaseManager(':memory:');
+  const taskRepo = new TaskRepository(db);
+  const auditRepo = new AuditRepository(db);
+  const task = taskRepo.createTask({ goal: 'Value hardening test - prototype pollution' });
+
+  const pollutedInput = JSON.parse(
+    '{"__proto__": {"polluted": "yes"}, "constructor": {"evil": true}, "prototype": {"evil": true}, "memoryId": "mem-pollute-1", "category": "PROJECT_FACT"}'
+  );
+
+  const event = auditRepo.appendEvent({
+    taskId: task.id,
+    eventType: 'MEMORY_CREATED',
+    actor: 'USER',
+    details: pollutedInput
+  });
+
+  const parsed = JSON.parse(event.detailsJson);
+  assert.deepEqual(parsed, {
+    memoryId: 'mem-pollute-1',
+    category: 'PROJECT_FACT'
+  });
+
+  // Verify Object prototype was not contaminated
+  assert.equal((Object.prototype as Record<string, unknown>).polluted, undefined);
+  assert.equal(Object.hasOwn(parsed, '__proto__'), false);
+  assert.equal(Object.hasOwn(parsed, 'constructor'), false);
+  assert.equal(Object.hasOwn(parsed, 'prototype'), false);
+  assert.equal(event.detailsJson.includes('polluted'), false);
+  assert.equal(event.detailsJson.includes('evil'), false);
+
+  db.close();
+});
