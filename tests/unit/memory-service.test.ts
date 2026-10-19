@@ -1662,3 +1662,243 @@ test('MemoryService - proposal decision workflow transitions properly and enable
     db.close();
   }
 });
+
+// ============================================================================
+// Phase 7.5: Substep 6 - Memory Lifecycle Consistency Review Tests
+// ============================================================================
+
+test('MemoryService.updateMemory - rejects agent attempts to mutate ARCHIVED memories', () => {
+  const { db, hostAuthority, authorizer, memoryService, taskRepo, auditRepo, workspaceA } = setupServiceTest();
+
+  try {
+    const task = hostAuthority.createTask(taskRepo, {
+      goal: 'Agent proposal task',
+      scope: workspaceA
+    });
+    const agentCaller = authorizer.authorizeAgent({ taskId: task.id });
+    const adminCaller = authorizer.authorizeUser({
+      credentials: 'token-admin-alpha',
+      requestedScope: workspaceA
+    });
+
+    // 1. Create an active memory and archive it
+    const active = memoryService.createMemory(adminCaller, {
+      key: 'agent.archived.guard.key',
+      content: 'Original active content',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceA.scopeId
+    });
+    const archived = memoryService.archiveMemory(adminCaller, active.id);
+    assert.equal(archived.status, 'ARCHIVED');
+
+    // 2. Agent attempts to overwrite the archived memory
+    assert.throws(
+      () => memoryService.updateMemory(agentCaller, archived.id, {
+        content: 'Agent overwrote archived memory'
+      }),
+      (err: unknown) =>
+        err instanceof SecurityViolationError &&
+        err.violationType === 'AGENT_MUTATION_RESTRICTED' &&
+        err.message.includes('Agents cannot directly modify memories')
+    );
+
+    // 3. Verify archived memory content in database remains intact
+    const unchanged = memoryService.getMemoryById(adminCaller, archived.id);
+    assert.ok(unchanged);
+    assert.equal(unchanged.content, 'Original active content');
+    assert.equal(unchanged.status, 'ARCHIVED');
+
+    // 4. Verify AGENT_MUTATION_DENIED audit was committed
+    const deniedEvents = auditRepo.getEventsByTaskId(task.id)
+      .filter((e) => e.eventType === 'MEMORY_ACCESS_DENIED');
+    const agentDeniedEvent = deniedEvents.find((e) => e.detailsJson.includes('AGENT_MUTATION_DENIED'));
+    assert.ok(agentDeniedEvent, 'Must audit AGENT_MUTATION_DENIED');
+    const details = JSON.parse(agentDeniedEvent.detailsJson);
+    assert.equal(details.operation, 'updateMemory');
+    assert.equal(details.memoryId, archived.id);
+    assert.equal('key' in details, false, 'Audit event must not leak memory key');
+    assert.equal('content' in details, false, 'Audit event must not leak content');
+  } finally {
+    db.close();
+  }
+});
+
+test('MemoryService.updateMemory - rejects agent attempts to mutate PENDING_APPROVAL proposals', () => {
+  const { db, hostAuthority, authorizer, memoryService, taskRepo, workspaceA } = setupServiceTest();
+
+  try {
+    const task = hostAuthority.createTask(taskRepo, {
+      goal: 'Agent proposal task',
+      scope: workspaceA
+    });
+    const agentCaller = authorizer.authorizeAgent({ taskId: task.id });
+    const adminCaller = authorizer.authorizeUser({
+      credentials: 'token-admin-alpha',
+      requestedScope: workspaceA
+    });
+
+    // 1. Submit proposal
+    const proposal = memoryService.createMemory(agentCaller, {
+      key: 'agent.pending.guard.key',
+      content: 'Original proposal content',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceA.scopeId
+    });
+    assert.equal(proposal.status, 'PENDING_APPROVAL');
+
+    // 2. Agent attempts to overwrite the pending proposal
+    assert.throws(
+      () => memoryService.updateMemory(agentCaller, proposal.id, {
+        content: 'Agent tampered proposal content'
+      }),
+      (err: unknown) =>
+        err instanceof SecurityViolationError &&
+        err.violationType === 'AGENT_MUTATION_RESTRICTED'
+    );
+
+    // 3. Proposal content in database remains intact
+    const unchanged = memoryService.getMemoryById(adminCaller, proposal.id);
+    assert.ok(unchanged);
+    assert.equal(unchanged.content, 'Original proposal content');
+    assert.equal(unchanged.status, 'PENDING_APPROVAL');
+  } finally {
+    db.close();
+  }
+});
+
+test('MemoryService.updateMemory - rejects caller attempts to mutate ARCHIVED memories', () => {
+  const { db, authorizer, memoryService, workspaceA } = setupServiceTest();
+
+  try {
+    const adminCaller = authorizer.authorizeUser({
+      credentials: 'token-admin-alpha',
+      requestedScope: workspaceA
+    });
+
+    // 1. Create and archive memory
+    const active = memoryService.createMemory(adminCaller, {
+      key: 'archived.immutable.key',
+      content: 'Original archived content',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceA.scopeId
+    });
+    const archived = memoryService.archiveMemory(adminCaller, active.id);
+    const originalUpdatedAt = archived.updatedAt;
+
+    // 2. Admin caller attempts to mutate archived memory
+    assert.throws(
+      () => memoryService.updateMemory(adminCaller, archived.id, {
+        content: 'Tampered archived content'
+      }),
+      (err: unknown) =>
+        err instanceof ValidationError &&
+        err.message.includes('record is archived')
+    );
+
+    // 3. Verify content and updatedAt remain unchanged
+    const unchanged = memoryService.getMemoryById(adminCaller, archived.id);
+    assert.ok(unchanged);
+    assert.equal(unchanged.content, 'Original archived content');
+    assert.equal(unchanged.updatedAt, originalUpdatedAt);
+  } finally {
+    db.close();
+  }
+});
+
+test('MemoryService.updateMemory - rejects caller attempts to mutate PENDING_APPROVAL proposals without deciding them', () => {
+  const { db, hostAuthority, authorizer, memoryService, taskRepo, workspaceA } = setupServiceTest();
+
+  try {
+    const task = hostAuthority.createTask(taskRepo, {
+      goal: 'Proposal task',
+      scope: workspaceA
+    });
+    const agentCaller = authorizer.authorizeAgent({ taskId: task.id });
+    const userCaller = authorizer.authorizeUser({
+      credentials: 'token-member-alpha',
+      requestedScope: workspaceA
+    });
+
+    // 1. Submit proposal
+    const proposal = memoryService.createMemory(agentCaller, {
+      key: 'proposal.immutable.key',
+      content: 'Original proposed content',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceA.scopeId
+    });
+
+    // 2. Member user attempts to alter proposal content via updateMemory
+    assert.throws(
+      () => memoryService.updateMemory(userCaller, proposal.id, {
+        content: 'Altered proposal content'
+      }),
+      (err: unknown) =>
+        err instanceof SecurityViolationError &&
+        err.violationType === 'UNAUTHORIZED_APPROVAL' &&
+        err.message.includes('Cannot modify a pending proposal via updateMemory')
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('MemoryService.decideProposal - two-way atomicity guarantees rollback of decision on audit failure', () => {
+  let shouldFail = false;
+  const { db, hostAuthority, authorizer, memoryService, taskRepo, workspaceA } = setupServiceTest({
+    _testPostAuditHook: () => {
+      if (shouldFail) {
+        throw new Error('SIMULATED_DECISION_POST_AUDIT_CRASH');
+      }
+    }
+  });
+
+  try {
+    const task = hostAuthority.createTask(taskRepo, {
+      goal: 'Proposal atomicity task',
+      scope: workspaceA
+    });
+    const agentCaller = authorizer.authorizeAgent({ taskId: task.id });
+    const adminCaller = authorizer.authorizeUser({
+      credentials: 'token-admin-alpha',
+      requestedScope: workspaceA
+    });
+
+    // 1. Submit proposal
+    const proposal = memoryService.createMemory(agentCaller, {
+      key: 'decision.atomic.rollback.key',
+      content: 'Atomic decision content',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: workspaceA.scopeId
+    });
+    assert.equal(proposal.status, 'PENDING_APPROVAL');
+
+    // 2. Enable post-audit failure
+    shouldFail = true;
+
+    assert.throws(
+      () => memoryService.decideProposal(adminCaller, {
+        memoryId: proposal.id,
+        decision: 'APPROVED'
+      }),
+      (err: unknown) => err instanceof Error && err.message.includes('SIMULATED_DECISION_POST_AUDIT_CRASH')
+    );
+
+    // 3. Verify proposal status in database remains PENDING_APPROVAL
+    const inDb = memoryService.getMemoryById(adminCaller, proposal.id);
+    assert.ok(inDb);
+    assert.equal(inDb.status, 'PENDING_APPROVAL', 'Proposal status must roll back to PENDING_APPROVAL');
+
+    // 4. Verify MEMORY_PROPOSAL_DECIDED audit event was rolled back
+    const auditRows = db.prepare('SELECT * FROM audit_events WHERE details_json LIKE ?')
+      .all(`%"${proposal.id}"%`) as Array<{ event_type: string }>;
+    const decidedEvents = auditRows.filter((r) => r.event_type === 'MEMORY_PROPOSAL_DECIDED');
+    assert.equal(decidedEvents.length, 0, 'MEMORY_PROPOSAL_DECIDED audit event must be rolled back on failure');
+  } finally {
+    db.close();
+  }
+});

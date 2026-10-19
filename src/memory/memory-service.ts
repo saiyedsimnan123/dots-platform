@@ -389,13 +389,19 @@ export class MemoryService {
   }
 
   /**
-   * Updates an existing memory within the caller's scope.
+   * Updates an existing active memory within the caller's scope.
    * 
-   * Strict Security Gates:
-   * 1. Status mutations are strictly forbidden via updateMemory.
+   * Strict Lifecycle & Status Gates:
+   * 1. The record lookup, scope validation, status validation, mutation, and mandatory
+   *    audit write all execute within ONE atomic transaction boundary.
+   * 2. Status mutations are strictly forbidden via updateMemory.
    *    Proposals can ONLY be activated through decideProposal with APPROVE permission.
-   * 2. Agents cannot directly modify active memories or change status.
-   * 3. State mutation audit logging is mandatory (fail-closed).
+   * 3. Only records in status 'ACTIVE' can be updated.
+   *    - 'ARCHIVED' records cannot be updated (preserves immutability and purge retention cutoffs).
+   *    - 'PENDING_APPROVAL' proposals cannot be updated directly (proposals must be decided via decideProposal).
+   * 4. Agents are strictly forbidden from modifying memories.
+   * 5. Discriminated outcome pattern ensures denial audit events are committed to the
+   *    database without rollback before the public method throws.
    */
   public updateMemory(caller: CallerContext, id: string, input: UpdateMemoryInput): Memory {
     this.validateCaller(caller, 'WRITE');
@@ -406,71 +412,110 @@ export class MemoryService {
       throw new ValidationError('UpdateMemoryInput must be provided.');
     }
 
-    let existing: Memory | null;
-    try {
-      existing = this.memoryRepo.getMemoryById(id, caller.scope);
-    } catch (err) {
-      if (err instanceof MemoryScopeViolationError) {
-        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
-          reason: 'CROSS_SCOPE_UPDATE_ATTEMPT',
-          memoryId: id,
-          expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
-        }, false);
+    type UpdateOutcome =
+      | { ok: true; memory: Memory }
+      | { ok: false; error: Error };
+
+    const outcome = this.memoryRepo.transaction((): UpdateOutcome => {
+      let existing: Memory | null;
+      try {
+        existing = this.memoryRepo.getMemoryById(id, caller.scope);
+      } catch (err) {
+        if (err instanceof MemoryScopeViolationError) {
+          this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+            reason: 'CROSS_SCOPE_UPDATE_ATTEMPT',
+            memoryId: id,
+            expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+          }, false);
+          return { ok: false, error: err };
+        }
+        throw err;
       }
-      throw err;
-    }
 
-    if (!existing) {
-      throw new MemoryNotFoundError(id);
-    }
+      if (!existing) {
+        return { ok: false, error: new MemoryNotFoundError(id) };
+      }
 
-    // STRICT APPROVAL GATE: updateMemory must never perform status lifecycle transitions
-    if (input.status !== undefined && input.status !== existing.status) {
+      // STRICT APPROVAL GATE: updateMemory must never perform status lifecycle transitions
+      if (input.status !== undefined && input.status !== existing.status) {
+        if (existing.status === 'PENDING_APPROVAL') {
+          this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+            reason: 'APPROVAL_BYPASS_ATTEMPT',
+            operation: 'updateMemory',
+            memoryId: id,
+            attemptedStatus: input.status
+          }, false);
+          return {
+            ok: false,
+            error: new SecurityViolationError(
+              'Cannot transition status of a pending proposal via updateMemory. Only the trusted decideProposal path with APPROVE permission may decide proposals.',
+              'UNAUTHORIZED_APPROVAL',
+              { memoryId: id, attemptedStatus: input.status }
+            )
+          };
+        }
+
+        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+          reason: 'UNAUTHORIZED_STATUS_TRANSITION',
+          operation: 'updateMemory',
+          memoryId: id,
+          currentStatus: existing.status,
+          attemptedStatus: input.status
+        }, false);
+        return {
+          ok: false,
+          error: new SecurityViolationError(
+            `Direct status transitions from '${existing.status}' to '${input.status}' cannot be performed via updateMemory. Use decideProposal for proposals, or archiveMemory to archive.`,
+            'UNAUTHORIZED_STATUS_TRANSITION',
+            { memoryId: id, currentStatus: existing.status, attemptedStatus: input.status }
+          )
+        };
+      }
+
+      // AGENT RESTRICTION: Agents are strictly forbidden from directly modifying any memories
+      if (caller.actor === 'AGENT') {
+        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+          reason: 'AGENT_MUTATION_DENIED',
+          operation: 'updateMemory',
+          memoryId: id
+        }, false);
+        return {
+          ok: false,
+          error: new SecurityViolationError(
+            'Agents cannot directly modify memories.',
+            'AGENT_MUTATION_RESTRICTED',
+            { memoryId: id }
+          )
+        };
+      }
+
+      // STRICT APPROVAL GATE: Pending proposals cannot be modified directly via updateMemory
       if (existing.status === 'PENDING_APPROVAL') {
         this.audit(caller, 'MEMORY_ACCESS_DENIED', {
           reason: 'APPROVAL_BYPASS_ATTEMPT',
           operation: 'updateMemory',
-          memoryId: id,
-          attemptedStatus: input.status
-        }, false);
-        throw new SecurityViolationError(
-          'Cannot transition status of a pending proposal via updateMemory. Only the trusted decideProposal path with APPROVE permission may decide proposals.',
-          'UNAUTHORIZED_APPROVAL',
-          { memoryId: id, attemptedStatus: input.status }
-        );
-      }
-
-      this.audit(caller, 'MEMORY_ACCESS_DENIED', {
-        reason: 'UNAUTHORIZED_STATUS_TRANSITION',
-        operation: 'updateMemory',
-        memoryId: id,
-        currentStatus: existing.status,
-        attemptedStatus: input.status
-      }, false);
-      throw new SecurityViolationError(
-        `Direct status transitions from '${existing.status}' to '${input.status}' cannot be performed via updateMemory. Use decideProposal for proposals, or archiveMemory to archive.`,
-        'UNAUTHORIZED_STATUS_TRANSITION',
-        { memoryId: id, currentStatus: existing.status, attemptedStatus: input.status }
-      );
-    }
-
-    if (caller.actor === 'AGENT') {
-      // Agents cannot directly modify already ACTIVE memories
-      if (existing.status === 'ACTIVE') {
-        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
-          reason: 'AGENT_ACTIVE_MUTATION_DENIED',
-          operation: 'updateMemory',
           memoryId: id
         }, false);
-        throw new SecurityViolationError(
-          'Agents cannot directly modify active memories.',
-          'AGENT_MUTATION_RESTRICTED',
-          { memoryId: id }
-        );
+        return {
+          ok: false,
+          error: new SecurityViolationError(
+            'Cannot modify a pending proposal via updateMemory. Only the trusted decideProposal path with APPROVE permission may decide proposals.',
+            'UNAUTHORIZED_APPROVAL',
+            { memoryId: id }
+          )
+        };
       }
-    }
 
-    return this.memoryRepo.transaction(() => {
+      // IMMUTABLE ARCHIVE GATE: Archived records cannot be modified via updateMemory
+      if (existing.status === 'ARCHIVED') {
+        return {
+          ok: false,
+          error: new ValidationError(
+            `Cannot update memory '${id}': record is archived.`
+          )
+        };
+      }
+
       const updated = this.memoryRepo.updateMemory(id, caller.scope, input);
 
       // Mandatory audit write for state update
@@ -482,8 +527,18 @@ export class MemoryService {
         updatedFields: Object.keys(input)
       }, true);
 
-      return updated;
+      if (this._testPostAuditHook) {
+        this._testPostAuditHook();
+      }
+
+      return { ok: true, memory: updated };
     });
+
+    if (!outcome.ok) {
+      throw outcome.error;
+    }
+
+    return outcome.memory;
   }
 
   /**
@@ -719,32 +774,39 @@ export class MemoryService {
     // 3. Verify APPROVE permission
     this.validateCaller(caller, 'APPROVE');
 
-    // 3. Lookup existing proposal within caller scope
-    let existing: Memory | null;
-    try {
-      existing = this.memoryRepo.getMemoryById(input.memoryId, caller.scope);
-    } catch (err) {
-      if (err instanceof MemoryScopeViolationError) {
-        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
-          reason: 'CROSS_SCOPE_DECISION_ATTEMPT',
-          memoryId: input.memoryId,
-          expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
-        }, false);
+    type DecisionOutcome =
+      | { ok: true; memory: Memory }
+      | { ok: false; error: Error };
+
+    const outcome = this.memoryRepo.transaction((): DecisionOutcome => {
+      let existing: Memory | null;
+      try {
+        existing = this.memoryRepo.getMemoryById(input.memoryId, caller.scope);
+      } catch (err) {
+        if (err instanceof MemoryScopeViolationError) {
+          this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+            reason: 'CROSS_SCOPE_DECISION_ATTEMPT',
+            memoryId: input.memoryId,
+            expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+          }, false);
+          return { ok: false, error: err };
+        }
+        throw err;
       }
-      throw err;
-    }
 
-    if (!existing) {
-      throw new MemoryNotFoundError(input.memoryId);
-    }
+      if (!existing) {
+        return { ok: false, error: new MemoryNotFoundError(input.memoryId) };
+      }
 
-    if (existing.status !== 'PENDING_APPROVAL') {
-      throw new ValidationError(
-        `Cannot decide memory proposal: memory '${input.memoryId}' is not pending approval (current status: '${existing.status}').`
-      );
-    }
+      if (existing.status !== 'PENDING_APPROVAL') {
+        return {
+          ok: false,
+          error: new ValidationError(
+            `Cannot decide memory proposal: memory '${input.memoryId}' is not pending approval (current status: '${existing.status}').`
+          )
+        };
+      }
 
-    return this.memoryRepo.transaction(() => {
       const newStatus: MemoryStatus = input.decision === 'APPROVED' ? 'ACTIVE' : 'ARCHIVED';
       const updated = this.memoryRepo.updateMemory(input.memoryId, caller.scope, { status: newStatus });
 
@@ -761,8 +823,18 @@ export class MemoryService {
         newStatus
       }, true);
 
-      return updated;
+      if (this._testPostAuditHook) {
+        this._testPostAuditHook();
+      }
+
+      return { ok: true, memory: updated };
     });
+
+    if (!outcome.ok) {
+      throw outcome.error;
+    }
+
+    return outcome.memory;
   }
 
   /**
