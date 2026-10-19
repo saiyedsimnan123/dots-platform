@@ -976,7 +976,7 @@ test('AuditRepository - value hardening: injected sentinel values in allowlisted
     checksum: 'SENTINEL_LEAKED_CHECKSUM_AAA',
     memoryId: 'SENTINEL_LEAKED_MEM_ID_BBB with invalid spaces',
     scopeId: 'SENTINEL_LEAKED_SCOPE_ID_CCC with invalid spaces',
-    expectedScope: 'SENTINEL_LEAKED_SCOPE_NO_COLON_DDD',
+    expectedScope: 'SENTINEL:sentinel-value',
     cutoffTimestamp: 'SENTINEL_LEAKED_TIMESTAMP_2026-02-30T00:00:00Z',
     updatedField: 'SENTINEL_LEAKED_FIELD_EEE',
     memoryIdsItem: 'SENTINEL_LEAKED_ITEM_FFF with invalid spaces'
@@ -1095,6 +1095,86 @@ test('AuditRepository - value hardening: injected sentinel values in allowlisted
   assert.ok(row6);
   assert.equal(row6.detailsJson.includes(sentinels.memoryIdsItem), false);
   assert.equal('memoryIds' in JSON.parse(row6.detailsJson), false);
+
+  db.close();
+});
+
+test('AuditRepository - value hardening: enforces strict scope prefix (GLOBAL or WORKSPACE) and drops invalid prefixes like SENTINEL', () => {
+  const db = new DatabaseManager(':memory:');
+  const taskRepo = new TaskRepository(db);
+  const auditRepo = new AuditRepository(db);
+  const task = taskRepo.createTask({ goal: 'Value hardening test - scope prefix validation' });
+
+  // Invalid scope strings: arbitrary prefixes (like SENTINEL:sentinel-value), lowercase prefixes, missing prefix/colon, spaces
+  const invalidScopeStrings = [
+    'SENTINEL:sentinel-value',
+    'CUSTOM:workspace-1',
+    'FOO:bar',
+    'workspace:ws-1',
+    'global:default',
+    'INVALID_PREFIX:ws-1',
+    ':ws-1',
+    'WORKSPACE:',
+    'GLOBAL:',
+    'WORKSPACE:invalid id spaces',
+    'INVALID_NO_COLON'
+  ];
+
+  for (const invalidScope of invalidScopeStrings) {
+    const event = auditRepo.appendEvent({
+      taskId: task.id,
+      eventType: 'MEMORY_ACCESS_DENIED',
+      actor: 'USER',
+      details: {
+        expectedScope: invalidScope,
+        callerScope: invalidScope,
+        taskScope: invalidScope,
+        memoryScope: invalidScope,
+        attemptedScope: invalidScope
+      }
+    });
+
+    const parsed = JSON.parse(event.detailsJson);
+    assert.equal('expectedScope' in parsed, false, `Invalid scope '${invalidScope}' in expectedScope must be dropped`);
+    assert.equal('callerScope' in parsed, false, `Invalid scope '${invalidScope}' in callerScope must be dropped`);
+    assert.equal('taskScope' in parsed, false, `Invalid scope '${invalidScope}' in taskScope must be dropped`);
+    assert.equal('memoryScope' in parsed, false, `Invalid scope '${invalidScope}' in memoryScope must be dropped`);
+    assert.equal('attemptedScope' in parsed, false, `Invalid scope '${invalidScope}' in attemptedScope must be dropped`);
+    assert.equal(event.detailsJson.includes(invalidScope), false);
+  }
+
+  // Valid scope strings: GLOBAL:<id> and WORKSPACE:<id>
+  const validScopeStrings = [
+    'GLOBAL:default',
+    'GLOBAL:custom-id',
+    'WORKSPACE:ws-1',
+    'WORKSPACE:ws-alpha',
+    'WORKSPACE:workspace-hash-alpha',
+    'WORKSPACE:123e4567-e89b-12d3-a456-426614174000',
+    'WORKSPACE:tenant.project-42_v1'
+  ];
+
+  for (const validScope of validScopeStrings) {
+    const event = auditRepo.appendEvent({
+      taskId: task.id,
+      eventType: 'MEMORY_ACCESS_DENIED',
+      actor: 'USER',
+      details: {
+        expectedScope: validScope,
+        callerScope: validScope,
+        taskScope: validScope,
+        memoryScope: validScope,
+        attemptedScope: validScope
+      }
+    });
+
+    const parsed = JSON.parse(event.detailsJson);
+    assert.equal(parsed.expectedScope, validScope, `Valid scope '${validScope}' in expectedScope must be preserved`);
+    assert.equal(parsed.callerScope, validScope, `Valid scope '${validScope}' in callerScope must be preserved`);
+    assert.equal(parsed.taskScope, validScope, `Valid scope '${validScope}' in taskScope must be preserved`);
+    assert.equal(parsed.memoryScope, validScope, `Valid scope '${validScope}' in memoryScope must be preserved`);
+    assert.equal(parsed.attemptedScope, validScope, `Valid scope '${validScope}' in attemptedScope must be preserved`);
+  }
 
   db.close();
 });

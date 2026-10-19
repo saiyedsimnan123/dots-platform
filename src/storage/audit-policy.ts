@@ -275,7 +275,14 @@ export const KNOWN_DENIAL_REASONS: ReadonlySet<string> = new Set([
  *    sensitive payload data or log-injection attacks cannot be smuggled through scope fields.
  */
 const ID_PATTERN = /^[a-zA-Z0-9_.-]{1,128}$/;
-const SCOPE_STRING_PATTERN = /^[a-zA-Z0-9_.-]{1,32}:[a-zA-Z0-9_.-]{1,128}$/;
+
+/**
+ * Strict regex validator for formatted scope strings ('<scopeType>:<scopeId>').
+ * Enforces that the scope-type prefix is strictly 'GLOBAL' or 'WORKSPACE'
+ * and the identifier portion satisfies the repository's established identifier contract (ID_PATTERN).
+ * Arbitrary prefixes such as 'SENTINEL:sentinel-value' are strictly rejected and dropped.
+ */
+export const STRICT_SCOPE_STRING_REGEX = /^(?:GLOBAL|WORKSPACE):[a-zA-Z0-9_.-]{1,128}$/;
 
 /**
  * Canonical SHA-256 digest format: strictly 64 lowercase hexadecimal characters.
@@ -399,7 +406,7 @@ export function validateMemoryAuditFieldValue(
       : undefined;
   }
 
-  // Scope strings (formatted as "scopeType:scopeId")
+  // Scope strings (formatted strictly as "<scopeType>:<scopeId>" where scopeType is GLOBAL or WORKSPACE)
   if (
     key === 'expectedScope' ||
     key === 'callerScope' ||
@@ -407,7 +414,7 @@ export function validateMemoryAuditFieldValue(
     key === 'memoryScope' ||
     key === 'attemptedScope'
   ) {
-    return typeof value === 'string' && SCOPE_STRING_PATTERN.test(value) ? value : undefined;
+    return typeof value === 'string' && STRICT_SCOPE_STRING_REGEX.test(value) ? value : undefined;
   }
 
   // Non-negative finite integers
