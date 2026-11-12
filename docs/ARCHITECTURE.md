@@ -342,7 +342,17 @@ To operate comfortably on a Windows laptop with 8 GB RAM alongside typical devel
 
 ---
 
-## 8. Future Compatibility Pathways
+## 8. Phase 8 Runtime, HTTP/SSE & Persistent Scheduler Extensions
+
+- **Composition Root & Configuration (`src/runtime/app.ts`, `src/runtime/config.ts`)**: `DotsRuntime` wires storage repositories, `HostMemoryAuthority`, `TokenIdentityProvider`, `MemoryService`, `TaskCoordinator`, `CrashRecoveryEngine`, `TaskScheduler`, `RuntimeEventBus`, and `OperationalLogger` with safe localhost defaults and graceful shutdown.
+- **HTTP/SSE & CLI Interfaces (`src/api/http-server.ts`, `src/cli/main.ts`)**: Native `node:http` REST and Server-Sent Events server enforcing bearer token auth, `GLOBAL`/`WORKSPACE` scope isolation, `ADMIN`-only approval/delete role checks, request size caps, and response/log secret scrubbing.
+- **Persistent Scheduler (`003_persistent_scheduler`, `src/storage/schedule-repository.ts`, `src/scheduler/task-scheduler.ts`)**:
+  - `schedules` persists `ONE_TIME` and `INTERVAL` definitions, `next_run_at`, `missed_run_policy` (`SKIP` | `RUN_ONCE`), `consecutive_failures`, `max_consecutive_failures`, and `scope_type`/`scope_id`.
+  - `schedule_occurrences` enforces DB-level uniqueness via `UNIQUE(schedule_id, occurrence_key)`, `task_id TEXT UNIQUE`, and partial unique index `idx_schedule_occurrences_one_active` (preventing concurrent active occurrences per schedule). Deterministic task IDs (`sched_<occurrenceId>`) guarantee idempotent crash recovery across pre-claim, post-claim, post-task-create, mid-execution, and post-completion interruption points with concurrency = 1.
+
+---
+
+## 9. Future Compatibility Pathways
 
 The architecture isolates modular extensions behind stable interfaces:
 - **Scheduling & Cron**: An internal lightweight scheduler service can query `TASKS` for recurring definitions without altering the execution pipeline.

@@ -3,7 +3,11 @@
   "version": "0.1.0",
   "description": "Next-Generation Dots AI Platform - Secure, durable, provider-independent agent runtime",
   "type": "module",
+  "bin": {
+    "dots": "./src/cli/main.ts"
+  },
   "scripts": {
+    "dots": "node src/cli/main.ts",
     "test": "node --test \"tests/**/*.test.ts\"",
     "typecheck": "tsc --noEmit"
   },

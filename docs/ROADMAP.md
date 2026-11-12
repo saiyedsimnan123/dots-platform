@@ -1,6 +1,6 @@
 # Engineering Roadmap: Next-Generation Dots AI Platform
 
-> **Document Status**: Approved Baseline (Phase 7 Completed)<br/>
+> **Document Status**: Active Baseline (Phase 8A–8D Backend Implemented; Web Dashboard & Cron Pending)<br/>
 > **Development Model**: Incremental, Test-Driven, Phase-Gated
 
 ---
@@ -18,8 +18,9 @@ flowchart LR
     P3 --> P4["Phase 4<br/>Policy & Sandboxed Tools"]
     P4 --> P5["Phase 5<br/>Vertical Slice Integration"]
     P5 --> P6["Phase 6<br/>Multi-Step & Recovery"]
-    P6 --> P7["Phase 7 (COMPLETED)<br/>Auditable Memory"]
-    P7 --> P8["Phase 8<br/>CLI & Advanced Ops"]
+    P6 --> P7["Phase 7 & 7.5 (COMPLETED)<br/>Auditable Memory"]
+    P7 --> P8A["Phase 8A–8D (COMPLETED)<br/>CLI, HTTP/SSE, Scheduler & Ops"]
+    P8A --> P8E["Phase 8E (PLANNED)<br/>Web UI & Cron"]
 ```
 
 ---
@@ -115,11 +116,18 @@ flowchart LR
 
 ---
 
-### Phase 8 — User Interface (CLI & Web Dashboard) & Advanced Capabilities
-- **Objective**: Deliver a polished, ergonomic interface for daily use on the 8 GB Windows laptop.
-- **Key Deliverables**:
-  - Interactive Terminal CLI (`dots run`, `dots status`, `dots approve`, `dots memory`).
-  - Lightweight local web interface (vanilla JS or lightweight Preact/Svelte, <10 MB asset bundle).
-  - Background task scheduling (cron-compatible lightweight timer).
-  - Comprehensive documentation and operational guide.
-- **Exit Criteria**: Full end-to-end user workflows executed via CLI and Web UI with peak memory consumption strictly below 180 MB RAM.
+### Phase 8A–8D — CLI, HTTP/SSE API, Persistent Scheduler & Operational Runtime (COMPLETED)
+- **Status**: Implemented and verified via targeted integration tests.
+- **Completed Deliverables**:
+  - **Phase 8A**: Executable Terminal CLI (`src/cli/main.ts`, `dots serve|run|status|cancel|approvals|approve|memory|schedule`), native `node:http` REST API (`src/api/http-server.ts`), scope-isolated Server-Sent Events (`RuntimeEventBus`), `TokenIdentityProvider` with constant-time digest verification, role-based approval restrictions (`ADMIN`), request-size limits (`413`), and secret scrubbing.
+  - **Phase 8B**: SQLite-backed persistent scheduler (`003_persistent_scheduler`, `ScheduleRepository`, `TaskScheduler`) supporting `ONE_TIME` and `INTERVAL` schedules, DB-enforced occurrence uniqueness and overlap prevention, missed-run policies (`SKIP`, `RUN_ONCE`), bounded consecutive failures with auto-pause, human approval non-bypass, and 5-point crash recovery (concurrency = 1).
+  - **Phase 8C**: Operational runtime (`DotsRuntime`, `loadRuntimeConfig`, `OperationalLogger`) with safe localhost defaults, persisted local host secret, and graceful startup/shutdown.
+  - **Phase 8D**: Updated `README.md`, `docs/ROADMAP.md`, `docs/ARCHITECTURE.md`, and added `docs/API.md`.
+
+---
+
+### Phase 8E — Web Dashboard & Cron Scheduling (PLANNED)
+- **Objective**: Add a lightweight local web interface and cron-expression schedule support on top of the Phase 8A–8C backend.
+- **Planned Deliverables**:
+  - Lightweight local web interface (<10 MB asset bundle) consuming `/api/*` and `/api/events`.
+  - Cron expression parser and schedule validation extending `TaskScheduler`.

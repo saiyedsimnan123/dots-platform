@@ -56,3 +56,14 @@ export * from './memory/canonical-json.ts';
 
 // Orchestration Layer
 export * from './orchestrator/coordinator.ts';
+
+// Phase 8: Persistent Scheduler, Runtime, API & CLI
+export * from './storage/schedule-repository.ts';
+export * from './scheduler/task-scheduler.ts';
+export * from './security/token-identity-provider.ts';
+export * from './runtime/event-bus.ts';
+export * from './runtime/logger.ts';
+export * from './runtime/config.ts';
+export * from './runtime/app.ts';
+export * from './api/http-server.ts';
+export { runCli, type CliIo } from './cli/main.ts';

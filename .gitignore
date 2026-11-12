@@ -9,16 +9,18 @@ dist/
 *.db
 *.db-wal
 *.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
 
 # Environment & Secrets (Crucial: Never commit credentials)
 .env
 .env.*
 !.env.example
+.dots-host-secret
 
-# Logs & Diagnostics
-*.log
-npm-debug.log*
-
-# Sandbox Output (created by sandboxed executions)
+# Runtime Data & Sandbox Output
+data/
+workspace/
 sandbox/
 tmp/
