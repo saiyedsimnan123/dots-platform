@@ -83,7 +83,18 @@ export type AuditEventType =
   | 'MEMORY_PROPOSAL_DECIDED'
   | 'MEMORY_EXPORTED'
   | 'MEMORIES_IMPORTED'
-  | 'MEMORIES_PURGED';
+  | 'MEMORIES_PURGED'
+  | 'SCHEDULE_CREATED'
+  | 'SCHEDULE_PAUSED'
+  | 'SCHEDULE_RESUMED'
+  | 'SCHEDULE_CANCELLED'
+  | 'SCHEDULE_COMPLETED'
+  | 'SCHEDULE_AUTO_PAUSED'
+  | 'SCHEDULE_OCCURRENCE_CLAIMED'
+  | 'SCHEDULE_OCCURRENCE_SKIPPED'
+  | 'SCHEDULE_OCCURRENCE_SUCCEEDED'
+  | 'SCHEDULE_OCCURRENCE_FAILED'
+  | 'SCHEDULE_OCCURRENCE_RECOVERED';
 
 /**
  * Primary Task Entity.
@@ -529,5 +540,85 @@ export interface MemoryPurgeResult {
   readonly isDryRun: boolean;
   readonly cutoffTimestamp?: string;
   readonly batchSizeLimit?: number;
+}
+
+/**
+ * Phase 8B - Persistent Scheduler Domain Types
+ */
+
+export type ScheduleType = 'ONE_TIME' | 'INTERVAL';
+export type ScheduleStatus = 'ACTIVE' | 'PAUSED' | 'COMPLETED' | 'CANCELLED';
+export type MissedRunPolicy = 'SKIP' | 'RUN_ONCE';
+export type OverlapPolicy = 'SKIP';
+export type OccurrenceStatus =
+  | 'CLAIMED'
+  | 'TASK_CREATED'
+  | 'RUNNING'
+  | 'AWAITING_APPROVAL'
+  | 'SUCCEEDED'
+  | 'FAILED'
+  | 'CANCELLED'
+  | 'SKIPPED_OVERLAP'
+  | 'SKIPPED_MISSED';
+
+export interface Schedule {
+  readonly id: string;
+  readonly name: string;
+  readonly goal: string;
+  readonly scheduleType: ScheduleType;
+  readonly status: ScheduleStatus;
+  readonly runAt: string | null;
+  readonly intervalMs: number | null;
+  readonly missedRunPolicy: MissedRunPolicy;
+  readonly overlapPolicy: OverlapPolicy;
+  readonly maxConsecutiveFailures: number;
+  readonly consecutiveFailures: number;
+  readonly scopeType: MemoryScopeType;
+  readonly scopeId: string;
+  readonly createdBy: string;
+  readonly metadataJson: string | null;
+  readonly nextRunAt: string | null;
+  readonly lastRunAt: string | null;
+  readonly lastTaskId: string | null;
+  readonly pausedReason: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface ScheduleOccurrence {
+  readonly id: string;
+  readonly scheduleId: string;
+  readonly occurrenceKey: string;
+  readonly scheduledFor: string;
+  readonly status: OccurrenceStatus;
+  readonly taskId: string | null;
+  readonly claimedAt: string;
+  readonly startedAt: string | null;
+  readonly completedAt: string | null;
+  readonly errorSummary: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface CreateScheduleInput {
+  readonly id?: string;
+  readonly name: string;
+  readonly goal: string;
+  readonly scheduleType: ScheduleType;
+  readonly runAt?: string;
+  readonly intervalMs?: number;
+  readonly startAt?: string;
+  readonly missedRunPolicy?: MissedRunPolicy;
+  readonly overlapPolicy?: OverlapPolicy;
+  readonly maxConsecutiveFailures?: number;
+  readonly metadata?: Record<string, unknown>;
+}
+
+export interface ListSchedulesFilter {
+  readonly scopeType?: MemoryScopeType;
+  readonly scopeId?: string;
+  readonly status?: ScheduleStatus;
+  readonly limit?: number;
+  readonly offset?: number;
 }
 

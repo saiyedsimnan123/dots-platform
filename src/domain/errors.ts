@@ -208,4 +208,28 @@ export class MemoryScopeViolationError extends DomainError {
   }
 }
 
+/**
+ * Thrown when a requested schedule entity cannot be found.
+ */
+export class ScheduleNotFoundError extends DomainError {
+  public readonly scheduleId: string;
+
+  constructor(scheduleId: string, details: Record<string, unknown> = {}) {
+    super(`Schedule with ID '${scheduleId}' was not found.`, 'SCHEDULE_NOT_FOUND', { scheduleId, ...details });
+    this.scheduleId = scheduleId;
+  }
+}
+
+/**
+ * Thrown when a schedule operation conflicts with its current state or uniqueness constraints.
+ */
+export class ScheduleConflictError extends DomainError {
+  public readonly scheduleId: string;
+
+  constructor(message: string, scheduleId: string, details: Record<string, unknown> = {}) {
+    super(message, 'SCHEDULE_CONFLICT', { scheduleId, ...details });
+    this.scheduleId = scheduleId;
+  }
+}
+
 

@@ -245,6 +245,70 @@ export class DatabaseManager {
             CREATE INDEX IF NOT EXISTS idx_memory_injections_memory_id ON memory_task_injections(memory_id);
           `);
         }
+      },
+      {
+        version: '003_persistent_scheduler',
+        up: (db) => {
+          db.exec(`
+            -- Schedules table: persistent one-time and recurring interval schedules
+            CREATE TABLE IF NOT EXISTS schedules (
+              id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              goal TEXT NOT NULL,
+              schedule_type TEXT NOT NULL CHECK (schedule_type IN ('ONE_TIME', 'INTERVAL')),
+              status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'PAUSED', 'COMPLETED', 'CANCELLED')),
+              run_at TEXT,
+              interval_ms INTEGER CHECK (interval_ms IS NULL OR interval_ms >= 1000),
+              missed_run_policy TEXT NOT NULL DEFAULT 'SKIP' CHECK (missed_run_policy IN ('SKIP', 'RUN_ONCE')),
+              overlap_policy TEXT NOT NULL DEFAULT 'SKIP' CHECK (overlap_policy IN ('SKIP')),
+              max_consecutive_failures INTEGER NOT NULL DEFAULT 3 CHECK (max_consecutive_failures >= 1),
+              consecutive_failures INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_failures >= 0),
+              scope_type TEXT NOT NULL CHECK (scope_type IN ('GLOBAL', 'WORKSPACE')),
+              scope_id TEXT NOT NULL,
+              created_by TEXT NOT NULL,
+              metadata_json TEXT,
+              next_run_at TEXT,
+              last_run_at TEXT,
+              last_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+              paused_reason TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_schedules_status_next_run ON schedules(status, next_run_at);
+            CREATE INDEX IF NOT EXISTS idx_schedules_scope ON schedules(scope_type, scope_id, status);
+
+            -- Schedule occurrences table: durable occurrence identity & DB-enforced duplicate prevention
+            CREATE TABLE IF NOT EXISTS schedule_occurrences (
+              id TEXT PRIMARY KEY,
+              schedule_id TEXT NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
+              occurrence_key TEXT NOT NULL,
+              scheduled_for TEXT NOT NULL,
+              status TEXT NOT NULL CHECK (
+                status IN (
+                  'CLAIMED', 'TASK_CREATED', 'RUNNING', 'AWAITING_APPROVAL',
+                  'SUCCEEDED', 'FAILED', 'CANCELLED', 'SKIPPED_OVERLAP', 'SKIPPED_MISSED'
+                )
+              ),
+              task_id TEXT UNIQUE REFERENCES tasks(id) ON DELETE SET NULL,
+              claimed_at TEXT NOT NULL,
+              started_at TEXT,
+              completed_at TEXT,
+              error_summary TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE (schedule_id, occurrence_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_schedule_occurrences_schedule_status
+              ON schedule_occurrences(schedule_id, status);
+            CREATE INDEX IF NOT EXISTS idx_schedule_occurrences_status
+              ON schedule_occurrences(status);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_schedule_occurrences_one_active
+              ON schedule_occurrences(schedule_id)
+              WHERE status IN ('CLAIMED', 'TASK_CREATED', 'RUNNING', 'AWAITING_APPROVAL');
+          `);
+        }
       }
     ];
 

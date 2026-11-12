@@ -544,6 +544,33 @@ export class TaskRepository {
   }
 
   /**
+   * Retrieves an approval request by its ID.
+   */
+  public getApprovalRequestById(id: string): ApprovalRequest | null {
+    const stmt = this.db.prepare('SELECT * FROM approval_requests WHERE id = ?');
+    const row = stmt.get(id) as unknown as ApprovalDbRow | undefined;
+    if (!row) {
+      return null;
+    }
+    return this.mapApprovalRow(row);
+  }
+
+  /**
+   * Lists approval requests optionally filtered by decision.
+   */
+  public listApprovalRequests(options: { decision?: ApprovalDecision; limit?: number } = {}): ApprovalRequest[] {
+    const limit = options.limit ?? 100;
+    if (options.decision) {
+      const stmt = this.db.prepare('SELECT * FROM approval_requests WHERE decision = ? ORDER BY created_at DESC LIMIT ?');
+      const rows = stmt.all(options.decision, limit) as unknown as ApprovalDbRow[];
+      return rows.map((r) => this.mapApprovalRow(r));
+    }
+    const stmt = this.db.prepare('SELECT * FROM approval_requests ORDER BY created_at DESC LIMIT ?');
+    const rows = stmt.all(limit) as unknown as ApprovalDbRow[];
+    return rows.map((r) => this.mapApprovalRow(r));
+  }
+
+  /**
    * Retrieves all approval requests for a task.
    */
   public getApprovalRequestsByTaskId(taskId: string): ApprovalRequest[] {
