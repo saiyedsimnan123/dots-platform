@@ -48,7 +48,11 @@ test('PathValidator - strictly rejects directory traversal attacks', () => {
       '../escape.txt',
       '../../escape.txt',
       'subdir/../../escape.txt',
-      'subdir/nested/../../../escape.txt'
+      'subdir/nested/../../../escape.txt',
+      '..\\escape.txt',
+      '..\\..\\escape.txt',
+      'subdir\\..\\..\\escape.txt',
+      'subdir\\nested\\..\\..\\..\\escape.txt'
     ];
 
     for (const attack of attacks) {
@@ -93,6 +97,15 @@ test('PathValidator - rejects absolute external system paths', () => {
     const externalPaths = [
       'C:\\Windows\\System32\\cmd.exe',
       'C:\\Windows\\notepad.exe',
+      'C:/Windows/System32/cmd.exe',
+      'D:/outside/file.txt',
+      'D:\\outside\\file.txt',
+      'c:\\temp\\malicious.bat',
+      'c:/temp/malicious.bat',
+      'C:',
+      'C:relative_on_drive.txt',
+      '\\\\server\\share\\file.txt',
+      '\\\\?\\C:\\Windows\\cmd.exe',
       '/etc/passwd',
       '/var/log/syslog'
     ];
@@ -100,7 +113,29 @@ test('PathValidator - rejects absolute external system paths', () => {
     for (const ext of externalPaths) {
       const check = PathValidator.checkContained(ext, testRoot);
       assert.equal(check.isContained, false);
+      assert.throws(
+        () => PathValidator.assertContained(ext, testRoot),
+        (err: unknown) => {
+          assert.ok(err instanceof SecurityViolationError);
+          return true;
+        }
+      );
     }
+  } finally {
+    cleanupDirs();
+  }
+});
+
+test('PathValidator - permits valid relative paths with Windows-style backslashes within workspace', () => {
+  setupDirs();
+  try {
+    const validBackslash = 'subdir\\file.txt';
+    const canonical = PathValidator.assertContained(validBackslash, testRoot);
+    assert.equal(canonical, resolve(testRoot, 'subdir/file.txt'));
+
+    const validNestedBackslash = 'nested\\deep\\file.json';
+    const canonicalNested = PathValidator.assertContained(validNestedBackslash, testRoot);
+    assert.equal(canonicalNested, resolve(testRoot, 'nested/deep/file.json'));
   } finally {
     cleanupDirs();
   }

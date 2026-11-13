@@ -72,8 +72,45 @@ export class PathValidator {
 
     const rootWithSep = canonicalRoot.endsWith(sep) ? canonicalRoot : canonicalRoot + sep;
 
-    // 2. Lexical resolution against workspace root
-    const resolvedTarget = normalize(resolve(canonicalRoot, inputPath));
+    // Reject bare Windows drive specifiers (e.g. 'C:', 'D:')
+    if (/^[a-zA-Z]:$/.test(inputPath)) {
+      return {
+        isContained: false,
+        canonicalPath: inputPath,
+        canonicalRoot,
+        violationReason: `Path traversal outside workspace sandbox: '${inputPath}'`
+      };
+    }
+
+    // Reject Windows drive-prefixed paths that do not match canonical workspace root drive
+    const driveMatch = /^[a-zA-Z]:/.exec(inputPath);
+    if (driveMatch) {
+      const inputDrive = inputPath.slice(0, 2).toUpperCase();
+      const rootDriveMatch = /^[a-zA-Z]:/.exec(canonicalRoot);
+      const rootDrive = rootDriveMatch ? canonicalRoot.slice(0, 2).toUpperCase() : null;
+      if (!rootDrive || rootDrive !== inputDrive) {
+        return {
+          isContained: false,
+          canonicalPath: inputPath,
+          canonicalRoot,
+          violationReason: `Path traversal outside workspace sandbox: '${inputPath}'`
+        };
+      }
+    }
+
+    // Reject Windows UNC paths when workspace root is not a matching UNC root
+    if (inputPath.startsWith('\\\\') && !canonicalRoot.startsWith('\\\\')) {
+      return {
+        isContained: false,
+        canonicalPath: inputPath,
+        canonicalRoot,
+        violationReason: `Path traversal outside workspace sandbox: '${inputPath}'`
+      };
+    }
+
+    // 2. Lexical resolution against workspace root (normalizing separators cross-platform)
+    const normalizedInput = inputPath.replace(/\\/g, '/');
+    const resolvedTarget = normalize(resolve(canonicalRoot, normalizedInput));
 
     // Lexical relative check: must not escape via '..' or different drive letter
     const rel = relative(canonicalRoot, resolvedTarget);
@@ -104,7 +141,31 @@ export class PathValidator {
         if (targetLstat.isSymbolicLink()) {
           // Resolve symlink target directly
           const linkTarget = readlinkSync(resolvedTarget);
-          const resolvedLink = normalize(resolve(dirname(resolvedTarget), linkTarget));
+          const linkDriveMatch = /^[a-zA-Z]:/.exec(linkTarget);
+          if (linkDriveMatch) {
+            const linkDrive = linkTarget.slice(0, 2).toUpperCase();
+            const rootDriveMatch = /^[a-zA-Z]:/.exec(canonicalRoot);
+            const rootDrive = rootDriveMatch ? canonicalRoot.slice(0, 2).toUpperCase() : null;
+            if (!rootDrive || rootDrive !== linkDrive) {
+              return {
+                isContained: false,
+                canonicalPath: resolvedTarget,
+                canonicalRoot,
+                violationReason: `Symlink escape detected: '${inputPath}' points to external location '${linkTarget}'`
+              };
+            }
+          }
+          if (linkTarget.startsWith('\\\\') && !canonicalRoot.startsWith('\\\\')) {
+            return {
+              isContained: false,
+              canonicalPath: resolvedTarget,
+              canonicalRoot,
+              violationReason: `Symlink escape detected: '${inputPath}' points to external location '${linkTarget}'`
+            };
+          }
+
+          const normalizedLink = linkTarget.replace(/\\/g, '/');
+          const resolvedLink = normalize(resolve(dirname(resolvedTarget), normalizedLink));
           const relLink = relative(canonicalRoot, resolvedLink);
           if (relLink === '..' || relLink.startsWith('..' + sep) || isAbsolute(relLink) || (resolvedLink !== canonicalRoot && !resolvedLink.startsWith(rootWithSep))) {
             return {
