@@ -371,6 +371,8 @@ export const textTransformTool: RegisteredTool = {
   }
 };
 
+import { webSearchTool, webFetchTool } from './web-tools.ts';
+
 /**
  * Standard registry collection of built-in safe tools
  */
@@ -380,6 +382,8 @@ export const standardTools: readonly RegisteredTool[] = [
   fileReadTool,
   fileListTool,
   fileWriteTool,
-  hashFileTool
+  hashFileTool,
+  webSearchTool,
+  webFetchTool
 ];
 
