@@ -232,4 +232,71 @@ export class ScheduleConflictError extends DomainError {
   }
 }
 
+/**
+ * Thrown when a requested agent cannot be found.
+ */
+export class AgentNotFoundError extends DomainError {
+  public readonly agentId: string;
+
+  constructor(agentId: string, details: Record<string, unknown> = {}) {
+    super(`Agent with ID '${agentId}' was not found.`, 'AGENT_NOT_FOUND', { agentId, ...details });
+    this.agentId = agentId;
+  }
+}
+
+/**
+ * Thrown when an agent registration conflicts with an already registered agent ID.
+ */
+export class DuplicateAgentRegistrationError extends DomainError {
+  public readonly agentId: string;
+
+  constructor(agentId: string, details: Record<string, unknown> = {}) {
+    super(`Agent with ID '${agentId}' is already registered.`, 'DUPLICATE_AGENT_REGISTRATION', { agentId, ...details });
+    this.agentId = agentId;
+  }
+}
+
+/**
+ * Thrown when an agent does not support a required capability.
+ */
+export class AgentCapabilityError extends DomainError {
+  public readonly agentId: string;
+  public readonly capability: string;
+
+  constructor(agentId: string, capability: string, details: Record<string, unknown> = {}) {
+    super(
+      `Agent '${agentId}' does not support required capability '${capability}'.`,
+      'UNSUPPORTED_CAPABILITY',
+      { agentId, capability, ...details }
+    );
+    this.agentId = agentId;
+    this.capability = capability;
+  }
+}
+
+/**
+ * Thrown when an agent execution fails.
+ */
+export class AgentExecutionError extends DomainError {
+  public readonly agentId: string;
+
+  constructor(agentId: string, message: string, details: Record<string, unknown> = {}) {
+    super(message, 'AGENT_EXECUTION_ERROR', { agentId, ...details });
+    this.agentId = agentId;
+  }
+}
+
+/**
+ * Thrown when an agent execution is cancelled.
+ */
+export class AgentCancelledError extends DomainError {
+  public readonly agentId?: string;
+
+  constructor(message: string = 'Agent execution was cancelled.', details: Record<string, unknown> = {}) {
+    super(message, 'AGENT_CANCELLED', details);
+    this.agentId = details.agentId as string | undefined;
+  }
+}
+
+
 

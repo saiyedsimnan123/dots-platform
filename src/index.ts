@@ -58,6 +58,12 @@ export * from './memory/canonical-json.ts';
 // Orchestration Layer
 export * from './orchestrator/coordinator.ts';
 
+// Agent Architecture Layer (Milestone 1C)
+export type * from './agents/types.ts';
+export * from './agents/context.ts';
+export * from './agents/base-agent.ts';
+export * from './agents/registry.ts';
+
 // Phase 8: Persistent Scheduler, Runtime, API & CLI
 export * from './storage/schedule-repository.ts';
 export * from './scheduler/task-scheduler.ts';

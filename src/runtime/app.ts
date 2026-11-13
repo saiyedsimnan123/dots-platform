@@ -48,6 +48,7 @@ import { TokenIdentityProvider } from '../security/token-identity-provider.ts';
 import { VerificationEngine } from '../verification/verifier.ts';
 import { MemoryService } from '../memory/memory-service.ts';
 import { TaskCoordinator } from '../orchestrator/coordinator.ts';
+import { AgentRegistry } from '../agents/index.ts';
 import { TaskScheduler } from '../scheduler/task-scheduler.ts';
 import { RuntimeEventBus } from './event-bus.ts';
 import { OperationalLogger } from './logger.ts';
@@ -105,6 +106,7 @@ export interface DotsRuntimeOptions extends LoadRuntimeConfigOverrides {
   readonly modelProvider?: IModelProvider;
   readonly logger?: OperationalLogger;
   readonly eventBus?: RuntimeEventBus;
+  readonly agentRegistry?: AgentRegistry;
 }
 
 export function scrubPublicData(value: unknown, depth: number = 0): unknown {
@@ -166,6 +168,7 @@ export class DotsRuntime {
   public readonly verifier: VerificationEngine;
   public readonly budgetTracker: TokenBudgetTracker;
   public readonly modelProvider: IModelProvider;
+  public readonly agentRegistry: AgentRegistry;
   public readonly coordinator: TaskCoordinator;
   public readonly crashRecovery: CrashRecoveryEngine;
   public readonly scheduler: TaskScheduler;
@@ -232,6 +235,8 @@ export class DotsRuntime {
           })
         : new MockModelProvider());
 
+    this.agentRegistry = options.agentRegistry ?? new AgentRegistry();
+
     this.coordinator = new TaskCoordinator({
       taskRepo: this.taskRepo,
       auditRepo: this.auditRepo,
@@ -246,7 +251,8 @@ export class DotsRuntime {
       hostAuthority: this.hostAuthority,
       authorizer: this.authorizer,
       enableDynamicReplan: this.config.enableDynamicReplan,
-      enableCompensation: this.config.enableCompensation
+      enableCompensation: this.config.enableCompensation,
+      agentRegistry: this.agentRegistry
     });
 
     this.crashRecovery = new CrashRecoveryEngine(this.taskRepo, this.auditRepo);

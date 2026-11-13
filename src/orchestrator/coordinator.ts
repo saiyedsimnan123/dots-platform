@@ -31,13 +31,14 @@ import type { StepOutputContext } from './variable-resolver.ts';
 import { VariableResolver } from './variable-resolver.ts';
 import { CompensationManager } from './compensation.ts';
 import { TaskStateMachine } from '../domain/state-machine.ts';
-import { TaskNotFoundError, CircuitBreakerError, ValidationError, SecurityViolationError } from '../domain/errors.ts';
+import { TaskNotFoundError, CircuitBreakerError, ValidationError, SecurityViolationError, AgentNotFoundError } from '../domain/errors.ts';
 import type { MemoryService } from '../memory/memory-service.ts';
 import type { HostMemoryAuthority } from '../security/host-authority.ts';
 import { MemoryAuthorizer, validateScope } from '../security/memory-authorizer.ts';
 import { PromptCompiler } from '../model/prompt-compiler.ts';
 import { defaultSecretScrubber } from '../model/secret-scrubber.ts';
 import { createMemoryProposeTool } from '../tools/memory-tools.ts';
+import { AgentRegistry, createAgentExecutionContext, type AgentInput, type AgentOutput } from '../agents/index.ts';
 
 const NON_SENSITIVE_PROOF_WORDS = new Set([
   'waterproof',
@@ -151,6 +152,7 @@ export interface CoordinatorOptions {
   readonly maxPlanSteps?: number;         // Hard circuit breaker: max steps per plan
   readonly maxTotalRetries?: number;      // Hard circuit breaker: total task retry ceiling
   readonly enableCompensation?: boolean;  // Rollback scratch mutations on failure
+  readonly agentRegistry?: AgentRegistry; // Shared agent registry for specialized agents
 }
 
 export class TaskCoordinator {
@@ -175,6 +177,7 @@ export class TaskCoordinator {
   private readonly hostAuthority?: HostMemoryAuthority;
   public readonly authorizer?: MemoryAuthorizer;
   public readonly promptCompiler: PromptCompiler;
+  public readonly agentRegistry: AgentRegistry;
 
   constructor(options: CoordinatorOptions) {
     if (options.memoryService) {
@@ -234,6 +237,7 @@ export class TaskCoordinator {
     this.hostAuthority = options.hostAuthority;
     this.authorizer = options.hostAuthority ? options.hostAuthority.authorizer : options.authorizer;
     this.promptCompiler = options.promptCompiler ?? new PromptCompiler();
+    this.agentRegistry = options.agentRegistry ?? new AgentRegistry();
 
     // Register agent memory proposal tool when memory subsystem and authorizer are configured
     if (this.memoryService && this.authorizer && !this.toolRegistry.get('memory_propose')) {
@@ -477,6 +481,160 @@ export class TaskCoordinator {
     return currentTask;
   }
 
+  /**
+   * Executes a registered agent within the platform's security boundary and audit pipeline.
+   * Automatically derives agent authorization scope, creates/transitions task state,
+   * emits audit events, and safely wraps errors.
+   */
+  public async executeAgent(
+    agentId: string,
+    input: AgentInput,
+    options?: {
+      readonly signal?: AbortSignal;
+    }
+  ): Promise<AgentOutput> {
+    if (!this.agentRegistry.has(agentId)) {
+      throw new AgentNotFoundError(agentId);
+    }
+
+    if (!input || typeof input !== 'object') {
+      throw new ValidationError('AgentInput must be an object.');
+    }
+    if (!input.goal || typeof input.goal !== 'string' || input.goal.trim() === '') {
+      throw new ValidationError('Agent input goal must be a non-empty string.');
+    }
+
+    let task: Task;
+    if (input.taskId) {
+      const existing = this.taskRepo.getTaskById(input.taskId);
+      if (!existing) {
+        throw new TaskNotFoundError(input.taskId);
+      }
+      task = existing;
+    } else {
+      const meta = {
+        agentId,
+        ...(input.parameters ? { parameters: input.parameters } : {})
+      };
+      if (input.caller && this.authorizer && this.hostAuthority) {
+        task = await this.submitScopedTask({
+          goal: input.goal,
+          caller: input.caller,
+          metadata: meta
+        });
+      } else {
+        task = await this.submitTask(input.goal, meta);
+      }
+    }
+
+    // Advance task status from SUBMITTED -> PLANNING -> EXECUTING if needed
+    if (task.status === 'SUBMITTED') {
+      task = this.taskRepo.updateTaskStatus(task.id, 'SUBMITTED', 'PLANNING');
+      this.auditRepo.appendEvent({
+        taskId: task.id,
+        eventType: 'STATE_TRANSITION',
+        actor: 'SYSTEM',
+        details: { from: 'SUBMITTED', to: 'PLANNING' }
+      });
+    }
+
+    if (task.status === 'PLANNING') {
+      task = this.taskRepo.updateTaskStatus(task.id, 'PLANNING', 'EXECUTING');
+      this.auditRepo.appendEvent({
+        taskId: task.id,
+        eventType: 'STATE_TRANSITION',
+        actor: 'SYSTEM',
+        details: { from: 'PLANNING', to: 'EXECUTING' }
+      });
+    }
+
+    // Derive agent caller if authorizer is present
+    let agentCaller: CallerContext | undefined;
+    if (this.authorizer) {
+      const taskScope = this.verifyTaskScope(task);
+      if (taskScope !== null) {
+        agentCaller = this.authorizer.authorizeAgent({ taskId: task.id });
+      }
+    }
+
+    this.auditRepo.appendEvent({
+      taskId: task.id,
+      eventType: 'AGENT_EXECUTION_STARTED',
+      actor: 'AGENT',
+      details: {
+        agentId,
+        goal: input.goal,
+        parameters: input.parameters ?? {}
+      }
+    });
+
+    const context = createAgentExecutionContext({
+      taskId: task.id,
+      workspaceRoot: this.workspaceRoot,
+      toolRegistry: this.toolRegistry,
+      policyEngine: this.policyEngine,
+      approvalBroker: this.approvalBroker,
+      modelProvider: this.modelProvider,
+      memoryService: this.memoryService,
+      authorizer: this.authorizer,
+      hostAuthority: this.hostAuthority,
+      taskRepo: this.taskRepo,
+      auditRepo: this.auditRepo,
+      signal: options?.signal ?? input.signal,
+      agentCaller
+    });
+
+    const output = await this.agentRegistry.execute(
+      agentId,
+      { ...input, taskId: task.id },
+      context
+    );
+
+    if (output.status === 'COMPLETED') {
+      this.taskRepo.updateTaskStatus(task.id, 'EXECUTING', 'VERIFYING');
+      this.taskRepo.updateTaskStatus(task.id, 'VERIFYING', 'COMPLETED');
+      this.auditRepo.appendEvent({
+        taskId: task.id,
+        eventType: 'AGENT_EXECUTION_COMPLETED',
+        actor: 'AGENT',
+        details: {
+          agentId,
+          stepsExecuted: output.stepsExecuted,
+          durationMs: output.durationMs,
+          summary: output.summary
+        }
+      });
+    } else if (output.status === 'CANCELLED') {
+      this.taskRepo.updateTaskStatus(
+        task.id,
+        'EXECUTING',
+        'CANCELLED',
+        output.error ?? 'Agent execution cancelled.'
+      );
+      this.auditRepo.appendEvent({
+        taskId: task.id,
+        eventType: 'TASK_CANCELLED',
+        actor: 'SYSTEM',
+        details: { agentId, reason: output.error ?? 'Execution cancelled' }
+      });
+    } else {
+      this.taskRepo.updateTaskStatus(
+        task.id,
+        'EXECUTING',
+        'FAILED',
+        output.error ?? 'Agent execution failed.'
+      );
+      this.auditRepo.appendEvent({
+        taskId: task.id,
+        eventType: 'AGENT_EXECUTION_FAILED',
+        actor: 'AGENT',
+        details: { agentId, error: output.error }
+      });
+    }
+
+    return output;
+  }
+
   // --- State Handlers ---
 
   private async handleSubmitted(task: Task): Promise<Task> {
@@ -495,6 +653,22 @@ export class TaskCoordinator {
 
     // Initial plan formulation if no steps exist yet
     if (steps.length === 0) {
+      const taskMeta = task.metadataJson ? (JSON.parse(task.metadataJson) as Record<string, unknown>) : {};
+      if (
+        taskMeta.agentId &&
+        typeof taskMeta.agentId === 'string' &&
+        this.agentRegistry.has(taskMeta.agentId)
+      ) {
+        const updated = this.taskRepo.updateTaskStatus(task.id, 'PLANNING', 'EXECUTING');
+        this.auditRepo.appendEvent({
+          taskId: task.id,
+          eventType: 'STATE_TRANSITION',
+          actor: 'SYSTEM',
+          details: { from: 'PLANNING', to: 'EXECUTING', agentId: taskMeta.agentId }
+        });
+        return updated;
+      }
+
       const availableTools = this.toolRegistry.listDefinitions();
 
       let compiled: CompiledPlanPrompt;
@@ -700,6 +874,24 @@ export class TaskCoordinator {
 
   private async handleExecuting(task: Task): Promise<Task> {
     const steps = this.taskRepo.getStepsByTaskId(task.id);
+
+    // If task is delegated to an agent with no plan steps, execute agent directly
+    if (steps.length === 0) {
+      const taskMeta = task.metadataJson ? (JSON.parse(task.metadataJson) as Record<string, unknown>) : {};
+      if (
+        taskMeta.agentId &&
+        typeof taskMeta.agentId === 'string' &&
+        this.agentRegistry.has(taskMeta.agentId)
+      ) {
+        await this.executeAgent(taskMeta.agentId, {
+          goal: task.goal,
+          taskId: task.id,
+          parameters: (taskMeta.parameters as Record<string, unknown>) ?? {}
+        });
+        return this.taskRepo.getTaskById(task.id)!;
+      }
+    }
+
     const activeStep = steps.find((s) => s.status === 'PENDING' || s.status === 'EXECUTING');
 
     if (!activeStep) {
