@@ -93,7 +93,8 @@ export function createAgentExecutionContext(
     auditRepo,
     signal,
     logger,
-    agentCaller
+    agentCaller,
+    memoryContext
   } = options;
 
   return {
@@ -111,6 +112,7 @@ export function createAgentExecutionContext(
     signal,
     logger,
     agentCaller,
+    memoryContext,
 
     /**
      * Discovers all registered tool definitions available in this execution context.

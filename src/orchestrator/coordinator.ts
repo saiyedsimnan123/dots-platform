@@ -31,14 +31,14 @@ import type { StepOutputContext } from './variable-resolver.ts';
 import { VariableResolver } from './variable-resolver.ts';
 import { CompensationManager } from './compensation.ts';
 import { TaskStateMachine } from '../domain/state-machine.ts';
-import { TaskNotFoundError, CircuitBreakerError, ValidationError, SecurityViolationError, AgentNotFoundError } from '../domain/errors.ts';
+import { TaskNotFoundError, CircuitBreakerError, ValidationError, SecurityViolationError, AgentNotFoundError, MemoryScopeViolationError } from '../domain/errors.ts';
 import type { MemoryService } from '../memory/memory-service.ts';
 import type { HostMemoryAuthority } from '../security/host-authority.ts';
 import { MemoryAuthorizer, validateScope } from '../security/memory-authorizer.ts';
 import { PromptCompiler } from '../model/prompt-compiler.ts';
 import { defaultSecretScrubber } from '../model/secret-scrubber.ts';
 import { createMemoryProposeTool } from '../tools/memory-tools.ts';
-import { AgentRegistry, createAgentExecutionContext, type AgentInput, type AgentOutput } from '../agents/index.ts';
+import { AgentRegistry, createAgentExecutionContext, mergeAgentContext, type AgentInput, type AgentOutput } from '../agents/index.ts';
 
 const NON_SENSITIVE_PROOF_WORDS = new Set([
   'waterproof',
@@ -482,6 +482,40 @@ export class TaskCoordinator {
   }
 
   /**
+   * Plans a task using the legacy planner (advances task through PLANNING state).
+   */
+  public async planTask(taskId: string): Promise<Task> {
+    const task = this.taskRepo.getTaskById(taskId);
+    if (!task) {
+      throw new TaskNotFoundError(taskId);
+    }
+    if (task.status === 'SUBMITTED') {
+      await this.step(taskId);
+    }
+    return this.step(taskId);
+  }
+
+  /**
+   * Executes a registered agent task (alias for executeAgent).
+   */
+  public async executeAgentTask(
+    agentIdOrTask: string | Task,
+    agentIdOrInput: string | AgentInput,
+    inputOrOptions?: AgentInput | { readonly signal?: AbortSignal },
+    options?: { readonly signal?: AbortSignal }
+  ): Promise<AgentOutput> {
+    if (typeof agentIdOrTask === 'string' && typeof agentIdOrInput === 'object') {
+      return this.executeAgent(agentIdOrTask, agentIdOrInput as AgentInput, inputOrOptions as any);
+    }
+    if (typeof agentIdOrInput === 'string' && typeof inputOrOptions === 'object') {
+      const input = inputOrOptions as AgentInput;
+      const taskId = typeof agentIdOrTask === 'object' ? agentIdOrTask.id : undefined;
+      return this.executeAgent(agentIdOrInput, { ...input, ...(taskId ? { taskId } : {}) }, options);
+    }
+    return this.executeAgent(agentIdOrTask as string, agentIdOrInput as AgentInput, inputOrOptions as any);
+  }
+
+  /**
    * Executes a registered agent within the platform's security boundary and audit pipeline.
    * Automatically derives agent authorization scope, creates/transitions task state,
    * emits audit events, and safely wraps errors.
@@ -550,10 +584,57 @@ export class TaskCoordinator {
 
     // Derive agent caller if authorizer is present
     let agentCaller: CallerContext | undefined;
+    let memoryContext: BuiltMemoryContext | undefined;
+    const stagedInjections: RecordMemoryInjectionInput[] = [];
+
     if (this.authorizer) {
       const taskScope = this.verifyTaskScope(task);
       if (taskScope !== null) {
         agentCaller = this.authorizer.authorizeAgent({ taskId: task.id });
+
+        // Phase 4B.1: Pre-Execution Memory Retrieval
+        if (this.memoryService && !input.context?._memoryInjected) {
+          const permissions = agentCaller.permissions instanceof Set
+            ? agentCaller.permissions
+            : new Set(agentCaller.permissions);
+          if (!permissions.has('READ')) {
+            throw new SecurityViolationError(
+              `Agent caller lacks READ permission for task '${task.id}'.`,
+              'INSUFFICIENT_PERMISSIONS'
+            );
+          }
+
+          try {
+            memoryContext = this.memoryService.buildTaskMemoryContext(agentCaller, {
+              query: task.goal,
+              taskId: task.id,
+              recordInjections: false,
+              maxBudgetChars: 4000
+            });
+
+            if (memoryContext && memoryContext.included.length > 0) {
+              for (const inc of memoryContext.included) {
+                stagedInjections.push({
+                  taskId: task.id,
+                  memoryId: inc.id,
+                  charCount: inc.charCount,
+                  estimatedTokens: inc.estimatedTokens
+                });
+              }
+
+              this.memoryService.recordTaskInjectionsBatch(agentCaller, stagedInjections);
+            }
+          } catch (err) {
+            if (
+              err instanceof SecurityViolationError ||
+              err instanceof MemoryScopeViolationError
+            ) {
+              throw err;
+            }
+            // Non-security retrieval failures are handled safely without crashing execution
+            memoryContext = undefined;
+          }
+        }
       }
     }
 
@@ -564,7 +645,11 @@ export class TaskCoordinator {
       details: {
         agentId,
         goal: input.goal,
-        parameters: input.parameters ?? {}
+        parameters: input.parameters ?? {},
+        ...(stagedInjections.length > 0 ? {
+          injectedMemoriesCount: stagedInjections.length,
+          injectedMemoryIds: stagedInjections.map((i) => i.memoryId).filter((id): id is string => typeof id === 'string')
+        } : {})
       }
     });
 
@@ -581,12 +666,23 @@ export class TaskCoordinator {
       taskRepo: this.taskRepo,
       auditRepo: this.auditRepo,
       signal: options?.signal ?? input.signal,
-      agentCaller
+      agentCaller,
+      memoryContext
+    });
+
+    // Merge memory context safely into agent input context
+    const mergedContext = mergeAgentContext({
+      userContext: input.context,
+      memoryContext
     });
 
     const output = await this.agentRegistry.execute(
       agentId,
-      { ...input, taskId: task.id },
+      {
+        ...input,
+        taskId: task.id,
+        context: mergedContext
+      },
       context
     );
 
@@ -661,7 +757,10 @@ export class TaskCoordinator {
       });
     }
 
-    return output;
+    return {
+      ...output,
+      taskId: output.taskId ?? task.id
+    };
   }
 
   // --- State Handlers ---

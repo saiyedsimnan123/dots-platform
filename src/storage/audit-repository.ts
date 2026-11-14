@@ -77,7 +77,7 @@ export class AuditRepository {
    */
   public getEventsByTaskId(taskId: string): AuditEvent[] {
     const stmt = this.db.prepare(
-      'SELECT * FROM audit_events WHERE task_id = ? ORDER BY timestamp ASC, id ASC'
+      'SELECT * FROM audit_events WHERE task_id = ? ORDER BY timestamp ASC, rowid ASC'
     );
     const rows = stmt.all(taskId) as unknown as AuditDbRow[];
     return rows.map((r) => this.mapAuditRow(r));

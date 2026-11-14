@@ -8,7 +8,7 @@
  * a common lifecycle, capability system, execution context, and safety perimeter.
  */
 
-import type { CallerContext } from '../domain/types.ts';
+import type { CallerContext, BuiltMemoryContext } from '../domain/types.ts';
 import type { IModelProvider, ModelConfig, ModelUsage, ToolDefinition } from '../model/types.ts';
 import type { ToolRegistry } from '../tools/registry.ts';
 import type { ToolExecutionResult } from '../tools/types.ts';
@@ -125,6 +125,7 @@ export interface AgentExecutionContext {
   readonly signal?: AbortSignal;
   readonly logger?: OperationalLogger;
   readonly agentCaller?: CallerContext;
+  readonly memoryContext?: BuiltMemoryContext;
 
   /**
    * Discovers all registered tool definitions available in this execution context.
@@ -166,6 +167,7 @@ export interface CreateAgentExecutionContextOptions {
   readonly signal?: AbortSignal;
   readonly logger?: OperationalLogger;
   readonly agentCaller?: CallerContext;
+  readonly memoryContext?: BuiltMemoryContext;
 }
 
 /**
