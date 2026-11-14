@@ -591,6 +591,17 @@ export class TaskCoordinator {
     );
 
     if (output.status === 'COMPLETED') {
+      const currentMeta = task.metadataJson ? (JSON.parse(task.metadataJson) as Record<string, unknown>) : {};
+      const updatedMeta = {
+        ...currentMeta,
+        output: output.result,
+        summary: output.summary,
+        stepsExecuted: output.stepsExecuted,
+        durationMs: output.durationMs,
+        ...(output.usage ? { usage: output.usage } : {})
+      };
+      this.taskRepo.updateTaskMetadata(task.id, updatedMeta);
+
       this.taskRepo.updateTaskStatus(task.id, 'EXECUTING', 'VERIFYING');
       this.taskRepo.updateTaskStatus(task.id, 'VERIFYING', 'COMPLETED');
       this.auditRepo.appendEvent({
@@ -601,10 +612,19 @@ export class TaskCoordinator {
           agentId,
           stepsExecuted: output.stepsExecuted,
           durationMs: output.durationMs,
-          summary: output.summary
+          summary: output.summary,
+          result: output.result
         }
       });
     } else if (output.status === 'CANCELLED') {
+      const currentMeta = task.metadataJson ? (JSON.parse(task.metadataJson) as Record<string, unknown>) : {};
+      const updatedMeta = {
+        ...currentMeta,
+        cancelled: true,
+        reason: output.error
+      };
+      this.taskRepo.updateTaskMetadata(task.id, updatedMeta);
+
       this.taskRepo.updateTaskStatus(
         task.id,
         'EXECUTING',
@@ -618,6 +638,15 @@ export class TaskCoordinator {
         details: { agentId, reason: output.error ?? 'Execution cancelled' }
       });
     } else {
+      const currentMeta = task.metadataJson ? (JSON.parse(task.metadataJson) as Record<string, unknown>) : {};
+      const updatedMeta = {
+        ...currentMeta,
+        error: output.error,
+        summary: output.summary,
+        durationMs: output.durationMs
+      };
+      this.taskRepo.updateTaskMetadata(task.id, updatedMeta);
+
       this.taskRepo.updateTaskStatus(
         task.id,
         'EXECUTING',
@@ -654,17 +683,39 @@ export class TaskCoordinator {
     // Initial plan formulation if no steps exist yet
     if (steps.length === 0) {
       const taskMeta = task.metadataJson ? (JSON.parse(task.metadataJson) as Record<string, unknown>) : {};
-      if (
-        taskMeta.agentId &&
-        typeof taskMeta.agentId === 'string' &&
-        this.agentRegistry.has(taskMeta.agentId)
-      ) {
+      if (taskMeta.agentId && typeof taskMeta.agentId === 'string') {
+        const agentId = taskMeta.agentId.trim();
+        if (!this.agentRegistry.has(agentId)) {
+          const errorMsg = `Agent '${agentId}' was not found in registry.`;
+          const failed = this.taskRepo.updateTaskStatus(task.id, 'PLANNING', 'FAILED', errorMsg);
+          this.auditRepo.appendEvent({
+            taskId: task.id,
+            eventType: 'AGENT_EXECUTION_FAILED',
+            actor: 'SYSTEM',
+            details: { agentId, error: errorMsg }
+          });
+          return failed;
+        }
+
+        const agent = this.agentRegistry.getOrThrow(agentId);
+        if (agent.capabilities.length === 0) {
+          const errorMsg = `Agent '${agentId}' has no supported capabilities.`;
+          const failed = this.taskRepo.updateTaskStatus(task.id, 'PLANNING', 'FAILED', errorMsg);
+          this.auditRepo.appendEvent({
+            taskId: task.id,
+            eventType: 'AGENT_EXECUTION_FAILED',
+            actor: 'SYSTEM',
+            details: { agentId, error: errorMsg }
+          });
+          return failed;
+        }
+
         const updated = this.taskRepo.updateTaskStatus(task.id, 'PLANNING', 'EXECUTING');
         this.auditRepo.appendEvent({
           taskId: task.id,
           eventType: 'STATE_TRANSITION',
           actor: 'SYSTEM',
-          details: { from: 'PLANNING', to: 'EXECUTING', agentId: taskMeta.agentId }
+          details: { from: 'PLANNING', to: 'EXECUTING', agentId }
         });
         return updated;
       }

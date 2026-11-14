@@ -714,4 +714,88 @@ export interface ConversationResponse {
   readonly error?: string;
 }
 
+/**
+ * Milestone 2B - Business Task Workflow Types
+ */
+
+export interface SubmitBusinessTaskInput {
+  readonly objective?: string;
+  readonly goal?: string;
+  readonly description?: string;
+  readonly agentId?: string;
+  readonly parameters?: Record<string, unknown>;
+  readonly run?: boolean;
+  readonly metadata?: Record<string, unknown>;
+}
+
+export interface PublicTaskView {
+  readonly id: string;
+  readonly goal: string;
+  readonly status: TaskStatus;
+  readonly currentStepIndex: number;
+  readonly scope: ScopeIdentifier;
+  readonly metadata: Record<string, unknown>;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly completedAt: string | null;
+  readonly errorSummary: string | null;
+}
+
+export interface PublicApprovalView {
+  readonly id: string;
+  readonly taskId: string;
+  readonly stepId: string;
+  readonly riskTier: RiskTier;
+  readonly actionSummary: string;
+  readonly targetResource: string;
+  readonly parameterDiff: Record<string, unknown>;
+  readonly decision: ApprovalDecision;
+  readonly decidedBy: string | null;
+  readonly decidedAt: string | null;
+  readonly expiresAt: string;
+  readonly createdAt: string;
+}
+
+export interface TaskDetailsView {
+  readonly task: PublicTaskView;
+  readonly steps: readonly Record<string, unknown>[];
+  readonly approvals: readonly PublicApprovalView[];
+  readonly auditEvents: readonly Record<string, unknown>[];
+  readonly usage: {
+    readonly promptTokens: number;
+    readonly completionTokens: number;
+    readonly totalTokens: number;
+    readonly totalCostUsd: number;
+  };
+}
+
+export interface BusinessTaskResultView {
+  readonly taskId: string;
+  readonly goal: string;
+  readonly status: TaskStatus;
+  readonly agentId?: string;
+  readonly output: unknown;
+  readonly summary?: string;
+  readonly error?: string;
+  readonly completedAt?: string | null;
+  readonly durationMs?: number | null;
+  readonly stepsExecuted: number;
+  readonly usage?: {
+    readonly promptTokens: number;
+    readonly completionTokens: number;
+    readonly totalTokens: number;
+    readonly totalCostUsd: number;
+    readonly totalPromptTokens?: number;
+    readonly totalCompletionTokens?: number;
+  };
+}
+
+export interface ListBusinessTasksFilter {
+  readonly status?: TaskStatus;
+  readonly agentId?: string;
+  readonly limit?: number;
+  readonly offset?: number;
+}
+
+
 

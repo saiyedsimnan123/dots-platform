@@ -153,6 +153,30 @@ export class TaskRepository {
   }
 
   /**
+   * Retrieves a task by its unique ID or throws TaskNotFoundError.
+   */
+  public getTaskByIdOrThrow(id: string): Task {
+    const task = this.getTaskById(id);
+    if (!task) {
+      throw new TaskNotFoundError(id);
+    }
+    return task;
+  }
+
+  /**
+   * Updates metadata on an existing task.
+   */
+  public updateTaskMetadata(taskId: string, metadata: Record<string, unknown>): Task {
+    const existing = this.getTaskByIdOrThrow(taskId);
+    const now = new Date().toISOString();
+    const currentMeta = existing.metadataJson ? (JSON.parse(existing.metadataJson) as Record<string, unknown>) : {};
+    const merged = { ...currentMeta, ...metadata };
+    const stmt = this.db.prepare('UPDATE tasks SET metadata_json = ?, updated_at = ? WHERE id = ?');
+    stmt.run(JSON.stringify(merged), now, taskId);
+    return this.getTaskByIdOrThrow(taskId);
+  }
+
+  /**
    * Lists tasks with optional status filter, limit, and offset.
    */
   public listTasks(options: { status?: TaskStatus; limit?: number; offset?: number } = {}): Task[] {

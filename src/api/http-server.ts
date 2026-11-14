@@ -348,8 +348,16 @@ export class DotsHttpServer {
     if (method === 'POST' && pathname === '/api/tasks') {
       const body = await this.readJsonObject(req);
       const task = await this.runtime.submitTask(caller, {
-        goal: body.goal as string,
-        metadata: body.metadata as Record<string, unknown> | undefined,
+        objective: typeof body.objective === 'string' ? body.objective : undefined,
+        goal: typeof body.goal === 'string' ? body.goal : undefined,
+        description: typeof body.description === 'string' ? body.description : undefined,
+        agentId: typeof body.agentId === 'string' ? body.agentId : undefined,
+        parameters: body.parameters && typeof body.parameters === 'object' && !Array.isArray(body.parameters)
+          ? (body.parameters as Record<string, unknown>)
+          : (body.parameters as any),
+        metadata: body.metadata && typeof body.metadata === 'object' && !Array.isArray(body.metadata)
+          ? (body.metadata as Record<string, unknown>)
+          : undefined,
         run: body.run === true
       });
       this.sendJson(res, 201, { task });
@@ -358,10 +366,11 @@ export class DotsHttpServer {
 
     if (method === 'GET' && pathname === '/api/tasks') {
       const status = (url.searchParams.get('status')?.trim() || undefined) as TaskStatus | undefined;
+      const agentId = url.searchParams.get('agentId')?.trim() || undefined;
       const limit = parseOptionalInt(url.searchParams.get('limit'), 'limit');
       const offset = parseOptionalInt(url.searchParams.get('offset'), 'offset');
-      const tasks = this.runtime.listTasks(caller, { status, limit, offset });
-      this.sendJson(res, 200, { tasks });
+      const result = this.runtime.listTasksWithTotal(caller, { status, agentId, limit, offset });
+      this.sendJson(res, 200, { tasks: result.tasks, total: result.total });
       return;
     }
 
@@ -370,6 +379,29 @@ export class DotsHttpServer {
       const taskId = decodeURIComponent(match[1]!);
       const details = this.runtime.getTaskDetails(caller, taskId);
       this.sendJson(res, 200, details);
+      return;
+    }
+
+    match = /^\/api\/tasks\/([^/]+)\/status$/.exec(pathname);
+    if (match && method === 'GET') {
+      const taskId = decodeURIComponent(match[1]!);
+      const details = this.runtime.getTaskDetails(caller, taskId);
+      this.sendJson(res, 200, {
+        taskId: details.task.id,
+        status: details.task.status,
+        goal: details.task.goal,
+        currentStepIndex: details.task.currentStepIndex,
+        completedAt: details.task.completedAt,
+        errorSummary: details.task.errorSummary
+      });
+      return;
+    }
+
+    match = /^\/api\/tasks\/([^/]+)\/result$/.exec(pathname);
+    if (match && method === 'GET') {
+      const taskId = decodeURIComponent(match[1]!);
+      const result = this.runtime.getTaskResult(caller, taskId);
+      this.sendJson(res, 200, { result });
       return;
     }
 

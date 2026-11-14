@@ -11,6 +11,7 @@ import type {
   ApprovalDecision,
   ApprovalRequest,
   AuditEvent,
+  BusinessTaskResultView,
   CallerContext,
   Conversation,
   ConversationMessage,
@@ -19,14 +20,19 @@ import type {
   ConversationStatus,
   CreateConversationInput,
   CreateScheduleInput,
+  ListBusinessTasksFilter,
   ListConversationsFilter,
   ListMessagesFilter,
   ListSchedulesFilter,
+  PublicApprovalView,
+  PublicTaskView,
   Schedule,
   ScheduleOccurrence,
   ScopeIdentifier,
   SendConversationMessageInput,
+  SubmitBusinessTaskInput,
   Task,
+  TaskDetailsView,
   TaskStatus,
   TaskStep,
   UpdateConversationInput
@@ -44,6 +50,7 @@ import { MemoryRepository } from '../storage/memory-repository.ts';
 import { ScheduleRepository } from '../storage/schedule-repository.ts';
 import { ConversationRepository } from '../storage/conversation-repository.ts';
 import { ConversationService } from '../conversation/conversation-service.ts';
+import { TaskWorkflowService } from '../tasks/task-workflow-service.ts';
 import { CrashRecoveryEngine } from '../storage/recovery.ts';
 import type { IModelProvider } from '../model/types.ts';
 import { MockModelProvider } from '../model/mock-provider.ts';
@@ -73,41 +80,11 @@ import {
 const SYSTEM_SCHEDULER_TASK_ID = '__system_scheduler__';
 const SENSITIVE_KEY_PATTERN = /(?:token|secret|password|passphrase|passwd|apikey|api_key|privatekey|authorization|credential|_scopeAttestation|_proof)/i;
 
-export interface PublicTaskView {
-  readonly id: string;
-  readonly goal: string;
-  readonly status: TaskStatus;
-  readonly currentStepIndex: number;
-  readonly scope: ScopeIdentifier;
-  readonly metadata: Record<string, unknown>;
-  readonly createdAt: string;
-  readonly updatedAt: string;
-  readonly completedAt: string | null;
-  readonly errorSummary: string | null;
-}
-
-export interface PublicApprovalView {
-  readonly id: string;
-  readonly taskId: string;
-  readonly stepId: string;
-  readonly riskTier: ApprovalRequest['riskTier'];
-  readonly actionSummary: string;
-  readonly targetResource: string;
-  readonly parameterDiff: Record<string, unknown>;
-  readonly decision: ApprovalDecision;
-  readonly decidedBy: string | null;
-  readonly decidedAt: string | null;
-  readonly expiresAt: string;
-  readonly createdAt: string;
-}
-
-export interface TaskDetailsView {
-  readonly task: PublicTaskView;
-  readonly steps: readonly Record<string, unknown>[];
-  readonly approvals: readonly PublicApprovalView[];
-  readonly auditEvents: readonly Record<string, unknown>[];
-  readonly usage: TaskUsageSummary;
-}
+export type {
+  PublicApprovalView,
+  PublicTaskView,
+  TaskDetailsView
+} from '../domain/types.ts';
 
 export interface AuthenticatedSession {
   readonly caller: CallerContext;
@@ -236,6 +213,7 @@ export class DotsRuntime {
   public readonly scheduler: TaskScheduler;
   public readonly conversationRepo: ConversationRepository;
   public readonly conversationService: ConversationService;
+  public readonly taskWorkflow: TaskWorkflowService;
 
   private readonly hostAuthority: HostMemoryAuthority;
   private readonly startedAtMs: number = Date.now();
@@ -342,6 +320,17 @@ export class DotsRuntime {
       hostAuthority: this.hostAuthority,
       maxHistoryMessages: this.config.maxConversationHistory
     });
+
+    this.taskWorkflow = new TaskWorkflowService({
+      taskRepo: this.taskRepo,
+      auditRepo: this.auditRepo,
+      coordinator: this.coordinator,
+      agentRegistry: this.agentRegistry,
+      authorizer: this.authorizer,
+      hostAuthority: this.hostAuthority,
+      eventBus: this.eventBus,
+      budgetTracker: this.budgetTracker
+    });
   }
 
   // --- Lifecycle ---
@@ -412,155 +401,39 @@ export class DotsRuntime {
 
   public async submitTask(
     caller: CallerContext,
-    input: { readonly goal: string; readonly metadata?: Record<string, unknown>; readonly run?: boolean }
+    input: SubmitBusinessTaskInput
   ): Promise<PublicTaskView> {
-    const verified = this.requirePermission(caller, 'WRITE');
-    const task = await this.coordinator.submitScopedTask({
-      goal: input.goal,
-      caller: verified,
-      metadata: input.metadata
-    });
-
-    let publicTask = this.toPublicTask(task, verified.scope);
-    this.eventBus.emit({
-      type: 'task.created',
-      scope: verified.scope,
-      taskId: task.id,
-      data: { task: publicTask }
-    });
-
-    if (input.run) {
-      publicTask = await this.runTask(verified, task.id);
-    }
-
-    return publicTask;
+    return this.taskWorkflow.submitTask(caller, input);
   }
 
   public async runTask(caller: CallerContext, taskId: string): Promise<PublicTaskView> {
-    const verified = this.requirePermission(caller, 'WRITE');
-    const { task, scope } = this.loadScopedTask(taskId, verified);
-
-    if (TaskStateMachine.isTerminal(task.status)) {
-      return this.toPublicTask(task, scope);
-    }
-
-    const updated = await this.coordinator.runToCompletion(task.id);
-    const publicTask = this.toPublicTask(updated, scope);
-
-    this.eventBus.emit({
-      type: 'task.updated',
-      scope,
-      taskId: updated.id,
-      data: { task: publicTask }
-    });
-
-    if (updated.status === 'AWAITING_APPROVAL') {
-      const pending = this.taskRepo
-        .getApprovalRequestsByTaskId(updated.id)
-        .filter((a) => a.decision === 'PENDING')
-        .map((a) => this.toPublicApproval(a));
-      this.eventBus.emit({
-        type: 'approval.requested',
-        scope,
-        taskId: updated.id,
-        data: { approvals: pending }
-      });
-    }
-
-    return publicTask;
+    return this.taskWorkflow.runTask(caller, taskId);
   }
 
   public cancelTask(caller: CallerContext, taskId: string, reason?: string): PublicTaskView {
-    const verified = this.requirePermission(caller, 'WRITE');
-    const { task, scope } = this.loadScopedTask(taskId, verified);
-
-    if (task.status === 'CANCELLED') {
-      return this.toPublicTask(task, scope);
-    }
-
-    const safeReason = reason ? defaultSecretScrubber.scrub(reason) : 'Cancelled by user.';
-    const updated = this.taskRepo.updateTaskStatus(task.id, task.status, 'CANCELLED', safeReason);
-    this.auditRepo.appendEvent({
-      taskId: task.id,
-      eventType: 'STATE_TRANSITION',
-      actor: 'USER',
-      details: { from: task.status, to: 'CANCELLED', reason: safeReason }
-    });
-
-    const publicTask = this.toPublicTask(updated, scope);
-    this.eventBus.emit({
-      type: 'task.updated',
-      scope,
-      taskId: updated.id,
-      data: { task: publicTask }
-    });
-
-    return publicTask;
+    return this.taskWorkflow.cancelTask(caller, taskId, reason);
   }
 
   public listTasks(
     caller: CallerContext,
-    filter: { readonly status?: TaskStatus; readonly limit?: number; readonly offset?: number } = {}
+    filter: ListBusinessTasksFilter = {}
   ): PublicTaskView[] {
-    const verified = this.requirePermission(caller, 'READ');
-    const limit = Math.min(200, Math.max(1, filter.limit ?? 50));
-    const offset = Math.max(0, filter.offset ?? 0);
+    return this.taskWorkflow.listTasks(caller, filter).tasks;
+  }
 
-    const matched: PublicTaskView[] = [];
-    const batchSize = 200;
-    let scanOffset = 0;
-
-    while (matched.length < offset + limit) {
-      const rows = this.taskRepo.listTasks({
-        status: filter.status,
-        limit: batchSize,
-        offset: scanOffset
-      });
-      if (rows.length === 0) {
-        break;
-      }
-      for (const task of rows) {
-        if (task.id === SYSTEM_SCHEDULER_TASK_ID) {
-          continue;
-        }
-        const taskScope = this.tryVerifyTaskScope(task);
-        if (
-          taskScope &&
-          taskScope.scopeType === verified.scope.scopeType &&
-          taskScope.scopeId === verified.scope.scopeId
-        ) {
-          matched.push(this.toPublicTask(task, taskScope));
-        }
-      }
-      if (rows.length < batchSize) {
-        break;
-      }
-      scanOffset += batchSize;
-    }
-
-    return matched.slice(offset, offset + limit);
+  public listTasksWithTotal(
+    caller: CallerContext,
+    filter: ListBusinessTasksFilter = {}
+  ): { tasks: PublicTaskView[]; total: number } {
+    return this.taskWorkflow.listTasks(caller, filter);
   }
 
   public getTaskDetails(caller: CallerContext, taskId: string): TaskDetailsView {
-    const verified = this.requirePermission(caller, 'READ');
-    const { task, scope } = this.loadScopedTask(taskId, verified);
+    return this.taskWorkflow.getTask(caller, taskId);
+  }
 
-    const steps = this.taskRepo.getStepsByTaskId(task.id).map((s) => this.toPublicStep(s));
-    const approvals = this.taskRepo
-      .getApprovalRequestsByTaskId(task.id)
-      .map((a) => this.toPublicApproval(a));
-    const auditEvents = this.auditRepo
-      .getEventsByTaskId(task.id)
-      .map((e) => this.toPublicAuditEvent(e));
-    const usage = this.budgetTracker.getUsageForTask(task.id);
-
-    return {
-      task: this.toPublicTask(task, scope),
-      steps,
-      approvals,
-      auditEvents,
-      usage
-    };
+  public getTaskResult(caller: CallerContext, taskId: string): BusinessTaskResultView {
+    return this.taskWorkflow.getTaskResult(caller, taskId);
   }
 
   // --- Approvals ---

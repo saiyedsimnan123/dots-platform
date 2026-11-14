@@ -119,6 +119,22 @@ function requireArg(val: string | undefined, label: string): string {
   return val;
 }
 
+function parseOptionalJson(raw: string | undefined, flagName: string): Record<string, unknown> | undefined {
+  if (!raw || raw.trim() === '') {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new ValidationError(`Flag '--${flagName}' must be a valid JSON object.`);
+    }
+    return parsed as Record<string, unknown>;
+  } catch (err) {
+    if (err instanceof ValidationError) throw err;
+    throw new ValidationError(`Flag '--${flagName}' contains invalid JSON: ${err instanceof Error ? err.message : String(err)}.`);
+  }
+}
+
 function renderHelp(): string {
   return [
     'Dots AI Platform CLI',
@@ -137,9 +153,16 @@ function renderHelp(): string {
     '',
     'Commands:',
     '  serve [--host <host>] [--port <port>]',
-    '  run <goal> [--no-wait]',
+    '  run <goal> [--description <desc>] [--agent <agentId>] [--params <json>] [--no-wait]',
     '  status [taskId] [--status <status>] [--limit <n>]',
     '  cancel <taskId> [--reason <text>]',
+    '  task submit <objective> [--description <desc>] [--agent <agentId>] [--params <json>] [--no-wait]',
+    '  task list [--status <status>] [--agent <agentId>] [--limit <n>] [--offset <n>]',
+    '  task get <id>',
+    '  task status <id>',
+    '  task result <id>',
+    '  task run <id>',
+    '  task cancel <id> [--reason <text>]',
     '  approvals [--decision <PENDING|APPROVED|REJECTED|EXPIRED>] [--limit <n>]',
     '  approve <approvalId> [--reject] [--no-resume]',
     '  memory list [--category <cat>] [--status <status>] [--limit <n>]',
@@ -333,9 +356,78 @@ async function executeLocalCommand(
 
   if (cmd === 'run') {
     const goal = requireArg(positionals.slice(1).join(' ').trim() || undefined, 'goal');
+    const description = getStringFlag(flags, 'description');
+    const agentId = getStringFlag(flags, 'agent');
+    const params = parseOptionalJson(getStringFlag(flags, 'params'), 'params');
     const wait = flags.get('no-wait') !== true;
-    const task = await runtime.submitTask(caller, { goal, run: wait });
+    const task = await runtime.submitTask(caller, {
+      goal,
+      objective: goal,
+      description,
+      agentId,
+      parameters: params,
+      run: wait
+    });
     return { task };
+  }
+
+  if (cmd === 'task') {
+    const sub = requireArg(positionals[1], 'task subcommand');
+    if (sub === 'submit') {
+      const objective = requireArg(positionals.slice(2).join(' ').trim() || undefined, 'objective');
+      const description = getStringFlag(flags, 'description');
+      const agentId = getStringFlag(flags, 'agent');
+      const params = parseOptionalJson(getStringFlag(flags, 'params'), 'params');
+      const wait = flags.get('no-wait') !== true;
+      const task = await runtime.submitTask(caller, {
+        objective,
+        description,
+        agentId,
+        parameters: params,
+        run: wait
+      });
+      return { task };
+    }
+    if (sub === 'list') {
+      const status = getStringFlag(flags, 'status') as TaskStatus | undefined;
+      const agentId = getStringFlag(flags, 'agent');
+      const limit = getIntFlag(flags, 'limit');
+      const offset = getIntFlag(flags, 'offset');
+      const result = runtime.listTasksWithTotal(caller, { status, agentId, limit, offset });
+      return { tasks: result.tasks, total: result.total };
+    }
+    if (sub === 'get') {
+      const id = requireArg(positionals[2], 'taskId');
+      return runtime.getTaskDetails(caller, id);
+    }
+    if (sub === 'status') {
+      const id = requireArg(positionals[2], 'taskId');
+      const details = runtime.getTaskDetails(caller, id);
+      return {
+        taskId: details.task.id,
+        status: details.task.status,
+        goal: details.task.goal,
+        currentStepIndex: details.task.currentStepIndex,
+        completedAt: details.task.completedAt,
+        errorSummary: details.task.errorSummary
+      };
+    }
+    if (sub === 'result') {
+      const id = requireArg(positionals[2], 'taskId');
+      const result = runtime.getTaskResult(caller, id);
+      return { result };
+    }
+    if (sub === 'run') {
+      const id = requireArg(positionals[2], 'taskId');
+      const task = await runtime.runTask(caller, id);
+      return { task };
+    }
+    if (sub === 'cancel') {
+      const id = requireArg(positionals[2], 'taskId');
+      const reason = getStringFlag(flags, 'reason');
+      return { task: runtime.cancelTask(caller, id, reason) };
+    }
+    throw new ValidationError(`Unknown task subcommand '${sub}'.`);
   }
 
   if (cmd === 'status') {
@@ -615,8 +707,78 @@ async function executeRemoteCommand(
 ): Promise<unknown> {
   if (cmd === 'run') {
     const goal = requireArg(positionals.slice(1).join(' ').trim() || undefined, 'goal');
+    const description = getStringFlag(flags, 'description');
+    const agentId = getStringFlag(flags, 'agent');
+    const params = parseOptionalJson(getStringFlag(flags, 'params'), 'params');
     const run = flags.get('no-wait') !== true;
-    return await callHttpApi(serverUrl, 'POST', '/api/tasks', token, scopeSpec, { goal, run });
+    return await callHttpApi(serverUrl, 'POST', '/api/tasks', token, scopeSpec, {
+      goal,
+      objective: goal,
+      description,
+      agentId,
+      parameters: params,
+      run
+    });
+  }
+
+  if (cmd === 'task') {
+    const sub = requireArg(positionals[1], 'task subcommand');
+    if (sub === 'submit') {
+      const objective = requireArg(positionals.slice(2).join(' ').trim() || undefined, 'objective');
+      const description = getStringFlag(flags, 'description');
+      const agentId = getStringFlag(flags, 'agent');
+      const params = parseOptionalJson(getStringFlag(flags, 'params'), 'params');
+      const run = flags.get('no-wait') !== true;
+      return await callHttpApi(serverUrl, 'POST', '/api/tasks', token, scopeSpec, {
+        objective,
+        description,
+        agentId,
+        parameters: params,
+        run
+      });
+    }
+    if (sub === 'list') {
+      const qs = new URLSearchParams();
+      const status = getStringFlag(flags, 'status');
+      const agentId = getStringFlag(flags, 'agent');
+      const limit = getIntFlag(flags, 'limit');
+      const offset = getIntFlag(flags, 'offset');
+      if (status) qs.set('status', status);
+      if (agentId) qs.set('agentId', agentId);
+      if (limit !== undefined) qs.set('limit', String(limit));
+      if (offset !== undefined) qs.set('offset', String(offset));
+      const suffix = qs.toString() ? `?${qs.toString()}` : '';
+      return await callHttpApi(serverUrl, 'GET', `/api/tasks${suffix}`, token, scopeSpec);
+    }
+    if (sub === 'get') {
+      const id = requireArg(positionals[2], 'taskId');
+      return await callHttpApi(serverUrl, 'GET', `/api/tasks/${encodeURIComponent(id)}`, token, scopeSpec);
+    }
+    if (sub === 'status') {
+      const id = requireArg(positionals[2], 'taskId');
+      return await callHttpApi(serverUrl, 'GET', `/api/tasks/${encodeURIComponent(id)}/status`, token, scopeSpec);
+    }
+    if (sub === 'result') {
+      const id = requireArg(positionals[2], 'taskId');
+      return await callHttpApi(serverUrl, 'GET', `/api/tasks/${encodeURIComponent(id)}/result`, token, scopeSpec);
+    }
+    if (sub === 'run') {
+      const id = requireArg(positionals[2], 'taskId');
+      return await callHttpApi(serverUrl, 'POST', `/api/tasks/${encodeURIComponent(id)}/run`, token, scopeSpec);
+    }
+    if (sub === 'cancel') {
+      const id = requireArg(positionals[2], 'taskId');
+      const reason = getStringFlag(flags, 'reason');
+      return await callHttpApi(
+        serverUrl,
+        'POST',
+        `/api/tasks/${encodeURIComponent(id)}/cancel`,
+        token,
+        scopeSpec,
+        reason ? { reason } : {}
+      );
+    }
+    throw new ValidationError(`Unknown task subcommand '${sub}'.`);
   }
 
   if (cmd === 'status') {
