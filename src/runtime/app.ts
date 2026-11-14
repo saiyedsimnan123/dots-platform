@@ -73,7 +73,7 @@ import { TokenIdentityProvider } from '../security/token-identity-provider.ts';
 import { VerificationEngine } from '../verification/verifier.ts';
 import { MemoryService } from '../memory/memory-service.ts';
 import { TaskCoordinator } from '../orchestrator/coordinator.ts';
-import { AgentRegistry, ResearchAgent, type AgentMetadata } from '../agents/index.ts';
+import { AgentRegistry, ResearchAgent, AnalyticsAgent, type AgentMetadata } from '../agents/index.ts';
 import { TaskScheduler } from '../scheduler/task-scheduler.ts';
 import { RuntimeEventBus } from './event-bus.ts';
 import { OperationalLogger } from './logger.ts';
@@ -301,6 +301,12 @@ export class DotsRuntime {
     }
     if (!this.agentRegistry.has('research')) {
       this.agentRegistry.register(new ResearchAgent({ id: 'research' }));
+    }
+    if (!this.agentRegistry.has('analytics-agent')) {
+      this.agentRegistry.register(new AnalyticsAgent({ id: 'analytics-agent' }));
+    }
+    if (!this.agentRegistry.has('analytics')) {
+      this.agentRegistry.register(new AnalyticsAgent({ id: 'analytics' }));
     }
 
     this.coordinator = new TaskCoordinator({

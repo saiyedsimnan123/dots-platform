@@ -64,6 +64,7 @@ export * from './agents/context.ts';
 export * from './agents/base-agent.ts';
 export * from './agents/registry.ts';
 export * from './agents/research-agent.ts';
+export * from './agents/analytics-agent.ts';
 
 // Phase 8: Persistent Scheduler, Runtime, API & CLI
 export * from './storage/schedule-repository.ts';
