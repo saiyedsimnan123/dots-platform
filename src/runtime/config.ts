@@ -37,6 +37,7 @@ export interface DotsRuntimeConfig {
   readonly enableDynamicReplan: boolean;
   readonly enableCompensation: boolean;
   readonly enableScheduler: boolean;
+  readonly maxConversationHistory: number;
 }
 
 export interface LoadRuntimeConfigOverrides {
@@ -58,6 +59,7 @@ export interface LoadRuntimeConfigOverrides {
   readonly enableDynamicReplan?: boolean;
   readonly enableCompensation?: boolean;
   readonly enableScheduler?: boolean;
+  readonly maxConversationHistory?: number;
   readonly requireTokens?: boolean;
   readonly env?: Record<string, string | undefined>;
 }
@@ -248,6 +250,9 @@ export function loadRuntimeConfig(overrides: LoadRuntimeConfigOverrides = {}): D
     autoApproveTier2: overrides.autoApproveTier2 ?? parseBoolean(env.DOTS_AUTO_APPROVE_TIER2, true),
     enableDynamicReplan: overrides.enableDynamicReplan ?? parseBoolean(env.DOTS_ENABLE_DYNAMIC_REPLAN, false),
     enableCompensation: overrides.enableCompensation ?? parseBoolean(env.DOTS_ENABLE_COMPENSATION, true),
-    enableScheduler: overrides.enableScheduler ?? parseBoolean(env.DOTS_ENABLE_SCHEDULER, true)
+    enableScheduler: overrides.enableScheduler ?? parseBoolean(env.DOTS_ENABLE_SCHEDULER, true),
+    maxConversationHistory:
+      overrides.maxConversationHistory ??
+      parsePositiveInt(env.DOTS_MAX_CONVERSATION_HISTORY, 50, 'DOTS_MAX_CONVERSATION_HISTORY')
   };
 }

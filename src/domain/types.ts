@@ -97,7 +97,12 @@ export type AuditEventType =
   | 'SCHEDULE_OCCURRENCE_SKIPPED'
   | 'SCHEDULE_OCCURRENCE_SUCCEEDED'
   | 'SCHEDULE_OCCURRENCE_FAILED'
-  | 'SCHEDULE_OCCURRENCE_RECOVERED';
+  | 'SCHEDULE_OCCURRENCE_RECOVERED'
+  | 'CONVERSATION_CREATED'
+  | 'CONVERSATION_UPDATED'
+  | 'CONVERSATION_ARCHIVED'
+  | 'CONVERSATION_DELETED'
+  | 'CONVERSATION_MESSAGE_SENT';
 
 /**
  * Primary Task Entity.
@@ -624,4 +629,89 @@ export interface ListSchedulesFilter {
   readonly limit?: number;
   readonly offset?: number;
 }
+
+/**
+ * Milestone 2A - Persistent Conversation Domain Entities and DTOs
+ */
+
+export type ConversationStatus = 'ACTIVE' | 'ARCHIVED';
+
+export interface Conversation {
+  readonly id: string;
+  readonly title: string;
+  readonly status: ConversationStatus;
+  readonly scopeType: MemoryScopeType;
+  readonly scopeId: string;
+  readonly createdBy: string;
+  readonly agentId: string | null;
+  readonly metadataJson: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export type ConversationMessageRole = 'system' | 'user' | 'assistant' | 'tool';
+
+export interface ConversationMessage {
+  readonly id: string;
+  readonly conversationId: string;
+  readonly role: ConversationMessageRole;
+  readonly content: string;
+  readonly name?: string | null;
+  readonly toolCallId?: string | null;
+  readonly toolCallsJson?: string | null;
+  readonly clientMessageId?: string | null;
+  readonly metadataJson?: string | null;
+  readonly createdAt: string;
+}
+
+export interface CreateConversationInput {
+  readonly id?: string;
+  readonly title?: string;
+  readonly scope?: ScopeIdentifier;
+  readonly agentId?: string;
+  readonly metadata?: Record<string, unknown>;
+}
+
+export interface UpdateConversationInput {
+  readonly title?: string;
+  readonly agentId?: string | null;
+  readonly metadata?: Record<string, unknown>;
+}
+
+export interface ListConversationsFilter {
+  readonly status?: ConversationStatus;
+  readonly agentId?: string;
+  readonly limit?: number;
+  readonly offset?: number;
+}
+
+export interface ListMessagesFilter {
+  readonly limit?: number;
+  readonly offset?: number;
+  readonly order?: 'ASC' | 'DESC';
+}
+
+export interface SendConversationMessageInput {
+  readonly content: string;
+  readonly role?: ConversationMessageRole;
+  readonly name?: string;
+  readonly clientMessageId?: string;
+  readonly metadata?: Record<string, unknown>;
+}
+
+export interface ConversationModelUsage {
+  readonly promptTokens: number;
+  readonly completionTokens: number;
+  readonly totalTokens: number;
+  readonly estimatedCostUsd?: number;
+}
+
+export interface ConversationResponse {
+  readonly conversation: Conversation;
+  readonly userMessage: ConversationMessage;
+  readonly assistantMessage?: ConversationMessage;
+  readonly usage?: ConversationModelUsage;
+  readonly error?: string;
+}
+
 

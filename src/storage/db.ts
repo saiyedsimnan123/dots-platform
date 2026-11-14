@@ -309,6 +309,50 @@ export class DatabaseManager {
               WHERE status IN ('CLAIMED', 'TASK_CREATED', 'RUNNING', 'AWAITING_APPROVAL');
           `);
         }
+      },
+      {
+        version: '004_conversation_system',
+        up: (db) => {
+          db.exec(`
+            -- Conversations table: persistent conversation sessions
+            CREATE TABLE IF NOT EXISTS conversations (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'ARCHIVED')),
+              scope_type TEXT NOT NULL CHECK (scope_type IN ('GLOBAL', 'WORKSPACE')),
+              scope_id TEXT NOT NULL,
+              created_by TEXT NOT NULL,
+              agent_id TEXT,
+              metadata_json TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_conversations_scope ON conversations(scope_type, scope_id, status);
+            CREATE INDEX IF NOT EXISTS idx_conversations_created_at ON conversations(created_at);
+            CREATE INDEX IF NOT EXISTS idx_conversations_agent_id ON conversations(agent_id);
+
+            -- Conversation messages table: chronological message store
+            CREATE TABLE IF NOT EXISTS conversation_messages (
+              id TEXT PRIMARY KEY,
+              conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+              role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
+              content TEXT NOT NULL,
+              name TEXT,
+              tool_call_id TEXT,
+              tool_calls_json TEXT,
+              client_message_id TEXT,
+              metadata_json TEXT,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_conversation_messages_conv_created ON conversation_messages(conversation_id, created_at ASC);
+            CREATE INDEX IF NOT EXISTS idx_conversation_messages_created_at ON conversation_messages(created_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_messages_client_id 
+              ON conversation_messages(conversation_id, client_message_id) 
+              WHERE client_message_id IS NOT NULL;
+          `);
+        }
       }
     ];
 

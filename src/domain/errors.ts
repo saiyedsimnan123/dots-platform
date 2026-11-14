@@ -298,5 +298,38 @@ export class AgentCancelledError extends DomainError {
   }
 }
 
+/**
+ * Thrown when a requested conversation entity cannot be found.
+ */
+export class ConversationNotFoundError extends DomainError {
+  public readonly conversationId: string;
+
+  constructor(conversationId: string, details: Record<string, unknown> = {}) {
+    super(`Conversation with ID '${conversationId}' was not found.`, 'CONVERSATION_NOT_FOUND', { conversationId, ...details });
+    this.conversationId = conversationId;
+  }
+}
+
+/**
+ * Thrown when cross-scope access is attempted on a conversation record.
+ */
+export class ConversationScopeViolationError extends DomainError {
+  public readonly expectedScope: string;
+  public readonly actualScope: string;
+  public readonly conversationId?: string;
+
+  constructor(expectedScope: string, actualScope: string, conversationId?: string, details: Record<string, unknown> = {}) {
+    super(
+      `Conversation scope violation: expected scope '${expectedScope}', but attempted operation in '${actualScope}'.`,
+      'CONVERSATION_SCOPE_VIOLATION',
+      { expectedScope, actualScope, conversationId, ...details }
+    );
+    this.expectedScope = expectedScope;
+    this.actualScope = actualScope;
+    this.conversationId = conversationId;
+  }
+}
+
+
 
 

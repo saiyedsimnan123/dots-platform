@@ -74,3 +74,7 @@ export * from './runtime/config.ts';
 export * from './runtime/app.ts';
 export * from './api/http-server.ts';
 export { runCli, type CliIo } from './cli/main.ts';
+
+// Milestone 2A: Persistent Conversation System
+export * from './storage/conversation-repository.ts';
+export * from './conversation/conversation-service.ts';

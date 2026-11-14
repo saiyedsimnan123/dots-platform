@@ -10,6 +10,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type {
   ApprovalDecision,
+  ConversationMessageRole,
+  ConversationStatus,
   CreateMemoryInput,
   CreateScheduleInput,
   ImportConflictStrategy,
@@ -22,7 +24,11 @@ import type {
   UpdateMemoryInput
 } from '../domain/types.ts';
 import {
+  AgentCapabilityError,
+  AgentNotFoundError,
   ConcurrencyConflictError,
+  ConversationNotFoundError,
+  ConversationScopeViolationError,
   DomainError,
   MemoryConflictError,
   MemoryNotFoundError,
@@ -38,7 +44,13 @@ import { BudgetExceededError } from '../model/budget-tracker.ts';
 import { defaultSecretScrubber } from '../model/secret-scrubber.ts';
 import type { RuntimeEvent } from '../runtime/event-bus.ts';
 import { parseScopeSpec } from '../runtime/config.ts';
-import { DotsRuntime, scrubPublicData, type AuthenticatedSession } from '../runtime/app.ts';
+import {
+  DotsRuntime,
+  scrubPublicData,
+  toPublicConversationView,
+  toPublicMessageView,
+  type AuthenticatedSession
+} from '../runtime/app.ts';
 
 class PayloadTooLargeError extends Error {
   public readonly maxBytes: number;
@@ -586,6 +598,129 @@ export class DotsHttpServer {
       return;
     }
 
+    // --- Conversations ---
+    if (method === 'POST' && pathname === '/api/conversations') {
+      const body = await this.readOptionalJsonObject(req);
+      const conversation = this.runtime.createConversation(caller, {
+        title: typeof body.title === 'string' ? body.title : undefined,
+        agentId: typeof body.agentId === 'string' ? body.agentId : undefined,
+        metadata:
+          body.metadata && typeof body.metadata === 'object' && !Array.isArray(body.metadata)
+            ? (body.metadata as Record<string, unknown>)
+            : undefined
+      });
+      this.sendJson(res, 201, { conversation: toPublicConversationView(conversation) });
+      return;
+    }
+
+    if (method === 'GET' && pathname === '/api/conversations') {
+      const status = (url.searchParams.get('status')?.trim() || undefined) as ConversationStatus | undefined;
+      const agentId = url.searchParams.get('agentId')?.trim() || undefined;
+      const limit = parseOptionalInt(url.searchParams.get('limit'), 'limit');
+      const offset = parseOptionalInt(url.searchParams.get('offset'), 'offset');
+      const result = this.runtime.listConversations(caller, { status, agentId, limit, offset });
+      this.sendJson(res, 200, {
+        conversations: result.conversations.map(toPublicConversationView),
+        total: result.total
+      });
+      return;
+    }
+
+    match = /^\/api\/conversations\/([^/]+)\/archive$/.exec(pathname);
+    if (match && method === 'POST') {
+      await this.readOptionalJsonObject(req);
+      const conversationId = decodeURIComponent(match[1]!);
+      const conversation = this.runtime.archiveConversation(caller, conversationId);
+      this.sendJson(res, 200, { conversation: toPublicConversationView(conversation) });
+      return;
+    }
+
+    match = /^\/api\/conversations\/([^/]+)\/messages$/.exec(pathname);
+    if (match && method === 'POST') {
+      const conversationId = decodeURIComponent(match[1]!);
+      const body = await this.readJsonObject(req);
+      if (!body.content || typeof body.content !== 'string' || (body.content as string).trim() === '') {
+        throw new ValidationError("Field 'content' must be a non-empty string.");
+      }
+      const result = await this.runtime.sendConversationMessage(caller, conversationId, {
+        content: body.content as string,
+        role: typeof body.role === 'string' ? (body.role as ConversationMessageRole) : undefined,
+        name: typeof body.name === 'string' ? (body.name as string) : undefined,
+        clientMessageId: typeof body.clientMessageId === 'string' ? (body.clientMessageId as string) : undefined,
+        metadata:
+          body.metadata && typeof body.metadata === 'object' && !Array.isArray(body.metadata)
+            ? (body.metadata as Record<string, unknown>)
+            : undefined
+      });
+      this.sendJson(res, 200, {
+        conversation: toPublicConversationView(result.conversation),
+        userMessage: toPublicMessageView(result.userMessage),
+        ...(result.assistantMessage ? { assistantMessage: toPublicMessageView(result.assistantMessage) } : {}),
+        ...(result.usage ? { usage: result.usage } : {})
+      });
+      return;
+    }
+
+    match = /^\/api\/conversations\/([^/]+)\/messages$/.exec(pathname);
+    if (match && method === 'GET') {
+      const conversationId = decodeURIComponent(match[1]!);
+      const limit = parseOptionalInt(url.searchParams.get('limit'), 'limit');
+      const offset = parseOptionalInt(url.searchParams.get('offset'), 'offset');
+      const orderParam = url.searchParams.get('order')?.trim().toUpperCase();
+      const order = orderParam === 'DESC' ? 'DESC' : 'ASC';
+      const result = this.runtime.getConversationMessages(caller, conversationId, { limit, offset, order });
+      this.sendJson(res, 200, {
+        messages: result.messages.map(toPublicMessageView),
+        total: result.total
+      });
+      return;
+    }
+
+    match = /^\/api\/conversations\/([^/]+)$/.exec(pathname);
+    if (match && method === 'GET') {
+      const conversationId = decodeURIComponent(match[1]!);
+      const limit = parseOptionalInt(url.searchParams.get('limit'), 'limit');
+      const offset = parseOptionalInt(url.searchParams.get('offset'), 'offset');
+      const conversation = this.runtime.getConversation(caller, conversationId);
+      const messagesResult = this.runtime.getConversationMessages(caller, conversationId, { limit, offset });
+      this.sendJson(res, 200, {
+        conversation: toPublicConversationView(conversation),
+        messages: messagesResult.messages.map(toPublicMessageView),
+        totalMessages: messagesResult.total
+      });
+      return;
+    }
+
+    match = /^\/api\/conversations\/([^/]+)$/.exec(pathname);
+    if (match && method === 'PATCH') {
+      const conversationId = decodeURIComponent(match[1]!);
+      const body = await this.readJsonObject(req);
+      const conversation = this.runtime.updateConversation(caller, conversationId, {
+        title: typeof body.title === 'string' ? body.title : undefined,
+        agentId: body.agentId === null ? null : (typeof body.agentId === 'string' ? body.agentId : undefined),
+        metadata:
+          body.metadata && typeof body.metadata === 'object' && !Array.isArray(body.metadata)
+            ? (body.metadata as Record<string, unknown>)
+            : undefined
+      });
+      this.sendJson(res, 200, { conversation: toPublicConversationView(conversation) });
+      return;
+    }
+
+    match = /^\/api\/conversations\/([^/]+)$/.exec(pathname);
+    if (match && method === 'DELETE') {
+      const conversationId = decodeURIComponent(match[1]!);
+      const hard = parseOptionalBool(url.searchParams.get('hard'), 'hard') === true;
+      if (hard) {
+        const deleted = this.runtime.deleteConversation(caller, conversationId);
+        this.sendJson(res, 200, { deleted });
+      } else {
+        const conversation = this.runtime.archiveConversation(caller, conversationId);
+        this.sendJson(res, 200, { conversation: toPublicConversationView(conversation) });
+      }
+      return;
+    }
+
     this.sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'API endpoint not found.' } });
   }
 
@@ -699,7 +834,7 @@ export class DotsHttpServer {
       return;
     }
 
-    if (err instanceof MemoryScopeViolationError) {
+    if (err instanceof MemoryScopeViolationError || err instanceof ConversationScopeViolationError) {
       this.sendJson(res, 403, {
         error: {
           code: err.code,
@@ -712,7 +847,9 @@ export class DotsHttpServer {
     if (
       err instanceof TaskNotFoundError ||
       err instanceof MemoryNotFoundError ||
-      err instanceof ScheduleNotFoundError
+      err instanceof ScheduleNotFoundError ||
+      err instanceof ConversationNotFoundError ||
+      err instanceof AgentNotFoundError
     ) {
       this.sendJson(res, 404, {
         error: {

@@ -12,14 +12,24 @@ import type {
   ApprovalRequest,
   AuditEvent,
   CallerContext,
+  Conversation,
+  ConversationMessage,
+  ConversationMessageRole,
+  ConversationResponse,
+  ConversationStatus,
+  CreateConversationInput,
   CreateScheduleInput,
+  ListConversationsFilter,
+  ListMessagesFilter,
   ListSchedulesFilter,
   Schedule,
   ScheduleOccurrence,
   ScopeIdentifier,
+  SendConversationMessageInput,
   Task,
   TaskStatus,
-  TaskStep
+  TaskStep,
+  UpdateConversationInput
 } from '../domain/types.ts';
 import {
   SecurityViolationError,
@@ -32,6 +42,8 @@ import { TaskRepository } from '../storage/task-repository.ts';
 import { AuditRepository } from '../storage/audit-repository.ts';
 import { MemoryRepository } from '../storage/memory-repository.ts';
 import { ScheduleRepository } from '../storage/schedule-repository.ts';
+import { ConversationRepository } from '../storage/conversation-repository.ts';
+import { ConversationService } from '../conversation/conversation-service.ts';
 import { CrashRecoveryEngine } from '../storage/recovery.ts';
 import type { IModelProvider } from '../model/types.ts';
 import { MockModelProvider } from '../model/mock-provider.ts';
@@ -100,6 +112,56 @@ export interface TaskDetailsView {
 export interface AuthenticatedSession {
   readonly caller: CallerContext;
   readonly principal: AuthenticatedPrincipal;
+}
+
+export interface PublicConversationView {
+  readonly id: string;
+  readonly title: string;
+  readonly status: ConversationStatus;
+  readonly scope: ScopeIdentifier;
+  readonly createdBy: string;
+  readonly agentId: string | null;
+  readonly metadata: Record<string, unknown>;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface PublicMessageView {
+  readonly id: string;
+  readonly conversationId: string;
+  readonly role: ConversationMessageRole;
+  readonly content: string;
+  readonly name?: string | null;
+  readonly clientMessageId?: string | null;
+  readonly metadata?: Record<string, unknown>;
+  readonly createdAt: string;
+}
+
+export function toPublicConversationView(c: Conversation): PublicConversationView {
+  return {
+    id: c.id,
+    title: defaultSecretScrubber.scrub(c.title),
+    status: c.status,
+    scope: { scopeType: c.scopeType, scopeId: c.scopeId },
+    createdBy: c.createdBy,
+    agentId: c.agentId,
+    metadata: scrubPublicData(safeJsonParse(c.metadataJson)) as Record<string, unknown>,
+    createdAt: c.createdAt,
+    updatedAt: c.updatedAt
+  };
+}
+
+export function toPublicMessageView(m: ConversationMessage): PublicMessageView {
+  return {
+    id: m.id,
+    conversationId: m.conversationId,
+    role: m.role,
+    content: defaultSecretScrubber.scrub(m.content),
+    ...(m.name ? { name: defaultSecretScrubber.scrub(m.name) } : {}),
+    ...(m.clientMessageId ? { clientMessageId: m.clientMessageId } : {}),
+    metadata: scrubPublicData(safeJsonParse(m.metadataJson ?? null)) as Record<string, unknown>,
+    createdAt: m.createdAt
+  };
 }
 
 export interface DotsRuntimeOptions extends LoadRuntimeConfigOverrides {
@@ -172,6 +234,8 @@ export class DotsRuntime {
   public readonly coordinator: TaskCoordinator;
   public readonly crashRecovery: CrashRecoveryEngine;
   public readonly scheduler: TaskScheduler;
+  public readonly conversationRepo: ConversationRepository;
+  public readonly conversationService: ConversationService;
 
   private readonly hostAuthority: HostMemoryAuthority;
   private readonly startedAtMs: number = Date.now();
@@ -266,6 +330,17 @@ export class DotsRuntime {
       logger: this.logger,
       eventBus: this.eventBus,
       pollIntervalMs: this.config.schedulerPollIntervalMs
+    });
+
+    this.conversationRepo = new ConversationRepository(this.db);
+    this.conversationService = new ConversationService({
+      conversationRepo: this.conversationRepo,
+      modelProvider: this.modelProvider,
+      agentRegistry: this.agentRegistry,
+      coordinator: this.coordinator,
+      authorizer: this.authorizer,
+      hostAuthority: this.hostAuthority,
+      maxHistoryMessages: this.config.maxConversationHistory
     });
   }
 
@@ -601,6 +676,55 @@ export class DotsRuntime {
 
   public cancelSchedule(caller: CallerContext, scheduleId: string): Schedule {
     return this.scheduler.cancelSchedule(caller, scheduleId);
+  }
+
+  // --- Conversations ---
+
+  public createConversation(caller: CallerContext, input: CreateConversationInput): Conversation {
+    return this.conversationService.createConversation(caller, input);
+  }
+
+  public getConversation(caller: CallerContext, conversationId: string): Conversation {
+    return this.conversationService.getConversation(caller, conversationId);
+  }
+
+  public listConversations(
+    caller: CallerContext,
+    filter: ListConversationsFilter = {}
+  ): { conversations: Conversation[]; total: number } {
+    return this.conversationService.listConversations(caller, filter);
+  }
+
+  public updateConversation(
+    caller: CallerContext,
+    conversationId: string,
+    input: UpdateConversationInput
+  ): Conversation {
+    return this.conversationService.updateConversation(caller, conversationId, input);
+  }
+
+  public archiveConversation(caller: CallerContext, conversationId: string): Conversation {
+    return this.conversationService.archiveConversation(caller, conversationId);
+  }
+
+  public deleteConversation(caller: CallerContext, conversationId: string): boolean {
+    return this.conversationService.deleteConversation(caller, conversationId);
+  }
+
+  public getConversationMessages(
+    caller: CallerContext,
+    conversationId: string,
+    filter: ListMessagesFilter = {}
+  ): { messages: ConversationMessage[]; total: number } {
+    return this.conversationService.getMessages(caller, conversationId, filter);
+  }
+
+  public async sendConversationMessage(
+    caller: CallerContext,
+    conversationId: string,
+    input: SendConversationMessageInput
+  ): Promise<ConversationResponse> {
+    return await this.conversationService.sendMessage(caller, conversationId, input);
   }
 
   // --- Internal Helpers ---

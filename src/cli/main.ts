@@ -12,6 +12,8 @@ import { readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import type {
   ApprovalDecision,
+  ConversationMessageRole,
+  ConversationStatus,
   CreateScheduleInput,
   ImportConflictStrategy,
   MemoryCategory,
@@ -25,7 +27,13 @@ import type {
 import { ValidationError } from '../domain/errors.ts';
 import { defaultSecretScrubber } from '../model/secret-scrubber.ts';
 import { parseScopeSpec } from '../runtime/config.ts';
-import { DotsRuntime, scrubPublicData, type DotsRuntimeOptions } from '../runtime/app.ts';
+import {
+  DotsRuntime,
+  scrubPublicData,
+  toPublicConversationView,
+  toPublicMessageView,
+  type DotsRuntimeOptions
+} from '../runtime/app.ts';
 import { DotsHttpServer } from '../api/http-server.ts';
 
 export interface CliIo {
@@ -45,7 +53,8 @@ const BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
   'no-resume',
   'reject',
   'include-archived',
-  'dry-run'
+  'dry-run',
+  'hard'
 ]);
 
 function parseArgv(argv: readonly string[]): ParsedArgs {
@@ -150,7 +159,15 @@ function renderHelp(): string {
     '  schedule occurrences <id> [--limit <n>]',
     '  schedule pause <id> [--reason <text>]',
     '  schedule resume <id>',
-    '  schedule cancel <id>'
+    '  schedule cancel <id>',
+    '  conversation create [--title <title>] [--agent <agentId>]',
+    '  conversation list [--status <ACTIVE|ARCHIVED>] [--agent <agentId>] [--limit <n>]',
+    '  conversation get <id> [--limit <n>]',
+    '  conversation send <id> <message> [--client-id <id>]',
+    '  conversation update <id> [--title <title>] [--agent <agentId>]',
+    '  conversation archive <id>',
+    '  conversation delete <id> [--hard]',
+    '  conversation messages <id> [--limit <n>] [--offset <n>] [--order <ASC|DESC>]'
   ].join('\n');
 }
 
@@ -497,6 +514,94 @@ async function executeLocalCommand(
     throw new ValidationError(`Unknown schedule subcommand '${sub}'.`);
   }
 
+  if (cmd === 'conversation') {
+    const sub = requireArg(positionals[1], 'conversation subcommand');
+    if (sub === 'create') {
+      const title = getStringFlag(flags, 'title');
+      const agentId = getStringFlag(flags, 'agent');
+      const conversation = runtime.createConversation(caller, {
+        title,
+        agentId
+      });
+      return { conversation: toPublicConversationView(conversation) };
+    }
+    if (sub === 'list') {
+      const status = getStringFlag(flags, 'status') as ConversationStatus | undefined;
+      const agentId = getStringFlag(flags, 'agent');
+      const limit = getIntFlag(flags, 'limit');
+      const offset = getIntFlag(flags, 'offset');
+      const result = runtime.listConversations(caller, { status, agentId, limit, offset });
+      return {
+        conversations: result.conversations.map(toPublicConversationView),
+        total: result.total
+      };
+    }
+    if (sub === 'get') {
+      const id = requireArg(positionals[2], 'conversationId');
+      const limit = getIntFlag(flags, 'limit');
+      const offset = getIntFlag(flags, 'offset');
+      const conversation = runtime.getConversation(caller, id);
+      const messagesResult = runtime.getConversationMessages(caller, id, { limit, offset });
+      return {
+        conversation: toPublicConversationView(conversation),
+        messages: messagesResult.messages.map(toPublicMessageView),
+        totalMessages: messagesResult.total
+      };
+    }
+    if (sub === 'send') {
+      const id = requireArg(positionals[2], 'conversationId');
+      const messageContent = requireArg(positionals.slice(3).join(' ').trim() || undefined, 'message content');
+      const clientId = getStringFlag(flags, 'client-id');
+      const result = await runtime.sendConversationMessage(caller, id, {
+        content: messageContent,
+        clientMessageId: clientId
+      });
+      return {
+        conversation: toPublicConversationView(result.conversation),
+        userMessage: toPublicMessageView(result.userMessage),
+        ...(result.assistantMessage ? { assistantMessage: toPublicMessageView(result.assistantMessage) } : {}),
+        ...(result.usage ? { usage: result.usage } : {})
+      };
+    }
+    if (sub === 'update') {
+      const id = requireArg(positionals[2], 'conversationId');
+      const title = getStringFlag(flags, 'title');
+      const agentId = getStringFlag(flags, 'agent');
+      const conversation = runtime.updateConversation(caller, id, {
+        title,
+        ...(flags.has('agent') ? { agentId: agentId ?? null } : {})
+      });
+      return { conversation: toPublicConversationView(conversation) };
+    }
+    if (sub === 'archive') {
+      const id = requireArg(positionals[2], 'conversationId');
+      const conversation = runtime.archiveConversation(caller, id);
+      return { conversation: toPublicConversationView(conversation) };
+    }
+    if (sub === 'delete') {
+      const id = requireArg(positionals[2], 'conversationId');
+      const hard = flags.get('hard') === true;
+      if (hard) {
+        const deleted = runtime.deleteConversation(caller, id);
+        return { deleted };
+      }
+      const conversation = runtime.archiveConversation(caller, id);
+      return { conversation: toPublicConversationView(conversation) };
+    }
+    if (sub === 'messages') {
+      const id = requireArg(positionals[2], 'conversationId');
+      const limit = getIntFlag(flags, 'limit');
+      const offset = getIntFlag(flags, 'offset');
+      const order = (getStringFlag(flags, 'order')?.toUpperCase() as 'ASC' | 'DESC') || 'ASC';
+      const result = runtime.getConversationMessages(caller, id, { limit, offset, order });
+      return {
+        messages: result.messages.map(toPublicMessageView),
+        total: result.total
+      };
+    }
+    throw new ValidationError(`Unknown conversation subcommand '${sub}'.`);
+  }
+
   throw new ValidationError(`Unknown command '${cmd}'. Run 'dots --help' for usage.`);
 }
 
@@ -723,6 +828,87 @@ async function executeRemoteCommand(
       return await callHttpApi(serverUrl, 'POST', `/api/schedules/${encodeURIComponent(id)}/cancel`, token, scopeSpec, {});
     }
     throw new ValidationError(`Unknown schedule subcommand '${sub}'.`);
+  }
+
+  if (cmd === 'conversation') {
+    const sub = requireArg(positionals[1], 'conversation subcommand');
+    if (sub === 'create') {
+      const title = getStringFlag(flags, 'title');
+      const agentId = getStringFlag(flags, 'agent');
+      return await callHttpApi(serverUrl, 'POST', '/api/conversations', token, scopeSpec, {
+        title,
+        agentId
+      });
+    }
+    if (sub === 'list') {
+      const qs = new URLSearchParams();
+      const status = getStringFlag(flags, 'status');
+      const agentId = getStringFlag(flags, 'agent');
+      const limit = getIntFlag(flags, 'limit');
+      const offset = getIntFlag(flags, 'offset');
+      if (status) qs.set('status', status);
+      if (agentId) qs.set('agentId', agentId);
+      if (limit !== undefined) qs.set('limit', String(limit));
+      if (offset !== undefined) qs.set('offset', String(offset));
+      const suffix = qs.toString() ? `?${qs.toString()}` : '';
+      return await callHttpApi(serverUrl, 'GET', `/api/conversations${suffix}`, token, scopeSpec);
+    }
+    if (sub === 'get') {
+      const id = requireArg(positionals[2], 'conversationId');
+      const qs = new URLSearchParams();
+      const limit = getIntFlag(flags, 'limit');
+      const offset = getIntFlag(flags, 'offset');
+      if (limit !== undefined) qs.set('limit', String(limit));
+      if (offset !== undefined) qs.set('offset', String(offset));
+      const suffix = qs.toString() ? `?${qs.toString()}` : '';
+      return await callHttpApi(serverUrl, 'GET', `/api/conversations/${encodeURIComponent(id)}${suffix}`, token, scopeSpec);
+    }
+    if (sub === 'send') {
+      const id = requireArg(positionals[2], 'conversationId');
+      const content = requireArg(positionals.slice(3).join(' ').trim() || undefined, 'message content');
+      const clientId = getStringFlag(flags, 'client-id');
+      return await callHttpApi(serverUrl, 'POST', `/api/conversations/${encodeURIComponent(id)}/messages`, token, scopeSpec, {
+        content,
+        clientMessageId: clientId
+      });
+    }
+    if (sub === 'update') {
+      const id = requireArg(positionals[2], 'conversationId');
+      const title = getStringFlag(flags, 'title');
+      const agentId = getStringFlag(flags, 'agent');
+      return await callHttpApi(serverUrl, 'PATCH', `/api/conversations/${encodeURIComponent(id)}`, token, scopeSpec, {
+        ...(title !== undefined ? { title } : {}),
+        ...(flags.has('agent') ? { agentId: agentId ?? null } : {})
+      });
+    }
+    if (sub === 'archive') {
+      const id = requireArg(positionals[2], 'conversationId');
+      return await callHttpApi(serverUrl, 'POST', `/api/conversations/${encodeURIComponent(id)}/archive`, token, scopeSpec);
+    }
+    if (sub === 'delete') {
+      const id = requireArg(positionals[2], 'conversationId');
+      const hard = flags.get('hard') === true;
+      return await callHttpApi(
+        serverUrl,
+        'DELETE',
+        `/api/conversations/${encodeURIComponent(id)}${hard ? '?hard=true' : ''}`,
+        token,
+        scopeSpec
+      );
+    }
+    if (sub === 'messages') {
+      const id = requireArg(positionals[2], 'conversationId');
+      const qs = new URLSearchParams();
+      const limit = getIntFlag(flags, 'limit');
+      const offset = getIntFlag(flags, 'offset');
+      const order = getStringFlag(flags, 'order');
+      if (limit !== undefined) qs.set('limit', String(limit));
+      if (offset !== undefined) qs.set('offset', String(offset));
+      if (order) qs.set('order', order);
+      const suffix = qs.toString() ? `?${qs.toString()}` : '';
+      return await callHttpApi(serverUrl, 'GET', `/api/conversations/${encodeURIComponent(id)}/messages${suffix}`, token, scopeSpec);
+    }
+    throw new ValidationError(`Unknown conversation subcommand '${sub}'.`);
   }
 
   throw new ValidationError(`Unknown command '${cmd}'. Run 'dots --help' for usage.`);
