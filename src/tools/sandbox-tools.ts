@@ -9,9 +9,11 @@
 import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, mkdirSync, lstatSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
-import type { RegisteredTool } from './types.ts';
+import { exec } from 'node:child_process';
+import type { RegisteredTool, ToolExecutionResult } from './types.ts';
 import { ToolExecutionError, SecurityViolationError } from '../domain/errors.ts';
 import { PathValidator } from '../security/path-validator.ts';
+import { defaultSecretScrubber } from '../model/secret-scrubber.ts';
 
 
 /**
@@ -371,6 +373,106 @@ export const textTransformTool: RegisteredTool = {
   }
 };
 
+const DANGEROUS_COMMAND_PATTERNS: readonly RegExp[] = [
+  /^\s*(?:sudo|su)\b/i,
+  /\brm\s+-(?:r|f|rf|fr)\s+\//i,
+  /\b:(){ :\|:& };:/,
+  /\bmkfs\b/i,
+  /\bdd\s+if=/i
+];
+
+/**
+ * Tier 3: Controlled development command execution tool
+ */
+export const commandRunTool: RegisteredTool = {
+  definition: {
+    name: 'command_run',
+    description: 'Executes approved development commands (testing, type checking, syntax checking) inside the workspace sandbox.',
+    parameters: {
+      command: {
+        type: 'string',
+        description: 'Command to execute inside the workspace (e.g. "npm test", "npx tsc --noEmit")'
+      },
+      timeoutMs: {
+        type: 'number',
+        description: 'Timeout in milliseconds (defaults to 15000)'
+      }
+    },
+    required: ['command']
+  },
+  riskTier: 'TIER_3',
+  handler: async (args, context) => {
+    const start = Date.now();
+    const rawCommand = String(args.command || '').trim();
+
+    if (!rawCommand) {
+      throw new ToolExecutionError('command_run', 'Command must be a non-empty string.');
+    }
+
+    for (const pattern of DANGEROUS_COMMAND_PATTERNS) {
+      if (pattern.test(rawCommand)) {
+        throw new SecurityViolationError(
+          `Security Violation: Command contains dangerous or privilege-escalating pattern: '${rawCommand}'`,
+          'DANGEROUS_COMMAND_FORBIDDEN'
+        );
+      }
+    }
+
+    const cwd = context?.workspaceRoot || process.cwd();
+    const timeoutMs =
+      typeof args.timeoutMs === 'number' && args.timeoutMs > 0
+        ? Math.min(args.timeoutMs, 60000)
+        : 15000;
+
+    return new Promise<ToolExecutionResult>((resolve, reject) => {
+      exec(
+        rawCommand,
+        {
+          cwd,
+          timeout: timeoutMs,
+          maxBuffer: 1024 * 1024
+        },
+        (error, stdout, stderr) => {
+          const durationMs = Date.now() - start;
+          const scrubbedStdout = defaultSecretScrubber.scrub(stdout ? stdout.toString() : '');
+          const scrubbedStderr = defaultSecretScrubber.scrub(stderr ? stderr.toString() : '');
+          const exitCode = error ? (typeof error.code === 'number' ? error.code : 1) : 0;
+
+          if (error && error.killed) {
+            reject(
+              new ToolExecutionError(
+                'command_run',
+                `Command timed out after ${timeoutMs}ms: '${rawCommand}'`
+              )
+            );
+            return;
+          }
+
+          resolve({
+            output: {
+              command: rawCommand,
+              stdout: scrubbedStdout,
+              stderr: scrubbedStderr,
+              exitCode,
+              passed: exitCode === 0
+            },
+            exitCode,
+            durationMs
+          });
+        }
+      );
+    });
+  }
+};
+
+export const runCommandTool: RegisteredTool = {
+  ...commandRunTool,
+  definition: {
+    ...commandRunTool.definition,
+    name: 'run_command'
+  }
+};
+
 import { webSearchTool, webFetchTool } from './web-tools.ts';
 
 /**
@@ -384,6 +486,8 @@ export const standardTools: readonly RegisteredTool[] = [
   fileWriteTool,
   hashFileTool,
   webSearchTool,
-  webFetchTool
+  webFetchTool,
+  commandRunTool,
+  runCommandTool
 ];
 

@@ -73,10 +73,79 @@ dots-platform/
   - Supports `ONE_TIME` and recurring `INTERVAL` schedules, pause/resume/cancel, database-enforced duplicate prevention (`UNIQUE(schedule_id, occurrence_key)`, `task_id UNIQUE`, partial unique active-occurrence index), overlap prevention, missed-run policies (`SKIP`, `RUN_ONCE`), bounded consecutive failures with auto-pause, human approval non-bypass, and crash recovery across all 5 interruption points (concurrency = 1).
 - **Phase 8C (Operational Readiness)**:
   - `DotsRuntime` composition root (`src/runtime/app.ts`), environment configuration (`src/runtime/config.ts`) with safe localhost defaults (`127.0.0.1:3847`), persisted local host secret (`.dots-host-secret` mode `0600`), structured secret-scrubbed JSON logging (`OperationalLogger`), and graceful startup/shutdown.
+- **Phase 3 (Specialized Autonomous Agents)**:
+  - **Research Agent** (`research-agent`, `research`): Evidence-based research agent with web search provider abstraction, safe fetching, prompt injection defense, and cross-source synthesis.
+  - **Analytics Agent** (`analytics-agent`, `analytics`): Local-first deterministic data analytics agent supporting inline CSV/JSON ingestion, dataset profiling, descriptive statistics, categorical analysis, IQR outlier detection, Pearson correlation ($r$), and time-series trends.
+  - **Developer Agent** (`developer-agent`, `developer`): Secure local-first developer agent with 6 core operations (`EXPLAIN`, `ANALYZE`, `DEBUG`, `GENERATE`, `REVIEW`, `TEST_PLAN`), sandboxed workspace file inspection, controlled code generation, approval gates for file writes (Tier 2) and command runs (Tier 3), and strict verification honesty.
 
 ### Planned (Not Yet Implemented)
 - **Web Dashboard UI** (lightweight browser interface).
 - **Cron Expression Scheduling** (only `ONE_TIME` and `INTERVAL` schedules are implemented).
+
+---
+
+## 5. Developer Agent (Phase 3C)
+
+The **Developer Agent** is a secure, local-first coding assistant integrated into the platform's orchestration, security, and tool registry frameworks.
+
+### Capabilities & Canonical IDs
+- **Canonical IDs**: `developer-agent`, `developer`
+- **Capabilities**: `development`, `code-analysis`, `debugging`, `code-generation`, `general`, `conversation`
+
+### Supported Operations
+1. `EXPLAIN` — Structural explanation of source code architecture, logic flow, parameters, and error stack traces.
+2. `ANALYZE` — Static code analysis identifying security vulnerabilities (eval, injection, hardcoded secrets), code smells, and unhandled promises.
+3. `DEBUG` — Root-cause diagnosis of runtime errors and generation of targeted remediation patches.
+4. `GENERATE` — Code generation via configured model providers or fallback scaffolds adhering to constraints and language specifications.
+5. `REVIEW` — Multi-pillar code review (Correctness, Security, Maintainability) with actionable verdicts (`APPROVED`, `CHANGES_REQUESTED`, `NEEDS_DISCUSSION`).
+6. `TEST_PLAN` — Focused test matrix formulation (Happy path, Edge cases, Error handling, Boundary conditions) and optional sandboxed test execution.
+
+### Security Perimeter & Approval Gates
+- **Workspace Confinement**: All file inspections and modifications are strictly jailed within the authorized `workspaceRoot` via `PathValidator`. Path traversal attacks (`../../`) are blocked.
+- **Sensitive File Protection**: Strict refusal to inspect credential or environment files (`.env`, `id_rsa`, `*.pem`, `credentials.json`).
+- **Prompt Injection Defense**: Comments and strings in inspected source code are sanitized against prompt-injection overrides before evaluation.
+- **Human-in-the-Loop Approvals**: Modifying workspace files (Tier 2) and executing commands (Tier 3) pass through the `PolicyEngine` and `ApprovalBroker`. If approval is required and no valid token is provided, the agent records `AWAITING_APPROVAL` status and never mutates state.
+- **Verification Honesty**: The agent never claims code was executed or tested unless sandboxed commands actually ran and exited with code 0.
+
+### Example Usage
+
+#### CLI Task Submission
+```bash
+# Analyze a source file for security vulnerabilities
+node src/cli/main.ts --server http://127.0.0.1:3847 run "Analyze security of auth service" \
+  --agent developer-agent \
+  --param operation=ANALYZE \
+  --param files=src/auth.ts
+
+# Propose a test plan
+node src/cli/main.ts --server http://127.0.0.1:3847 run "Propose test plan for SessionManager" \
+  --agent developer \
+  --param operation=TEST_PLAN \
+  --param code="class SessionManager { create() { return 'id'; } }"
+```
+
+#### Example Report Output (Markdown)
+```markdown
+# Developer Report: Analyze auth service
+**Status**: `COMPLETED` | **Operation**: `ANALYZE` | **Files Inspected**: 1 | **Findings**: 2
+
+## Executive Summary
+Developer task processed under operation ANALYZE. Inspected 1 workspace file(s), identified 2 finding(s).
+
+## Code Analysis & Findings
+| ID | Severity | Category | Title | Line | Recommendation |
+|---|---|---|---|---|---|
+| `finding-1` | `CRITICAL` | `SECURITY` | Direct dynamic code execution (eval) | 14 | Replace eval() with safe parsing. |
+
+## Verification & Test Execution
+> [!IMPORTANT]
+> **Verification Honesty Guarantee**: Code is only certified as passed when verification commands actually ran with exit code 0.
+```
+
+### Current Limitations
+- Static analysis is rule-based and heuristic; it does not replace comprehensive automated test suites or formal verification.
+- The Developer Agent does not perform autonomous deployments, terminal shell bypasses, or production infrastructure modifications.
+- Without a configured model provider (`GeminiProvider`), code generation falls back to deterministic scaffolds.
 
 ---
 

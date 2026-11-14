@@ -111,6 +111,13 @@ graph TD
   - `Working Context Manager`: Compiles prompt windows containing task goal, current step, prior step outputs, and relevant constraints.
   - `Long-Term Memory`: Key-value and structured fact store that allows users to view, search, export, edit, or delete any persisted memory item.
 
+### 2.7 Specialized Autonomous Agents (IAgent Subsystem)
+- **Role**: Provides purpose-built autonomous agents adhering to the universal `IAgent` contract and registered in `AgentRegistry`.
+- **Components**:
+  - `Research Agent` (`research-agent`, `research`): Automated multi-source web inquiry, source attribution, and cross-source agreement/contradiction synthesis.
+  - `Analytics Agent` (`analytics-agent`, `analytics`): Deterministic data profiling, descriptive statistics, frequency distributions, IQR outlier detection, Pearson correlation ($r$), and temporal trend analysis.
+  - `Developer Agent` (`developer-agent`, `developer`): Autonomous coding assistant supporting 6 core operations (`EXPLAIN`, `ANALYZE`, `DEBUG`, `GENERATE`, `REVIEW`, `TEST_PLAN`), sandboxed workspace file inspection, controlled code modification, Tier 3 command execution gates, and strict verification honesty.
+
 ---
 
 ## 3. Finite State Machine (FSM) Specification

@@ -9,3 +9,4 @@ export * from './base-agent.ts';
 export * from './registry.ts';
 export * from './research-agent.ts';
 export * from './analytics-agent.ts';
+export * from './developer-agent.ts';
