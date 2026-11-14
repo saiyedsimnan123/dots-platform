@@ -73,7 +73,7 @@ import { TokenIdentityProvider } from '../security/token-identity-provider.ts';
 import { VerificationEngine } from '../verification/verifier.ts';
 import { MemoryService } from '../memory/memory-service.ts';
 import { TaskCoordinator } from '../orchestrator/coordinator.ts';
-import { AgentRegistry } from '../agents/index.ts';
+import { AgentRegistry, ResearchAgent, type AgentMetadata } from '../agents/index.ts';
 import { TaskScheduler } from '../scheduler/task-scheduler.ts';
 import { RuntimeEventBus } from './event-bus.ts';
 import { OperationalLogger } from './logger.ts';
@@ -276,7 +276,8 @@ export class DotsRuntime {
 
     this.policyEngine = new PolicyEngine({
       workspaceRoot: this.config.workspaceRoot,
-      autoApproveTier2: this.config.autoApproveTier2
+      autoApproveTier2: this.config.autoApproveTier2,
+      autoApproveTier3: this.config.autoApproveTier3
     });
     this.approvalBroker = new ApprovalBroker(this.taskRepo, this.auditRepo);
     this.verifier = new VerificationEngine();
@@ -295,6 +296,12 @@ export class DotsRuntime {
         : new MockModelProvider());
 
     this.agentRegistry = options.agentRegistry ?? new AgentRegistry();
+    if (!this.agentRegistry.has('research-agent')) {
+      this.agentRegistry.register(new ResearchAgent({ id: 'research-agent' }));
+    }
+    if (!this.agentRegistry.has('research')) {
+      this.agentRegistry.register(new ResearchAgent({ id: 'research' }));
+    }
 
     this.coordinator = new TaskCoordinator({
       taskRepo: this.taskRepo,
@@ -426,6 +433,12 @@ export class DotsRuntime {
 
   public listTools(): readonly RegisteredTool[] {
     return this.toolRegistry.listRegistered();
+  }
+
+  // --- Agents ---
+
+  public listAgents(): readonly AgentMetadata[] {
+    return this.agentRegistry.listDefinitions();
   }
 
   // --- Tasks ---

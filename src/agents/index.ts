@@ -7,3 +7,4 @@ export type * from './types.ts';
 export * from './context.ts';
 export * from './base-agent.ts';
 export * from './registry.ts';
+export * from './research-agent.ts';

@@ -35,6 +35,7 @@ export interface DotsRuntimeConfig {
   readonly schedulerPollIntervalMs: number;
   readonly maxTaskBudgetUsd: number;
   readonly autoApproveTier2: boolean;
+  readonly autoApproveTier3: boolean;
   readonly enableDynamicReplan: boolean;
   readonly enableCompensation: boolean;
   readonly enableScheduler: boolean;
@@ -59,6 +60,7 @@ export interface LoadRuntimeConfigOverrides {
   readonly schedulerPollIntervalMs?: number;
   readonly maxTaskBudgetUsd?: number;
   readonly autoApproveTier2?: boolean;
+  readonly autoApproveTier3?: boolean;
   readonly enableDynamicReplan?: boolean;
   readonly enableCompensation?: boolean;
   readonly enableScheduler?: boolean;
@@ -271,6 +273,7 @@ export function loadRuntimeConfig(overrides: LoadRuntimeConfigOverrides = {}): D
     maxTaskBudgetUsd:
       overrides.maxTaskBudgetUsd ?? parsePositiveFloat(env.DOTS_MAX_TASK_BUDGET_USD, 0.5, 'DOTS_MAX_TASK_BUDGET_USD'),
     autoApproveTier2: overrides.autoApproveTier2 ?? parseBoolean(env.DOTS_AUTO_APPROVE_TIER2, true),
+    autoApproveTier3: overrides.autoApproveTier3 ?? parseBoolean(env.DOTS_AUTO_APPROVE_TIER3, false),
     enableDynamicReplan: overrides.enableDynamicReplan ?? parseBoolean(env.DOTS_ENABLE_DYNAMIC_REPLAN, false),
     enableCompensation: overrides.enableCompensation ?? parseBoolean(env.DOTS_ENABLE_COMPENSATION, true),
     enableScheduler: overrides.enableScheduler ?? parseBoolean(env.DOTS_ENABLE_SCHEDULER, true),

@@ -26,15 +26,18 @@ export interface PolicyEvaluationResult {
 export interface PolicyEngineOptions {
   readonly workspaceRoot: string;
   readonly autoApproveTier2?: boolean;
+  readonly autoApproveTier3?: boolean;
 }
 
 export class PolicyEngine {
   public readonly workspaceRoot: string;
   private readonly autoApproveTier2: boolean;
+  private readonly autoApproveTier3: boolean;
 
   constructor(options: PolicyEngineOptions) {
     this.workspaceRoot = resolve(options.workspaceRoot);
     this.autoApproveTier2 = options.autoApproveTier2 ?? true;
+    this.autoApproveTier3 = options.autoApproveTier3 ?? false;
   }
 
   /**
@@ -85,6 +88,15 @@ export class PolicyEngine {
         };
 
       case 'TIER_3': // Consequential (network, external scripts)
+        if (this.autoApproveTier3) {
+          return {
+            decision: 'ALLOWED',
+            riskTier,
+            reason: `Auto-approved consequential operation (${toolName})`,
+            sanitizedArguments: sanitizedArgs,
+            approvalRequired: false
+          };
+        }
         return {
           decision: 'REQUIRES_APPROVAL',
           riskTier,

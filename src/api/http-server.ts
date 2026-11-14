@@ -445,6 +445,13 @@ export class DotsHttpServer {
       return;
     }
 
+    // --- Agents ---
+    if (method === 'GET' && pathname === '/api/agents') {
+      const agents = this.runtime.listAgents();
+      this.sendJson(res, 200, { agents, count: agents.length });
+      return;
+    }
+
     // --- Approvals ---
     if (method === 'GET' && pathname === '/api/approvals') {
       const decision = (url.searchParams.get('decision')?.trim() || undefined) as ApprovalDecision | undefined;

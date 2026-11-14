@@ -164,6 +164,7 @@ function renderHelp(): string {
     '  task run <id>',
     '  task cancel <id> [--reason <text>]',
     '  tools list',
+    '  agents list',
     '  approvals [--decision <PENDING|APPROVED|REJECTED|EXPIRED>] [--limit <n>]',
     '  approve <approvalId> [--reject] [--no-resume]',
     '  memory list [--category <cat>] [--status <status>] [--limit <n>]',
@@ -444,6 +445,15 @@ async function executeLocalCommand(
       return { tools, count: tools.length };
     }
     throw new ValidationError(`Unknown tool subcommand '${sub}'.`);
+  }
+
+  if (cmd === 'agents' || cmd === 'agent') {
+    const sub = positionals[1] ?? 'list';
+    if (sub === 'list') {
+      const agents = runtime.listAgents();
+      return { agents, count: agents.length };
+    }
+    throw new ValidationError(`Unknown agent subcommand '${sub}'.`);
   }
 
   if (cmd === 'status') {
@@ -803,6 +813,14 @@ async function executeRemoteCommand(
       return await callHttpApi(serverUrl, 'GET', '/api/tools', token, scopeSpec);
     }
     throw new ValidationError(`Unknown tool subcommand '${sub}'.`);
+  }
+
+  if (cmd === 'agents' || cmd === 'agent') {
+    const sub = positionals[1] ?? 'list';
+    if (sub === 'list') {
+      return await callHttpApi(serverUrl, 'GET', '/api/agents', token, scopeSpec);
+    }
+    throw new ValidationError(`Unknown agent subcommand '${sub}'.`);
   }
 
   if (cmd === 'status') {
