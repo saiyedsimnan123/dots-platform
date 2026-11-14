@@ -17,6 +17,7 @@ import type { LogLevel } from './logger.ts';
 import { ValidationError } from '../domain/errors.ts';
 
 export type ConfiguredProviderMode = 'mock' | 'gemini';
+export type ConfiguredWebSearchProviderMode = 'duckduckgo' | 'searxng' | 'mock' | 'none';
 
 export interface DotsRuntimeConfig {
   readonly dbPath: string;
@@ -38,6 +39,8 @@ export interface DotsRuntimeConfig {
   readonly enableCompensation: boolean;
   readonly enableScheduler: boolean;
   readonly maxConversationHistory: number;
+  readonly webSearchProvider: ConfiguredWebSearchProviderMode;
+  readonly searxngUrl?: string;
 }
 
 export interface LoadRuntimeConfigOverrides {
@@ -60,6 +63,8 @@ export interface LoadRuntimeConfigOverrides {
   readonly enableCompensation?: boolean;
   readonly enableScheduler?: boolean;
   readonly maxConversationHistory?: number;
+  readonly webSearchProvider?: ConfiguredWebSearchProviderMode;
+  readonly searxngUrl?: string;
   readonly requireTokens?: boolean;
   readonly env?: Record<string, string | undefined>;
 }
@@ -230,6 +235,24 @@ export function loadRuntimeConfig(overrides: LoadRuntimeConfigOverrides = {}): D
 
   const hostSecret = resolveOrCreateHostSecret(dbPath, overrides.hostSecret ?? env.DOTS_HOST_SECRET);
 
+  const webSearchProviderRaw = (
+    overrides.webSearchProvider ??
+    env.DOTS_WEB_SEARCH_PROVIDER?.trim() ??
+    (env.DOTS_SEARXNG_URL ? 'searxng' : 'none')
+  ).toLowerCase();
+
+  const VALID_WEB_SEARCH_PROVIDERS: ReadonlySet<string> = new Set(['duckduckgo', 'searxng', 'mock', 'none']);
+  if (!VALID_WEB_SEARCH_PROVIDERS.has(webSearchProviderRaw)) {
+    throw new ValidationError(
+      `Invalid web search provider '${webSearchProviderRaw}'. Must be 'duckduckgo', 'searxng', 'mock', or 'none'.`
+    );
+  }
+
+  const searxngUrl = overrides.searxngUrl ?? (env.DOTS_SEARXNG_URL?.trim() || undefined);
+  if (webSearchProviderRaw === 'searxng' && (!searxngUrl || searxngUrl.trim() === '')) {
+    throw new ValidationError("Web search provider 'searxng' selected but DOTS_SEARXNG_URL is not configured.");
+  }
+
   return {
     dbPath,
     workspaceRoot,
@@ -253,6 +276,8 @@ export function loadRuntimeConfig(overrides: LoadRuntimeConfigOverrides = {}): D
     enableScheduler: overrides.enableScheduler ?? parseBoolean(env.DOTS_ENABLE_SCHEDULER, true),
     maxConversationHistory:
       overrides.maxConversationHistory ??
-      parsePositiveInt(env.DOTS_MAX_CONVERSATION_HISTORY, 50, 'DOTS_MAX_CONVERSATION_HISTORY')
+      parsePositiveInt(env.DOTS_MAX_CONVERSATION_HISTORY, 50, 'DOTS_MAX_CONVERSATION_HISTORY'),
+    webSearchProvider: webSearchProviderRaw as ConfiguredWebSearchProviderMode,
+    searxngUrl
   };
 }

@@ -59,6 +59,12 @@ import { TokenBudgetTracker, type TaskUsageSummary } from '../model/budget-track
 import { defaultSecretScrubber } from '../model/secret-scrubber.ts';
 import { ToolRegistry } from '../tools/registry.ts';
 import { standardTools } from '../tools/sandbox-tools.ts';
+import type { RegisteredTool } from '../tools/types.ts';
+import {
+  createConfiguredWebSearchProvider,
+  setWebSearchProvider,
+  type IWebSearchProvider
+} from '../tools/web-tools.ts';
 import { PolicyEngine } from '../security/policy-engine.ts';
 import { ApprovalBroker } from '../security/approval-broker.ts';
 import { HostMemoryAuthority } from '../security/host-authority.ts';
@@ -73,6 +79,7 @@ import { RuntimeEventBus } from './event-bus.ts';
 import { OperationalLogger } from './logger.ts';
 import {
   loadRuntimeConfig,
+  type ConfiguredWebSearchProviderMode,
   type DotsRuntimeConfig,
   type LoadRuntimeConfigOverrides
 } from './config.ts';
@@ -141,8 +148,9 @@ export function toPublicMessageView(m: ConversationMessage): PublicMessageView {
   };
 }
 
-export interface DotsRuntimeOptions extends LoadRuntimeConfigOverrides {
+export interface DotsRuntimeOptions extends Omit<LoadRuntimeConfigOverrides, 'webSearchProvider'> {
   readonly modelProvider?: IModelProvider;
+  readonly webSearchProvider?: IWebSearchProvider | ConfiguredWebSearchProviderMode;
   readonly logger?: OperationalLogger;
   readonly eventBus?: RuntimeEventBus;
   readonly agentRegistry?: AgentRegistry;
@@ -214,6 +222,7 @@ export class DotsRuntime {
   public readonly conversationRepo: ConversationRepository;
   public readonly conversationService: ConversationService;
   public readonly taskWorkflow: TaskWorkflowService;
+  public readonly webSearchProvider: IWebSearchProvider | null;
 
   private readonly hostAuthority: HostMemoryAuthority;
   private readonly startedAtMs: number = Date.now();
@@ -221,7 +230,15 @@ export class DotsRuntime {
   private stopped: boolean = false;
 
   constructor(options: DotsRuntimeOptions = {}) {
-    this.config = loadRuntimeConfig(options);
+    const { webSearchProvider: searchOverride, ...configOverrides } = options;
+    const searchMode =
+      typeof searchOverride === 'string'
+        ? (searchOverride as ConfiguredWebSearchProviderMode)
+        : undefined;
+    this.config = loadRuntimeConfig({
+      ...configOverrides,
+      ...(searchMode ? { webSearchProvider: searchMode } : {})
+    });
     this.logger =
       options.logger ??
       new OperationalLogger({
@@ -331,6 +348,14 @@ export class DotsRuntime {
       eventBus: this.eventBus,
       budgetTracker: this.budgetTracker
     });
+
+    this.webSearchProvider =
+      typeof searchOverride === 'object' && searchOverride !== null
+        ? searchOverride
+        : createConfiguredWebSearchProvider(this.config.webSearchProvider, {
+            searxngUrl: this.config.searxngUrl
+          });
+    setWebSearchProvider(this.webSearchProvider);
   }
 
   // --- Lifecycle ---
@@ -395,6 +420,12 @@ export class DotsRuntime {
       throw new SecurityViolationError('Invalid or unverified authentication credentials.', 'UNAUTHENTICATED');
     }
     return { caller, principal };
+  }
+
+  // --- Tools ---
+
+  public listTools(): readonly RegisteredTool[] {
+    return this.toolRegistry.listRegistered();
   }
 
   // --- Tasks ---

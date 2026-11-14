@@ -86,7 +86,10 @@ const SUPPORTED_CONTENT_TYPES: readonly string[] = [
   'application/json',
   'application/xml',
   'text/xml',
-  'application/xhtml+xml'
+  'application/xhtml+xml',
+  'application/x-javascript',
+  'application/javascript',
+  'text/javascript'
 ];
 
 const BLOCKED_BINARY_MIME_PREFIXES: readonly string[] = [
@@ -145,6 +148,29 @@ export function isPrivateOrReservedIp(ip: string): boolean {
     const rest = cleanIp.slice(2);
     if (isIPv4(rest)) {
       cleanIp = rest;
+    }
+  }
+
+  // Normalize NAT64 IPv4-embedded IPv6 (64:ff9b::/96 or 64:ff9b:1::/48, RFC 6052 / RFC 8215)
+  if (cleanIp.startsWith('64:ff9b::') || cleanIp.startsWith('64:ff9b:1::')) {
+    const prefix = cleanIp.startsWith('64:ff9b:1::') ? '64:ff9b:1::' : '64:ff9b::';
+    const rest = cleanIp.slice(prefix.length);
+    if (isIPv4(rest)) {
+      cleanIp = rest;
+    } else {
+      const parts = rest.split(':');
+      if (parts.length === 2) {
+        const p1 = parseInt(parts[0]!, 16);
+        const p2 = parseInt(parts[1]!, 16);
+        if (Number.isFinite(p1) && Number.isFinite(p2)) {
+          cleanIp = [
+            (p1 >> 8) & 0xff,
+            p1 & 0xff,
+            (p2 >> 8) & 0xff,
+            p2 & 0xff
+          ].join('.');
+        }
+      }
     }
   }
 
@@ -219,6 +245,7 @@ export function isLoopbackIp(ip: string): boolean {
   if (cleanIp === '127.0.0.1' || cleanIp === '::1' || cleanIp === 'localhost') return true;
   if (isIPv4(cleanIp) && cleanIp.startsWith('127.')) return true;
   if (cleanIp === '::ffff:127.0.0.1' || cleanIp === '::ffff:7f00:1') return true;
+  if (cleanIp === '64:ff9b::127.0.0.1' || cleanIp === '64:ff9b::7f00:1') return true;
   return false;
 }
 
@@ -411,6 +438,246 @@ export class MockWebSearchProvider implements IWebSearchProvider {
   }
 }
 
+export interface DuckDuckGoSearchProviderOptions {
+  readonly timeoutMs?: number;
+  readonly maxBytes?: number;
+  readonly fetchFn?: typeof safeFetch;
+}
+
+/**
+ * Free, zero-API-key live web search provider powered by DuckDuckGo's Instant Answer & Topics API.
+ */
+export class DuckDuckGoSearchProvider implements IWebSearchProvider {
+  public readonly name: string = 'duckduckgo';
+  private readonly timeoutMs: number;
+  private readonly maxBytes: number;
+  private readonly fetchFn: typeof safeFetch;
+
+  constructor(options: DuckDuckGoSearchProviderOptions = {}) {
+    this.timeoutMs = options.timeoutMs ?? 10_000;
+    this.maxBytes = options.maxBytes ?? 2 * 1024 * 1024;
+    this.fetchFn = options.fetchFn ?? safeFetch;
+  }
+
+  public async search(query: string, limit: number = DEFAULT_SEARCH_LIMIT): Promise<WebSearchResponse> {
+    const effectiveLimit = Math.max(1, Math.min(limit, MAX_SEARCH_LIMIT));
+    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+
+    let fetchResult: SafeFetchResult;
+    try {
+      fetchResult = await this.fetchFn(url, {
+        extractText: false,
+        timeoutMs: this.timeoutMs,
+        maxBytes: this.maxBytes
+      });
+    } catch (err) {
+      throw new ToolExecutionError(
+        WEB_SEARCH_TOOL_NAME,
+        `DuckDuckGo search request failed: ${defaultSecretScrubber.scrub(err instanceof Error ? err.message : String(err))}`
+      );
+    }
+
+    let parsedData: any;
+    try {
+      parsedData = JSON.parse(fetchResult.content);
+    } catch {
+      throw new ToolExecutionError(
+        WEB_SEARCH_TOOL_NAME,
+        'DuckDuckGo search provider returned invalid JSON response.'
+      );
+    }
+
+    const results: WebSearchResult[] = [];
+    const seenUrls = new Set<string>();
+
+    const addResult = (title: string, rawUrl: string, snippet: string) => {
+      if (!rawUrl || typeof rawUrl !== 'string') return;
+      try {
+        const u = new URL(rawUrl);
+        if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
+        const normalizedUrl = u.toString();
+        if (seenUrls.has(normalizedUrl)) return;
+        seenUrls.add(normalizedUrl);
+
+        results.push({
+          title: defaultSecretScrubber.scrub(title.trim() || u.hostname),
+          url: defaultSecretScrubber.scrub(normalizedUrl),
+          snippet: defaultSecretScrubber.scrub(snippet.trim() || title.trim()),
+          domain: defaultSecretScrubber.scrub(u.hostname)
+        });
+      } catch {
+        // Skip malformed URLs
+      }
+    };
+
+    // 1. Direct Abstract / Topic Answer
+    if (parsedData.AbstractURL && parsedData.Abstract) {
+      addResult(
+        parsedData.Heading || query,
+        parsedData.AbstractURL,
+        parsedData.Abstract
+      );
+    }
+
+    // 2. Results array (e.g. Official Site)
+    if (Array.isArray(parsedData.Results)) {
+      for (const r of parsedData.Results) {
+        if (r && typeof r === 'object') {
+          addResult(r.Text || '', r.FirstURL || '', r.Text || '');
+        }
+      }
+    }
+
+    // 3. RelatedTopics array (flat or grouped in Topics)
+    const processTopic = (t: any) => {
+      if (!t || typeof t !== 'object') return;
+      if (t.FirstURL && t.Text) {
+        const text = String(t.Text);
+        const title = text.split(' - ')[0] || text;
+        addResult(title, t.FirstURL, text);
+      } else if (Array.isArray(t.Topics)) {
+        for (const sub of t.Topics) {
+          processTopic(sub);
+        }
+      }
+    };
+
+    if (Array.isArray(parsedData.RelatedTopics)) {
+      for (const topic of parsedData.RelatedTopics) {
+        if (results.length >= effectiveLimit) break;
+        processTopic(topic);
+      }
+    }
+
+    const finalResults = results.slice(0, effectiveLimit);
+    return {
+      query: defaultSecretScrubber.scrub(query),
+      provider: this.name,
+      count: finalResults.length,
+      results: finalResults
+    };
+  }
+}
+
+export interface SearxngSearchProviderOptions {
+  readonly baseUrl: string;
+  readonly timeoutMs?: number;
+  readonly maxBytes?: number;
+  readonly fetchFn?: typeof safeFetch;
+}
+
+/**
+ * Self-hostable, open-source metasearch provider using SearXNG's JSON API.
+ */
+export class SearxngSearchProvider implements IWebSearchProvider {
+  public readonly name: string = 'searxng';
+  private readonly baseUrl: string;
+  private readonly timeoutMs: number;
+  private readonly maxBytes: number;
+  private readonly fetchFn: typeof safeFetch;
+
+  constructor(options: SearxngSearchProviderOptions) {
+    if (!options || typeof options !== 'object' || !options.baseUrl) {
+      throw new ValidationError('SearxngSearchProvider requires a valid baseUrl.');
+    }
+    this.baseUrl = options.baseUrl.replace(/\/+$/, '');
+    this.timeoutMs = options.timeoutMs ?? 10_000;
+    this.maxBytes = options.maxBytes ?? 2 * 1024 * 1024;
+    this.fetchFn = options.fetchFn ?? safeFetch;
+  }
+
+  public async search(query: string, limit: number = DEFAULT_SEARCH_LIMIT): Promise<WebSearchResponse> {
+    const effectiveLimit = Math.max(1, Math.min(limit, MAX_SEARCH_LIMIT));
+    const url = `${this.baseUrl}/search?q=${encodeURIComponent(query)}&format=json`;
+
+    let fetchResult: SafeFetchResult;
+    try {
+      fetchResult = await this.fetchFn(url, {
+        extractText: false,
+        timeoutMs: this.timeoutMs,
+        maxBytes: this.maxBytes
+      });
+    } catch (err) {
+      throw new ToolExecutionError(
+        WEB_SEARCH_TOOL_NAME,
+        `SearXNG search request failed: ${defaultSecretScrubber.scrub(err instanceof Error ? err.message : String(err))}`
+      );
+    }
+
+    let parsedData: any;
+    try {
+      parsedData = JSON.parse(fetchResult.content);
+    } catch {
+      throw new ToolExecutionError(
+        WEB_SEARCH_TOOL_NAME,
+        'SearXNG search provider returned invalid JSON response.'
+      );
+    }
+
+    if (!parsedData || typeof parsedData !== 'object' || !Array.isArray(parsedData.results)) {
+      throw new ToolExecutionError(
+        WEB_SEARCH_TOOL_NAME,
+        'SearXNG search provider response is missing expected results array.'
+      );
+    }
+
+    const results: WebSearchResult[] = [];
+    const seenUrls = new Set<string>();
+
+    for (const item of parsedData.results) {
+      if (results.length >= effectiveLimit) break;
+      if (!item || typeof item !== 'object' || !item.url) continue;
+
+      try {
+        const u = new URL(item.url);
+        if (u.protocol !== 'http:' && u.protocol !== 'https:') continue;
+        const normalizedUrl = u.toString();
+        if (seenUrls.has(normalizedUrl)) continue;
+        seenUrls.add(normalizedUrl);
+
+        results.push({
+          title: defaultSecretScrubber.scrub(item.title || u.hostname),
+          url: defaultSecretScrubber.scrub(normalizedUrl),
+          snippet: defaultSecretScrubber.scrub(item.content || item.title || ''),
+          domain: defaultSecretScrubber.scrub(u.hostname)
+        });
+      } catch {
+        // Skip malformed
+      }
+    }
+
+    return {
+      query: defaultSecretScrubber.scrub(query),
+      provider: this.name,
+      count: results.length,
+      results
+    };
+  }
+}
+
+export function createConfiguredWebSearchProvider(
+  providerName?: string,
+  options: { readonly searxngUrl?: string; readonly fetchFn?: typeof safeFetch } = {}
+): IWebSearchProvider | null {
+  if (!providerName || providerName === 'none') {
+    return null;
+  }
+  const norm = providerName.trim().toLowerCase();
+  if (norm === 'duckduckgo') {
+    return new DuckDuckGoSearchProvider({ fetchFn: options.fetchFn });
+  }
+  if (norm === 'searxng') {
+    if (!options.searxngUrl || options.searxngUrl.trim() === '') {
+      throw new ValidationError("SearXNG search provider requires 'searxngUrl' or DOTS_SEARXNG_URL to be configured.");
+    }
+    return new SearxngSearchProvider({ baseUrl: options.searxngUrl, fetchFn: options.fetchFn });
+  }
+  if (norm === 'mock') {
+    return new MockWebSearchProvider();
+  }
+  throw new ValidationError(`Unknown web search provider: '${providerName}'. Supported providers: 'duckduckgo', 'searxng', 'mock', 'none'.`);
+}
+
 let activeWebSearchProvider: IWebSearchProvider | null = null;
 
 export function setWebSearchProvider(provider: IWebSearchProvider | null): void {
@@ -454,7 +721,7 @@ export interface SafeFetchResult {
  * Validates a target URL against protocol and destination security rules.
  * Throws SecurityViolationError or ValidationError upon failure.
  */
-function validateTargetUrl(
+export function validateTargetUrl(
   rawUrl: string,
   allowLoopback: boolean = false
 ): URL {
@@ -467,6 +734,12 @@ function validateTargetUrl(
     parsed = new URL(rawUrl.trim());
   } catch (err) {
     throw new ValidationError(`Malformed URL: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // Strip userinfo (username / password) to avoid credential transmission or leakage
+  if (parsed.username || parsed.password) {
+    parsed.username = '';
+    parsed.password = '';
   }
 
   const protocol = parsed.protocol.toLowerCase();
@@ -810,7 +1083,7 @@ export const webSearchTool: RegisteredTool = {
     if (!provider) {
       throw new ToolExecutionError(
         WEB_SEARCH_TOOL_NAME,
-        'Web search provider is not configured. Configure an active web search provider before executing searches.'
+        'Web search provider is not configured. Configure an active web search provider (e.g. set DOTS_WEB_SEARCH_PROVIDER=duckduckgo or DOTS_SEARXNG_URL=https://...) before executing searches.'
       );
     }
 

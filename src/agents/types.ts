@@ -9,7 +9,7 @@
  */
 
 import type { CallerContext } from '../domain/types.ts';
-import type { IModelProvider, ModelConfig, ModelUsage } from '../model/types.ts';
+import type { IModelProvider, ModelConfig, ModelUsage, ToolDefinition } from '../model/types.ts';
 import type { ToolRegistry } from '../tools/registry.ts';
 import type { ToolExecutionResult } from '../tools/types.ts';
 import type { PolicyEngine } from '../security/policy-engine.ts';
@@ -125,6 +125,16 @@ export interface AgentExecutionContext {
   readonly signal?: AbortSignal;
   readonly logger?: OperationalLogger;
   readonly agentCaller?: CallerContext;
+
+  /**
+   * Discovers all registered tool definitions available in this execution context.
+   */
+  listTools(): readonly ToolDefinition[];
+
+  /**
+   * Retrieves a registered tool definition by name, or undefined if not found.
+   */
+  getTool(name: string): ToolDefinition | undefined;
 
   /**
    * Safely executes a registered tool through the platform PolicyEngine and ApprovalBroker.

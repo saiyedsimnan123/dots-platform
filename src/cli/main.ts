@@ -163,6 +163,7 @@ function renderHelp(): string {
     '  task result <id>',
     '  task run <id>',
     '  task cancel <id> [--reason <text>]',
+    '  tools list',
     '  approvals [--decision <PENDING|APPROVED|REJECTED|EXPIRED>] [--limit <n>]',
     '  approve <approvalId> [--reject] [--no-resume]',
     '  memory list [--category <cat>] [--status <status>] [--limit <n>]',
@@ -428,6 +429,21 @@ async function executeLocalCommand(
       return { task: runtime.cancelTask(caller, id, reason) };
     }
     throw new ValidationError(`Unknown task subcommand '${sub}'.`);
+  }
+
+  if (cmd === 'tools' || cmd === 'tool') {
+    const sub = positionals[1] ?? 'list';
+    if (sub === 'list') {
+      const tools = runtime.listTools().map((t) => ({
+        name: t.definition.name,
+        description: t.definition.description,
+        riskTier: t.riskTier,
+        parameters: t.definition.parameters,
+        required: t.definition.required ?? []
+      }));
+      return { tools, count: tools.length };
+    }
+    throw new ValidationError(`Unknown tool subcommand '${sub}'.`);
   }
 
   if (cmd === 'status') {
@@ -779,6 +795,14 @@ async function executeRemoteCommand(
       );
     }
     throw new ValidationError(`Unknown task subcommand '${sub}'.`);
+  }
+
+  if (cmd === 'tools' || cmd === 'tool') {
+    const sub = positionals[1] ?? 'list';
+    if (sub === 'list') {
+      return await callHttpApi(serverUrl, 'GET', '/api/tools', token, scopeSpec);
+    }
+    throw new ValidationError(`Unknown tool subcommand '${sub}'.`);
   }
 
   if (cmd === 'status') {

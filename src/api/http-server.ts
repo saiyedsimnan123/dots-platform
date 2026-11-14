@@ -432,6 +432,19 @@ export class DotsHttpServer {
       return;
     }
 
+    // --- Tools ---
+    if (method === 'GET' && pathname === '/api/tools') {
+      const tools = this.runtime.listTools().map((t) => ({
+        name: t.definition.name,
+        description: t.definition.description,
+        riskTier: t.riskTier,
+        parameters: t.definition.parameters,
+        required: t.definition.required ?? []
+      }));
+      this.sendJson(res, 200, { tools, count: tools.length });
+      return;
+    }
+
     // --- Approvals ---
     if (method === 'GET' && pathname === '/api/approvals') {
       const decision = (url.searchParams.get('decision')?.trim() || undefined) as ApprovalDecision | undefined;

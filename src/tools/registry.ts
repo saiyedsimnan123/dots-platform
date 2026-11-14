@@ -50,6 +50,20 @@ export class ToolRegistry {
   }
 
   /**
+   * Alias for listDefinitions to support tool listing API.
+   */
+  public list(): ToolDefinition[] {
+    return this.listDefinitions();
+  }
+
+  /**
+   * Returns all registered tools including their risk tiers and handlers.
+   */
+  public listRegistered(): readonly RegisteredTool[] {
+    return Array.from(this.tools.values());
+  }
+
+  /**
    * Safely executes a tool through the policy gate and sandbox.
    */
   public async execute(

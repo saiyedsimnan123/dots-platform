@@ -446,6 +446,8 @@ export class ConversationService {
         policyEngine: undefined as any,
         modelProvider: this.modelProvider,
         agentCaller: caller,
+        listTools: () => [],
+        getTool: () => undefined,
         executeTool: async () => {
           throw new SecurityViolationError('Direct tool execution without coordinator is disallowed.', 'TOOL_EXECUTION_DISALLOWED');
         }
