@@ -58,6 +58,7 @@ export type * from './memory/embedding-types.ts';
 export * from './memory/embedding-types.ts';
 export * from './memory/vector-utils.ts';
 export * from './memory/mock-embedding-provider.ts';
+export * from './memory/local-embedding-provider.ts';
 
 // Orchestration Layer
 export * from './orchestrator/coordinator.ts';
