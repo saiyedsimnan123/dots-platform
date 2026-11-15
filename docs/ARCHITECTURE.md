@@ -518,3 +518,40 @@ Phase 4B.4 introduces secure, controlled inheritance of authorized global memori
   - Cross-tenant data sharing is prohibited by design; public multi-tenant catalog sharing without explicit principal grants is not supported.
   - Duplicate suppression and conflict resolution use deterministic lexical and normalized key matching; semantic embedding-based similarity is deferred to future vector milestones.
 
+---
+
+## 14. Phase 4C.2 Embedding Provider Abstraction & Vector Utilities
+
+Phase 4C.2 establishes the provider-independent foundation for vector embeddings within the Dots AI Platform, preserving the platform's local-first, zero-runtime-dependency architecture:
+
+- **Universal Embedding Contract (`src/memory/embedding-types.ts`)**:
+  - `IEmbeddingProvider`: Defines a provider-independent contract featuring provider name, model identifier, vector dimensions, single-text embedding (`embed`), batch embedding (`embedBatch`), and availability reporting (`isAvailable`).
+  - Unit Normalization Invariant: All vectors returned by any implementing provider are contractually guaranteed to be unit-length (Euclidean $L_2$ norm = 1.0) `Float32Array` instances.
+  - Bounded Payloads: Individual text inputs are bounded to `MAX_EMBEDDING_TEXT_LENGTH` (8,192 chars) and batch requests are bounded to `MAX_EMBEDDING_BATCH_SIZE` (100 items) to prevent memory pressure.
+  - Cooperative Cancellation: Supports `AbortSignal` checks before and during inference, throwing `AgentCancelledError` when cancelled.
+  - Defensive Copying: Returned vectors are fresh clones, preventing external callers from mutating internal provider buffers.
+- **Dependency-Free Vector Utilities (`src/memory/vector-utils.ts`)**:
+  - Implements lightweight mathematical primitives in pure TypeScript without external numerical libraries:
+    - Dimension and type validation (`validateVector`, `validateVectorDimensions`).
+    - Finite-value guarantees (rejects `NaN`, `+Infinity`, `-Infinity`).
+    - $L_2$ norm calculation (`l2Norm`), zero-vector detection (`isZeroVector`), and unit normalization (`normalizeVector`).
+    - Exact dot product (`dotProduct`) and cosine similarity (`cosineSimilarity`), strictly clamped to $[-1.0, 1.0]$ with verified behavior for identical (1.0), opposite (-1.0), and orthogonal (0.0) vectors.
+- **Deterministic Mock Test Provider (`src/memory/mock-embedding-provider.ts`)**:
+  - `DeterministicMockEmbeddingProvider`: Provides 100% offline, zero-dependency, reproducible vector generation for unit and integration testing.
+  - Seeded Mulberry32 PRNG: Uses SHA-256 hashes of input texts to seed a deterministic 32-bit PRNG, guaranteeing identical float32 outputs for identical inputs across runs and platforms.
+  - Controlled Semantic Testing: Exposes `registerPredefinedVector()` to allow test suites to bind specific texts to known vectors (e.g. testing exact cosine orthogonal or opposite pairs).
+  - Simulation Capabilities: Supports simulating provider outages (`setAvailable(false)`), queued transient failures (`enqueueFailure`), and persistent errors (`setSimulatedFailure`).
+- **Important Distinction: Mock Vectors vs Real Semantic Embeddings**:
+  - Mock vectors generated from text hashes are pseudo-random and **do not possess natural language or semantic understanding**.
+  - Lexically distinct synonyms (e.g., "automobile" and "car") will produce orthogonal pseudo-random vectors under the mock provider unless explicitly configured via `registerPredefinedVector()`.
+  - The mock provider is strictly an offline testing fixture designed to validate interfaces, batching, normalization, error handling, and pipeline contracts without downloading multi-megabyte weights.
+- **Future Local Provider Implementation Pathway (Phase 4C.3)**:
+  - Phase 4C.3 will introduce concrete providers implementing `IEmbeddingProvider`:
+    1. `LocalEmbeddingProvider`: An optional, CPU-friendly sentence embedding model (quantized `all-MiniLM-L6-v2`) via local ONNX/Transformers.js runtime with cached weights.
+    2. `HttpEmbeddingProvider`: An optional HTTP client connecting to local Ollama endpoints (`http://localhost:11434`) for users already running Ollama.
+- **Why Lexical Retrieval Remains Unchanged in Phase 4C.2**:
+  - Phase 4C.2 is strictly foundational: it defines types, utilities, and test providers.
+  - Pre-execution memory injection (`buildTaskMemoryContext`), runtime memory search (`memory_search`), and relevance ranking (`RelevanceMatcher`) continue using deterministic lexical scoring ($0.50 \times \text{key} + 0.30 \times \text{tag} + 0.20 \times \text{overlap}$) without alteration.
+  - Hybrid scoring combining lexical matching with semantic cosine similarity will be introduced in Phase 4C.5 after vector storage (Phase 4C.4) and local providers (Phase 4C.3) are established.
+
+

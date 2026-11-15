@@ -54,6 +54,10 @@ export * from './memory/relevance-matcher.ts';
 export * from './memory/context-builder.ts';
 export * from './memory/memory-service.ts';
 export * from './memory/canonical-json.ts';
+export type * from './memory/embedding-types.ts';
+export * from './memory/embedding-types.ts';
+export * from './memory/vector-utils.ts';
+export * from './memory/mock-embedding-provider.ts';
 
 // Orchestration Layer
 export * from './orchestrator/coordinator.ts';

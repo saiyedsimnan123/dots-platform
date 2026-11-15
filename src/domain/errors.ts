@@ -330,6 +330,46 @@ export class ConversationScopeViolationError extends DomainError {
   }
 }
 
+/**
+ * Thrown when an embedding provider is not available or disabled.
+ */
+export class EmbeddingProviderUnavailableError extends DomainError {
+  public readonly providerName: string;
+
+  constructor(providerName: string, message?: string, details: Record<string, unknown> = {}) {
+    super(
+      message ?? `Embedding provider '${providerName}' is currently unavailable.`,
+      'EMBEDDING_PROVIDER_UNAVAILABLE',
+      { providerName, ...details }
+    );
+    this.providerName = providerName;
+  }
+}
+
+/**
+ * Thrown when a vector fails dimension or validation checks (e.g. NaN, Infinity, length mismatch, zero-length).
+ */
+export class InvalidVectorError extends DomainError {
+  constructor(message: string, details: Record<string, unknown> = {}) {
+    super(message, 'INVALID_VECTOR', details);
+  }
+}
+
+/**
+ * Thrown when an embedding model inference or vector generation operation fails.
+ */
+export class EmbeddingInferenceError extends DomainError {
+  public readonly providerName?: string;
+  public readonly modelId?: string;
+
+  constructor(message: string, details: Record<string, unknown> = {}) {
+    super(message, 'EMBEDDING_INFERENCE_ERROR', details);
+    this.providerName = typeof details.providerName === 'string' ? details.providerName : undefined;
+    this.modelId = typeof details.modelId === 'string' ? details.modelId : undefined;
+  }
+}
+
+
 
 
 
