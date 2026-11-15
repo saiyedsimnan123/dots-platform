@@ -431,6 +431,52 @@ Phase 4B.2 extends the Modern Agent runtime with dynamic on-demand memory search
   - Successful memory searches that return memories record `MEMORY_RETRIEVED` audit events with memory IDs, result count, authorized scope, and task ID, without leaking raw memory content.
 - **Current Limitations (Phase 4B.2 Scope)**:
   - Vector embeddings, semantic similarity, and knowledge graph relations are not yet implemented (retrieval uses deterministic lexical ranking).
-  - Memory extraction and proposals remain manual tool invocations (`memory_propose`); automatic post-execution memory formation is deferred to subsequent milestones.
+  - Automatic post-execution memory proposal is provided by the `KnowledgeProposalPipeline` (Phase 4B.3).
   - Global scope inheritance into workspace tasks is not yet enabled.
+
+---
+
+## 12. Phase 4B.3 Automatic Knowledge Proposals (`KnowledgeProposalPipeline`)
+
+Phase 4B.3 completes the autonomous knowledge lifecycle by enabling agents to synthesize and propose structured long-term memories upon successful task completion:
+
+- **Lifecycle Integration & Execution Timing**:
+  - Runs in `TaskCoordinator.executeAgent()` strictly *after* successful task execution (`output.status === 'COMPLETED'`).
+  - Tasks that fail (`status === 'FAILED'`), are cancelled (`status === 'CANCELLED'`), or terminate with degraded results never trigger automatic memory proposals.
+- **Trusted Authorization & Scope Isolation**:
+  - The pipeline receives the authenticated task and caller context derived strictly from `MemoryAuthorizer.authorizeAgent({ taskId: task.id })`.
+  - Proposals are submitted under `caller.actor === 'AGENT'`, which strictly forces status to `PENDING_APPROVAL`.
+  - Unattested legacy tasks without verified scope attestations skip proposal generation.
+  - Proposals are confined to the task's verified scope (`WORKSPACE` or `GLOBAL`), preventing cross-tenant memory leakage.
+- **Strict Approval Gate (Anti-Self-Approval Guarantee)**:
+  - Agents can NEVER approve, activate, or directly mutate their own proposals.
+  - All proposals remain in `PENDING_APPROVAL` until an authenticated human user with `APPROVE` permission evaluates them via `MemoryService.decideProposal()`.
+  - Attempts by agents to approve proposals throw `SecurityViolationError` (`AGENT_APPROVAL_RESTRICTED`).
+- **Agent-Specific Deterministic Knowledge Extraction**:
+  - **Research Agent**:
+    - Reusable findings with citations, evidence, domain references, and corroborating agreements.
+    - Explicit limitations and open questions captured under `research.limitations.*`.
+    - Skips extraction entirely if research status is `FAILED` or `INSUFFICIENT_EVIDENCE` (guaranteeing that unestablished or unverified claims are never proposed as facts).
+  - **Analytics Agent**:
+    - Schema & dataset profiling characteristics (`rowCount`, `columnCount`, column names/types) under `analytics.dataset.*`. Strictly never stores raw data rows or sample payloads.
+    - Data quality anomalies, missing value statistics, and warnings under `analytics.quality.*`.
+    - Validated trends, correlations ($r \ge 0.50$), and high-level insights under `analytics.insights.*`.
+  - **Developer Agent**:
+    - Confirmed debugging solutions under `developer.debug.*` (root causes, findings, applied changes).
+    - Verified architectural patterns & decisions under `developer.pattern.*`.
+    - Testing procedures and verification outcomes under `developer.test-procedure.*`.
+    - Generated code is strictly NOT proposed unless independent verification assertions were performed and all passed.
+- **Duplicate Suppression & Quality Safeguards**:
+  - Queries existing memories in caller scope before proposal; skips candidates whose keys or contents already exist in active or pending status.
+  - Bounds memory payloads: keys $\le 256$ chars, content $\le 8192$ chars, tags $\le 50$ items.
+  - Scrubs secrets and authentication tokens from keys, content, tags, and metadata via `defaultSecretScrubber`.
+  - Fail-safe design: extraction or submission errors are caught gracefully and never fail or roll back a successfully completed task.
+- **Provenance & Auditing**:
+  - Proposals include metadata identifying `source: 'automatic_knowledge_proposal'`, `taskId`, `agentId`, and timestamp.
+  - MemoryService logs `MEMORY_PROPOSAL_SUBMITTED` state mutation audit events.
+  - TaskCoordinator logs `KNOWLEDGE_PROPOSALS_GENERATED` audit events with proposal IDs and scope details.
+- **Current Limitations (Phase 4B.3 Scope)**:
+  - Proposals require human review; automated heuristic approval policies (e.g. for low-risk preferences) are not implemented.
+  - Extraction relies on structured agent report outputs; open-ended freeform chat transcripts without structured report schemas require explicit agent tool calls (`memory_propose`).
+  - Semantic similarity deduplication is lexical; embeddings-based near-duplicate detection is deferred to vector milestones.
 

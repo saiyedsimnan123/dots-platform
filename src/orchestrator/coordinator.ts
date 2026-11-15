@@ -38,6 +38,7 @@ import { MemoryAuthorizer, validateScope } from '../security/memory-authorizer.t
 import { PromptCompiler } from '../model/prompt-compiler.ts';
 import { defaultSecretScrubber } from '../model/secret-scrubber.ts';
 import { createMemoryProposeTool, createMemorySearchTool } from '../tools/memory-tools.ts';
+import { KnowledgeProposalPipeline } from '../memory/knowledge-pipeline.ts';
 import { AgentRegistry, createAgentExecutionContext, mergeAgentContext, type AgentInput, type AgentOutput } from '../agents/index.ts';
 
 const NON_SENSITIVE_PROOF_WORDS = new Set([
@@ -153,6 +154,8 @@ export interface CoordinatorOptions {
   readonly maxTotalRetries?: number;      // Hard circuit breaker: total task retry ceiling
   readonly enableCompensation?: boolean;  // Rollback scratch mutations on failure
   readonly agentRegistry?: AgentRegistry; // Shared agent registry for specialized agents
+  readonly knowledgePipeline?: KnowledgeProposalPipeline;
+  readonly enableKnowledgeProposals?: boolean;
 }
 
 export class TaskCoordinator {
@@ -178,6 +181,8 @@ export class TaskCoordinator {
   public readonly authorizer?: MemoryAuthorizer;
   public readonly promptCompiler: PromptCompiler;
   public readonly agentRegistry: AgentRegistry;
+  public readonly knowledgePipeline: KnowledgeProposalPipeline;
+  public readonly enableKnowledgeProposals: boolean;
 
   constructor(options: CoordinatorOptions) {
     if (options.memoryService) {
@@ -238,6 +243,8 @@ export class TaskCoordinator {
     this.authorizer = options.hostAuthority ? options.hostAuthority.authorizer : options.authorizer;
     this.promptCompiler = options.promptCompiler ?? new PromptCompiler();
     this.agentRegistry = options.agentRegistry ?? new AgentRegistry();
+    this.knowledgePipeline = options.knowledgePipeline ?? new KnowledgeProposalPipeline();
+    this.enableKnowledgeProposals = options.enableKnowledgeProposals ?? true;
 
     // Register agent memory tools when memory subsystem and authorizer are configured
     if (this.memoryService && this.authorizer) {
@@ -717,6 +724,36 @@ export class TaskCoordinator {
           result: output.result
         }
       });
+
+      // Phase 4B.3: Post-Execution Automatic Knowledge Proposal Pipeline
+      if (this.memoryService && agentCaller && this.enableKnowledgeProposals) {
+        try {
+          const proposed = await this.knowledgePipeline.processCompletedTask({
+            task,
+            agentId,
+            output,
+            caller: agentCaller,
+            memoryService: this.memoryService
+          });
+          if (proposed.length > 0) {
+            this.auditRepo.appendEvent({
+              taskId: task.id,
+              eventType: 'KNOWLEDGE_PROPOSALS_GENERATED',
+              actor: 'SYSTEM',
+              details: {
+                agentId,
+                proposalCount: proposed.length,
+                proposalIds: proposed.map((p) => p.id),
+                keys: proposed.map((p) => p.key),
+                scopeType: agentCaller.scope.scopeType,
+                scopeId: agentCaller.scope.scopeId
+              }
+            });
+          }
+        } catch {
+          // Graceful degradation: knowledge proposal failures never crash a completed task
+        }
+      }
     } else if (output.status === 'CANCELLED') {
       const currentMeta = task.metadataJson ? (JSON.parse(task.metadataJson) as Record<string, unknown>) : {};
       const updatedMeta = {

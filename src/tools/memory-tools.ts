@@ -120,7 +120,7 @@ function sanitizeValue(val: unknown): unknown {
   return val;
 }
 
-function sanitizeProposalMetadata(metadata?: Record<string, unknown>): Record<string, unknown> | undefined {
+export function sanitizeProposalMetadata(metadata?: Record<string, unknown>): Record<string, unknown> | undefined {
   if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
     return undefined;
   }
