@@ -24,11 +24,16 @@ import type { MemoryCategory, MemoryScopeType } from '../domain/types.ts';
 import {
   ValidationError,
   SecurityViolationError,
-  MemoryScopeViolationError
+  MemoryScopeViolationError,
+  AgentCancelledError
 } from '../domain/errors.ts';
 import type { MemoryService } from '../memory/memory-service.ts';
 import type { MemoryAuthorizer } from '../security/memory-authorizer.ts';
 import { defaultSecretScrubber } from '../model/secret-scrubber.ts';
+import {
+  MEMORY_CONTEXT_SECURITY_BOUNDARY,
+  MEMORY_CONTEXT_SECURITY_NOTICE
+} from '../memory/context-builder.ts';
 
 export const MEMORY_PROPOSE_TOOL_NAME = 'memory_propose';
 
@@ -478,6 +483,198 @@ export function createMemoryProposeTool(
           scopeType: memory.scopeType,
           scopeId: memory.scopeId,
           message: 'Memory proposal submitted successfully and is pending human approval.'
+        },
+        exitCode: 0,
+        durationMs: Date.now() - start
+      };
+    }
+  };
+}
+
+export const MEMORY_SEARCH_TOOL_NAME = 'memory_search';
+
+/**
+ * Creates a registered tool definition and execution handler for agent memory search.
+ * Read-only safe inspection tool (TIER_1).
+ */
+export function createMemorySearchTool(
+  memoryService: MemoryService,
+  authorizer: MemoryAuthorizer
+): RegisteredTool {
+  if (!memoryService) {
+    throw new ValidationError('MemoryService must be provided to createMemorySearchTool.');
+  }
+  if (!authorizer) {
+    throw new ValidationError('MemoryAuthorizer must be provided to createMemorySearchTool.');
+  }
+
+  return {
+    definition: {
+      name: MEMORY_SEARCH_TOOL_NAME,
+      description: 'Searches relevant long-term memories within the task scope using lexical and keyword matching. Returns read-only historical memories.',
+      parameters: {
+        query: {
+          type: 'string',
+          description: 'Search query or keywords to find relevant stored memories (max 2000 characters).'
+        },
+        limit: {
+          type: 'number',
+          description: 'Optional maximum number of memories to return (1-50, default 5).'
+        },
+        category: {
+          type: 'string',
+          description: 'Optional category filter: USER_PREFERENCE, PROJECT_FACT, or LEARNED_PROCEDURE.',
+          enum: ['USER_PREFERENCE', 'PROJECT_FACT', 'LEARNED_PROCEDURE']
+        }
+      },
+      required: ['query']
+    },
+    riskTier: 'TIER_1',
+    handler: async (rawArgs: Record<string, unknown>, context: ToolContext): Promise<ToolExecutionResult> => {
+      const start = Date.now();
+
+      // Early cancellation check
+      if (context?.signal?.aborted) {
+        throw new AgentCancelledError(
+          `Memory search cancelled by signal: ${context.signal.reason ? String(context.signal.reason) : 'aborted'}`
+        );
+      }
+
+      // 1. Context verification
+      if (!context || !context.taskId || typeof context.taskId !== 'string' || context.taskId.trim() === '') {
+        throw new SecurityViolationError(
+          'Tool execution context must provide an authoritative taskId.',
+          'UNAUTHORIZED_AGENT_EXECUTION'
+        );
+      }
+
+      // 2. Authorize agent and derive authenticated scope
+      const caller = authorizer.authorizeAgent({ taskId: context.taskId });
+
+      // 3. Strict argument validation
+      if (!rawArgs || typeof rawArgs !== 'object' || Array.isArray(rawArgs)) {
+        throw new ValidationError('Tool arguments must be a non-null object.');
+      }
+
+      // Query validation
+      const rawQuery = rawArgs.query;
+      if (typeof rawQuery !== 'string' || rawQuery.trim() === '') {
+        throw new ValidationError('Memory search query must be a non-empty string.');
+      }
+      const query = rawQuery.trim();
+      if (query.length > 2000) {
+        throw new ValidationError(`Memory search query exceeds limit of 2000 characters (${query.length} > 2000).`);
+      }
+
+      // Limit validation
+      let limit = 5;
+      if (rawArgs.limit !== undefined) {
+        if (
+          typeof rawArgs.limit !== 'number' ||
+          !Number.isInteger(rawArgs.limit) ||
+          rawArgs.limit < 1 ||
+          rawArgs.limit > 50
+        ) {
+          throw new ValidationError(
+            `Memory search limit must be an integer between 1 and 50, received '${String(rawArgs.limit)}'.`
+          );
+        }
+        limit = rawArgs.limit;
+      }
+
+      // Category validation
+      let category: MemoryCategory | undefined;
+      if (rawArgs.category !== undefined) {
+        if (!rawArgs.category || !VALID_CATEGORIES.has(rawArgs.category as MemoryCategory)) {
+          throw new ValidationError(
+            `Invalid memory category '${String(rawArgs.category)}'. Must be one of: ${Array.from(VALID_CATEGORIES).join(', ')}.`
+          );
+        }
+        category = rawArgs.category as MemoryCategory;
+      }
+
+      // Scope gate: Reject any explicit scope spoofing in args
+      if (rawArgs.scopeType !== undefined && rawArgs.scopeType !== caller.scope.scopeType) {
+        throw new MemoryScopeViolationError(
+          `${caller.scope.scopeType}:${caller.scope.scopeId}`,
+          `${String(rawArgs.scopeType)}:${String(rawArgs.scopeId ?? caller.scope.scopeId)}`,
+          'search'
+        );
+      }
+      if (rawArgs.scopeId !== undefined && rawArgs.scopeId !== caller.scope.scopeId) {
+        throw new MemoryScopeViolationError(
+          `${caller.scope.scopeType}:${caller.scope.scopeId}`,
+          `${String(rawArgs.scopeType ?? caller.scope.scopeType)}:${String(rawArgs.scopeId)}`,
+          'search'
+        );
+      }
+
+      // Cancellation check before search
+      if (context?.signal?.aborted) {
+        throw new AgentCancelledError(
+          `Memory search cancelled by signal: ${context.signal.reason ? String(context.signal.reason) : 'aborted'}`
+        );
+      }
+
+      // 4. Perform search via MemoryService
+      const scoredMemories = memoryService.searchMemories(caller, {
+        query,
+        limit,
+        category,
+        taskId: context.taskId
+      });
+
+      // Cancellation check after search
+      if (context?.signal?.aborted) {
+        throw new AgentCancelledError(
+          `Memory search cancelled by signal: ${context.signal.reason ? String(context.signal.reason) : 'aborted'}`
+        );
+      }
+
+      // 5. Format results safely with secret scrubbing and untrusted context boundary
+      const formattedMemories = scoredMemories.map((sm) => {
+        let tags: string[] = [];
+        try {
+          const parsed = JSON.parse(sm.memory.tagsJson);
+          if (Array.isArray(parsed)) {
+            tags = parsed
+              .filter((t): t is string => typeof t === 'string')
+              .map((t) => defaultSecretScrubber.scrub(t));
+          }
+        } catch {
+          tags = [];
+        }
+
+        let metadata: Record<string, unknown> = {};
+        try {
+          const parsed = JSON.parse(sm.memory.metadataJson);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            metadata = (sanitizeProposalMetadata(parsed as Record<string, unknown>) ?? {}) as Record<string, unknown>;
+          }
+        } catch {
+          metadata = {};
+        }
+
+        return {
+          id: sm.memory.id,
+          key: defaultSecretScrubber.scrub(sm.memory.key),
+          content: defaultSecretScrubber.scrub(sm.memory.content),
+          category: sm.memory.category,
+          score: sm.score,
+          tags,
+          metadata,
+          createdAt: sm.memory.createdAt
+        };
+      });
+
+      return {
+        output: {
+          success: true,
+          query: defaultSecretScrubber.scrub(query),
+          count: formattedMemories.length,
+          memories: formattedMemories,
+          _boundary: MEMORY_CONTEXT_SECURITY_BOUNDARY,
+          _securityNotice: MEMORY_CONTEXT_SECURITY_NOTICE
         },
         exitCode: 0,
         durationMs: Date.now() - start

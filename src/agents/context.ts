@@ -16,6 +16,7 @@ import type { ToolDefinition } from '../model/types.ts';
 import type { ToolContext, ToolExecutionResult } from '../tools/types.ts';
 import {
   AgentCancelledError,
+  MemoryScopeViolationError,
   SecurityViolationError,
   ToolExecutionError,
   ValidationError
@@ -145,7 +146,8 @@ export function createAgentExecutionContext(
       const toolCtx: ToolContext = {
         taskId: taskId ?? 'unscoped-agent-task',
         stepId: 'agent-tool-step',
-        workspaceRoot
+        workspaceRoot,
+        signal
       };
 
       try {
@@ -174,7 +176,8 @@ export function createAgentExecutionContext(
           err instanceof SecurityViolationError ||
           err instanceof ValidationError ||
           err instanceof AgentCancelledError ||
-          err instanceof ToolExecutionError
+          err instanceof ToolExecutionError ||
+          err instanceof MemoryScopeViolationError
         ) {
           throw err;
         }

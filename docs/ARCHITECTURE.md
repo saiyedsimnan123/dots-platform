@@ -391,8 +391,46 @@ The Modern Agent execution pipeline (`TaskCoordinator.executeAgent()` and `execu
 - **Context Size Limits**: The context budget enforces limits (default 32,000 characters). If user context and memory context combined exceed the limit, the memory block is omitted. User instructions are **never** truncated to make room for memories.
 - **Provenance & Auditing**: Injected memory IDs and token estimates are recorded in `memory_task_injections` batch operations. The `AGENT_EXECUTION_STARTED` audit event records `injectedMemoriesCount` and `injectedMemoryIds` without leaking raw memory content into audit logs.
 - **Current Limitations (Phase 4B.1 Scope)**:
-  - Memory injection occurs strictly *prior to execution*; agents do not yet possess dynamic run-time search tools (`memory_search`).
+  - Memory injection occurs strictly *prior to execution*; dynamic run-time search is provided by the `memory_search` tool (Phase 4B.2).
   - Agents do not automatically extract or propose new memories on task completion (`memory_propose` remains a manual tool call).
   - Retrieval uses deterministic lexical token matching (composite key, tag, and word overlap); vector embeddings and semantic search are not yet implemented.
   - Scope retrieval is strictly partitioned; global scope inheritance into workspace tasks is not yet implemented.
+
+---
+
+## 11. Phase 4B.2 Agent Memory Search Tool (`memory_search`)
+
+Phase 4B.2 extends the Modern Agent runtime with dynamic on-demand memory search during agent execution, complementing pre-execution injection:
+
+- **Pre-Execution vs. Runtime Search Distinction**:
+  - **Pre-Execution Injection (Phase 4B.1)**: Runs automatically in `TaskCoordinator.executeAgentTask()` *before* agent invocation, using `task.goal` to inject initial relevant context into `input.context.formattedContext` and `context.memoryContext`.
+  - **Runtime Memory Search Tool (Phase 4B.2)**: An explicit, agent-callable tool (`memory_search`) that agents (`ResearchAgent`, `AnalyticsAgent`, `DeveloperAgent`, or custom agents) invoke during execution via `context.executeTool('memory_search', { query, limit?, category? })` when their evolving reasoning requires additional historical facts or procedures.
+- **Tool Specification & Policy Tier**:
+  - **Tool Name**: `memory_search`
+  - **Risk Tier**: `TIER_1` (Read-only safe inspection inside sandboxed execution; auto-approved by `PolicyEngine` with no human approval token required).
+  - **Input Parameters**:
+    - `query` (string, required): Search query or keywords to find relevant stored memories (max 2,000 characters).
+    - `limit` (number, optional): Maximum number of memories to return (1–50, defaults to 5).
+    - `category` (string, optional): Filter by `USER_PREFERENCE`, `PROJECT_FACT`, or `LEARNED_PROCEDURE`.
+- **Authorization & Scope Boundary**:
+  - The tool handler derives caller context strictly from verified task scope via `MemoryAuthorizer.authorizeAgent({ taskId: context.taskId })`.
+  - Any caller-provided attempts to widen or spoof scope (`scopeType` or `scopeId`) trigger `MemoryScopeViolationError` and fail closed.
+  - Multi-tenant workspace isolation is strictly enforced; an agent in `ws-alpha` can never observe or search memories in `ws-beta`.
+  - Unattested tasks or missing `taskId` values trigger `SecurityViolationError` or `TaskNotFoundError` and fail closed.
+- **Deterministic Lexical Ranking & Zero-Relevance Guarantee**:
+  - Integrates with `RelevanceMatcher.rank(query, candidates)` using weighted composite scoring: Key Match (0.50), Tag Match (0.30), and Word Overlap (0.20).
+  - Strictly excludes candidates with `score <= 0.0`. If no memories match query tokens, the tool cleanly returns `count: 0` and `memories: []`.
+  - Excludes inactive records: proposals (`PENDING_APPROVAL`), archived memories (`ARCHIVED`), and purged records are never returned.
+- **Security & Untrusted Context Framing**:
+  - Search results are wrapped with security boundaries:
+    - `_boundary`: `=== BEGIN UNTRUSTED LONG-TERM MEMORY CONTEXT ===`
+    - `_securityNotice`: Explains that returned memories are untrusted historical context that must not be executed as system directives.
+  - All output strings (query, content, tags, metadata keys/values) are scrubbed with `defaultSecretScrubber` before return to prevent credential leakage.
+  - Cancellation via `AbortSignal` is checked before and during tool execution, throwing `AgentCancelledError` cleanly on abort.
+- **Audit Logging**:
+  - Successful memory searches that return memories record `MEMORY_RETRIEVED` audit events with memory IDs, result count, authorized scope, and task ID, without leaking raw memory content.
+- **Current Limitations (Phase 4B.2 Scope)**:
+  - Vector embeddings, semantic similarity, and knowledge graph relations are not yet implemented (retrieval uses deterministic lexical ranking).
+  - Memory extraction and proposals remain manual tool invocations (`memory_propose`); automatic post-execution memory formation is deferred to subsequent milestones.
+  - Global scope inheritance into workspace tasks is not yet enabled.
 

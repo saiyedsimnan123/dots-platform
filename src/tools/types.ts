@@ -9,6 +9,7 @@ export interface ToolContext {
   readonly taskId: string;
   readonly stepId: string;
   readonly workspaceRoot: string;
+  readonly signal?: AbortSignal;
 }
 
 export interface ToolExecutionResult {

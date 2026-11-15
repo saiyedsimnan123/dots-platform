@@ -37,7 +37,7 @@ import type { HostMemoryAuthority } from '../security/host-authority.ts';
 import { MemoryAuthorizer, validateScope } from '../security/memory-authorizer.ts';
 import { PromptCompiler } from '../model/prompt-compiler.ts';
 import { defaultSecretScrubber } from '../model/secret-scrubber.ts';
-import { createMemoryProposeTool } from '../tools/memory-tools.ts';
+import { createMemoryProposeTool, createMemorySearchTool } from '../tools/memory-tools.ts';
 import { AgentRegistry, createAgentExecutionContext, mergeAgentContext, type AgentInput, type AgentOutput } from '../agents/index.ts';
 
 const NON_SENSITIVE_PROOF_WORDS = new Set([
@@ -239,9 +239,14 @@ export class TaskCoordinator {
     this.promptCompiler = options.promptCompiler ?? new PromptCompiler();
     this.agentRegistry = options.agentRegistry ?? new AgentRegistry();
 
-    // Register agent memory proposal tool when memory subsystem and authorizer are configured
-    if (this.memoryService && this.authorizer && !this.toolRegistry.get('memory_propose')) {
-      this.toolRegistry.register(createMemoryProposeTool(this.memoryService, this.authorizer));
+    // Register agent memory tools when memory subsystem and authorizer are configured
+    if (this.memoryService && this.authorizer) {
+      if (!this.toolRegistry.get('memory_propose')) {
+        this.toolRegistry.register(createMemoryProposeTool(this.memoryService, this.authorizer));
+      }
+      if (!this.toolRegistry.get('memory_search')) {
+        this.toolRegistry.register(createMemorySearchTool(this.memoryService, this.authorizer));
+      }
     }
   }
 

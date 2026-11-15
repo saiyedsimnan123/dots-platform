@@ -59,7 +59,8 @@ import type {
   MemoryImportResult,
   MemoryPurgeMode,
   PurgeArchivedMemoriesOptions,
-  MemoryPurgeResult
+  MemoryPurgeResult,
+  ScoredMemory
 } from '../domain/types.ts';
 import {
   ValidationError,
@@ -96,6 +97,15 @@ const VALID_CONFLICT_STRATEGIES: ReadonlySet<ImportConflictStrategy> = new Set([
   'SKIP',
   'OVERWRITE'
 ]);
+
+export interface SearchMemoriesOptions {
+  readonly query: string;
+  readonly limit?: number;
+  readonly category?: MemoryCategory;
+  readonly taskId?: string;
+  readonly scopeType?: MemoryScopeType;
+  readonly scopeId?: string;
+}
 
 export interface MemoryServiceOptions {
   readonly memoryRepo: MemoryRepository;
@@ -1130,6 +1140,109 @@ export class MemoryService {
     }
 
     return context;
+  }
+
+  /**
+   * Searches active memories within the caller's authorized scope using lexical and keyword ranking.
+   * Enforces caller verification, READ permission, task scope alignment (if taskId provided),
+   * strictly excludes zero-relevance results (score <= 0.0), and limits returned records (1-50, default 5).
+   */
+  public searchMemories(
+    caller: CallerContext,
+    options: SearchMemoriesOptions
+  ): ScoredMemory[] {
+    this.validateCaller(caller, 'READ');
+    if (!options || typeof options !== 'object') {
+      throw new ValidationError('SearchMemoriesOptions must be provided.');
+    }
+    if (typeof options.query !== 'string') {
+      throw new ValidationError('Query must be a string.');
+    }
+
+    // Reject explicit scope spoofing attempts
+    this.assertCallerScopeMatch(caller, options.scopeType, options.scopeId, 'searchMemories');
+
+    // Limit validation
+    let limit = 5;
+    if (options.limit !== undefined) {
+      if (
+        typeof options.limit !== 'number' ||
+        !Number.isInteger(options.limit) ||
+        options.limit < 1 ||
+        options.limit > 50
+      ) {
+        throw new ValidationError(
+          `Memory search limit must be an integer between 1 and 50, received '${String(options.limit)}'.`
+        );
+      }
+      limit = options.limit;
+    }
+
+    // Category validation
+    if (options.category !== undefined && !VALID_CATEGORIES.has(options.category)) {
+      throw new ValidationError(
+        `Invalid memory category '${String(options.category)}'. Must be one of: ${Array.from(VALID_CATEGORIES).join(', ')}.`
+      );
+    }
+
+    // If taskId is provided, verify task exists and authoritative scope is compatible
+    if (options.taskId) {
+      if (!this.taskRepo) {
+        throw new ValidationError('TaskRepository is required for authoritative task lookup.');
+      }
+      const task = this.taskRepo.getTaskById(options.taskId);
+      if (!task) {
+        throw new TaskNotFoundError(options.taskId);
+      }
+      const taskScope = this.extractAuthoritativeTaskScope(task);
+      if (
+        taskScope.scopeType !== caller.scope.scopeType ||
+        taskScope.scopeId !== caller.scope.scopeId
+      ) {
+        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+          reason: 'TASK_CALLER_SCOPE_MISMATCH',
+          taskId: options.taskId,
+          callerScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`,
+          taskScope: `${taskScope.scopeType}:${taskScope.scopeId}`
+        }, false);
+        throw new MemoryScopeViolationError(
+          `${caller.scope.scopeType}:${caller.scope.scopeId}`,
+          `${taskScope.scopeType}:${taskScope.scopeId}`,
+          undefined,
+          { taskId: options.taskId }
+        );
+      }
+    }
+
+    // Query active memories within caller scope
+    const candidates = this.memoryRepo.listMemories({
+      scopeType: caller.scope.scopeType,
+      scopeId: caller.scope.scopeId,
+      status: 'ACTIVE',
+      category: options.category
+    });
+
+    const query = options.query.trim();
+    if (!query || candidates.length === 0) {
+      return [];
+    }
+
+    const ranked = this.relevanceMatcher.rank(query, candidates);
+    const relevant = ranked.filter((scored) => scored.score > 0);
+    const limited = relevant.slice(0, limit);
+
+    if (limited.length > 0) {
+      this.audit(caller, 'MEMORY_RETRIEVED', {
+        memoryIds: limited.map((m) => m.memory.id),
+        count: limited.length,
+        scopeType: caller.scope.scopeType,
+        scopeId: caller.scope.scopeId,
+        taskId: options.taskId,
+        operation: 'searchMemories'
+      }, false);
+    }
+
+    return limited;
   }
 
   /**
