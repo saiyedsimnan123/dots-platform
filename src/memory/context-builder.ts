@@ -185,7 +185,10 @@ export class MemoryContextBuilder {
           score: scored.score,
           category: scored.memory.category,
           charCount,
-          estimatedTokens
+          estimatedTokens,
+          scopeType: scored.memory.scopeType,
+          scopeId: scored.memory.scopeId,
+          isInherited: (scored as any).isInherited ?? (scored.memory as any)._isInherited ?? (scored.memory.scopeType === 'GLOBAL')
         });
       } else {
         // Exclude oversized candidate, but CONTINUE loop to test smaller subsequent candidates

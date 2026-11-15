@@ -114,6 +114,8 @@ export class HostMemoryAuthority {
 
     const metadata = {
       ...(input.metadata ?? {}),
+      ...(input.principalId ? { _principalId: input.principalId, principalId: input.principalId } : {}),
+      ...(input.permittedScopes ? { _permittedScopes: input.permittedScopes } : {}),
       _scopeAttestation: attestation
     };
 
@@ -146,6 +148,14 @@ export class HostMemoryAuthority {
       }),
       permissions: Object.freeze(new Set(SYSTEM_PERMISSIONS)),
       taskId: input.taskId,
+      ...(input.principalId !== undefined ? { principalId: input.principalId } : {}),
+      ...(input.permittedScopes !== undefined
+        ? {
+            permittedScopes: Object.freeze(
+              input.permittedScopes.map((s) => Object.freeze({ scopeType: s.scopeType, scopeId: s.scopeId }))
+            )
+          }
+        : {}),
       _proof: Object.freeze({
         signature,
         nonce

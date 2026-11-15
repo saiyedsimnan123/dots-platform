@@ -432,7 +432,7 @@ Phase 4B.2 extends the Modern Agent runtime with dynamic on-demand memory search
 - **Current Limitations (Phase 4B.2 Scope)**:
   - Vector embeddings, semantic similarity, and knowledge graph relations are not yet implemented (retrieval uses deterministic lexical ranking).
   - Automatic post-execution memory proposal is provided by the `KnowledgeProposalPipeline` (Phase 4B.3).
-  - Global scope inheritance into workspace tasks is not yet enabled.
+  - Global scope inheritance into workspace tasks is implemented with same-principal verification and deterministic precedence (Phase 4B.4).
 
 ---
 
@@ -479,4 +479,42 @@ Phase 4B.3 completes the autonomous knowledge lifecycle by enabling agents to sy
   - Proposals require human review; automated heuristic approval policies (e.g. for low-risk preferences) are not implemented.
   - Extraction relies on structured agent report outputs; open-ended freeform chat transcripts without structured report schemas require explicit agent tool calls (`memory_propose`).
   - Semantic similarity deduplication is lexical; embeddings-based near-duplicate detection is deferred to vector milestones.
+
+---
+
+## 13. Phase 4B.4 Global and Workspace Memory Inheritance
+
+Phase 4B.4 introduces secure, controlled inheritance of authorized global memories into workspace-level memory retrieval, harmonizing pre-execution memory injection (Phase 4B.1), runtime memory search (`memory_search`, Phase 4B.2), and automatic knowledge proposals (`KnowledgeProposalPipeline`, Phase 4B.3):
+
+- **Scope Semantics & Multi-Tenant Boundaries**:
+  - `GLOBAL` scope (`scopeId: 'default'`): Holds cross-workspace facts, user preferences, and shared procedures owned by specific authenticated principals or system administrators. Never assumed to be publicly accessible.
+  - `WORKSPACE` scope (`scopeId: <workspaceId>`): Strictly isolated tenant/project boundaries. Tasks running in Workspace A can never view or query memories belonging to Workspace B, and vice versa.
+  - Global tasks query only authorized `GLOBAL` memories and can never inspect workspace-scoped memories.
+- **Strict Same-Principal Inheritance Restrictions**:
+  - When a workspace-scoped task or caller retrieves memory, eligible global records are restricted strictly to those belonging to the *same authenticated principal or tenant* (`principalId`, `ownerId`, or `tenantId`).
+  - The caller must possess explicit permission to access `GLOBAL:default` within its host-verified `permittedScopes`. Callers whose permitted scopes omit global access cannot inherit global memories.
+  - Caller A can never retrieve Caller B's global memories under any circumstance.
+  - Unauthenticated or unidentified callers fail closed and are blocked from accessing principal-owned global memories.
+- **Deterministic Workspace-Over-Global Conflict Resolution**:
+  - Precedence rule: When the same normalized memory key (`key.trim().toLowerCase()`) exists in both `WORKSPACE` and `GLOBAL` scopes, the workspace-specific memory record takes precedence and is returned.
+  - The conflicting global memory record is suppressed for that workspace query, but remains intact, unaltered, and active in the database. Subsequent global queries or queries in other workspaces continue to see the global record.
+  - Unrelated keys from both scopes are preserved, combined into the candidate pool, and ranked deterministically by composite relevance score, priority, created timestamp, key, and ID.
+- **Read-Only Inherited Global Memories & Write Isolation**:
+  - Inherited global memories are strictly read-only from workspace execution contexts.
+  - Workspace agents and callers cannot update (`updateMemory`), archive (`archiveMemory`), delete (`deleteMemory`), or directly mutate global memories; cross-scope mutation attempts throw `MemoryScopeViolationError`.
+  - Workspace agents can only create proposals within their own `WORKSPACE` scope. Any attempt to propose to `GLOBAL` scope is rejected.
+  - Approving a workspace proposal via `decideProposal()` activates only the workspace record and never modifies or activates a global record.
+  - Human approval remains required for all proposals; agents are strictly forbidden from self-approving memory proposals (`SecurityViolationError: UNAUTHORIZED_APPROVAL`).
+- **Retrieval Provenance & Tamper-Evident Auditing**:
+  - Memory retrieval responses (`IncludedMemoryInfo` in pre-execution injection, `ScoredMemory`, and `memory_search` tool outputs) identify originating scope (`scopeType`, `scopeId`) and whether the memory was inherited (`isInherited: boolean`).
+  - Memory task injections (`memory_task_injections`) record provenance linking the inherited memory ID to the executing workspace task.
+  - Auditing records `MEMORY_RETRIEVED` events with result count, inherited count, and memory IDs, while strictly preserving privacy by never logging raw memory content or keys.
+- **Failure-Closed Security & Tamper Resistance**:
+  - All caller and task scopes are validated via process-private cryptographic HMAC signatures and WeakSet containment (`MemoryAuthorizer.verify()`).
+  - Handcrafted context objects, tampered scopes, forged permissions, and invalid credentials fail closed immediately with `SecurityViolationError` or `MemoryScopeViolationError`.
+  - Inactive memories (`status !== 'ACTIVE'`) and expired memories (`expiresAt` in the past or `expired: true`) are strictly excluded from inheritance and search.
+- **Current Limitations (Phase 4B.4 Scope)**:
+  - Single-level inheritance (`GLOBAL` -> `WORKSPACE`): Hierarchical multi-level workspace inheritance trees (e.g., Organization -> Department -> Project -> Task) are not implemented.
+  - Cross-tenant data sharing is prohibited by design; public multi-tenant catalog sharing without explicit principal grants is not supported.
+  - Duplicate suppression and conflict resolution use deterministic lexical and normalized key matching; semantic embedding-based similarity is deferred to future vector milestones.
 

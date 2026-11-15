@@ -389,6 +389,8 @@ export class TaskCoordinator {
     const task = this.hostAuthority.createTask(this.taskRepo, {
       goal: goal.trim(),
       scope: effectiveScope,
+      principalId: verifiedCaller.principalId,
+      permittedScopes: verifiedCaller.permittedScopes,
       metadata: sanitizedMeta
     });
 

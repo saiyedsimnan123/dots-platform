@@ -663,7 +663,10 @@ export function createMemorySearchTool(
           score: sm.score,
           tags,
           metadata,
-          createdAt: sm.memory.createdAt
+          createdAt: sm.memory.createdAt,
+          scopeType: sm.memory.scopeType,
+          scopeId: sm.memory.scopeId,
+          isInherited: Boolean((sm as any).isInherited ?? (sm.memory.scopeType === 'GLOBAL' && caller.scope.scopeType === 'WORKSPACE'))
         };
       });
 

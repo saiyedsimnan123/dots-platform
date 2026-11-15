@@ -559,13 +559,28 @@ export class KnowledgeProposalPipeline {
       return [];
     }
 
-    // Invariant 4: Duplicate suppression against existing memories in caller scope
+    // Invariant 4: Duplicate suppression against existing memories the caller is authorized to inspect
     let existingMemories: Memory[] = [];
     try {
       existingMemories = memoryService.listMemories(caller, {
         scopeType: caller.scope.scopeType,
         scopeId: caller.scope.scopeId
       });
+      // Also inspect authorized inherited global memories if accessible
+      if (caller.scope.scopeType === 'WORKSPACE') {
+        const canAccessGlobal =
+          !caller.permittedScopes ||
+          caller.permittedScopes.length === 0 ||
+          caller.permittedScopes.some((s) => s.scopeType === 'GLOBAL' && s.scopeId === 'default');
+        if (canAccessGlobal) {
+          try {
+            const globalCandidates = memoryService.listEligibleGlobalMemories(caller);
+            existingMemories.push(...globalCandidates);
+          } catch {
+            // ignore if not permitted
+          }
+        }
+      }
     } catch {
       existingMemories = [];
     }

@@ -365,6 +365,7 @@ export interface ScoredMemory {
   readonly memory: Memory;
   readonly score: number;
   readonly breakdown: RelevanceBreakdown;
+  readonly isInherited?: boolean;
 }
 
 export interface IncludedMemoryInfo {
@@ -374,6 +375,9 @@ export interface IncludedMemoryInfo {
   readonly category: MemoryCategory;
   readonly charCount: number;
   readonly estimatedTokens: number;
+  readonly scopeType?: MemoryScopeType;
+  readonly scopeId?: string;
+  readonly isInherited?: boolean;
 }
 
 export interface ExcludedMemoryInfo {
@@ -390,6 +394,8 @@ export interface SerializedMemoryRecord {
   readonly content: string;
   readonly tags: readonly string[];
   readonly metadata: Record<string, unknown>;
+  readonly scope?: ScopeIdentifier;
+  readonly isInherited?: boolean;
 }
 
 export interface SerializedMemoryPayload {
@@ -425,6 +431,8 @@ export interface CallerContext {
   readonly scope: ScopeIdentifier;
   readonly permissions: ReadonlySet<MemoryPermission> | readonly MemoryPermission[];
   readonly taskId?: string;
+  readonly principalId?: string;
+  readonly permittedScopes?: readonly ScopeIdentifier[];
   readonly _proof?: {
     readonly signature: string;
     readonly nonce: string;

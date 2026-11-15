@@ -272,7 +272,28 @@ export class MemoryService {
       }
       return memory;
     } catch (err) {
-      if (err instanceof MemoryScopeViolationError) {
+      if (err instanceof MemoryScopeViolationError && caller.scope.scopeType === 'WORKSPACE') {
+        try {
+          const globalMemory = this.memoryRepo.getMemoryById(id, { scopeType: 'GLOBAL', scopeId: 'default' });
+          if (globalMemory && this.isMemoryEligibleForCaller(globalMemory, caller)) {
+            this.audit(caller, 'MEMORY_RETRIEVED', {
+              memoryId: globalMemory.id,
+              category: globalMemory.category,
+              scopeType: globalMemory.scopeType,
+              scopeId: globalMemory.scopeId,
+              inherited: true
+            }, false);
+            return globalMemory;
+          }
+        } catch {
+          // not found or not in global
+        }
+        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+          reason: 'CROSS_SCOPE_READ_ATTEMPT',
+          memoryId: id,
+          expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+        }, false);
+      } else if (err instanceof MemoryScopeViolationError) {
         this.audit(caller, 'MEMORY_ACCESS_DENIED', {
           reason: 'CROSS_SCOPE_READ_ATTEMPT',
           memoryId: id,
@@ -284,7 +305,8 @@ export class MemoryService {
   }
 
   /**
-   * Retrieves an active memory by its exact key within the caller's scope.
+   * Retrieves an active memory by its exact key within the caller's scope,
+   * with inherited global memory fallback for workspace callers.
    */
   public getMemoryByKey(
     caller: CallerContext,
@@ -292,13 +314,22 @@ export class MemoryService {
     status: MemoryStatus = 'ACTIVE'
   ): Memory | null {
     this.validateCaller(caller, 'READ');
-    const memory = this.memoryRepo.getMemoryByKey(key, caller.scope, status);
+    let memory = this.memoryRepo.getMemoryByKey(key, caller.scope, status);
+    let isInherited = false;
+    if (!memory && caller.scope.scopeType === 'WORKSPACE') {
+      const globalMem = this.memoryRepo.getMemoryByKey(key, { scopeType: 'GLOBAL', scopeId: 'default' }, status);
+      if (globalMem && this.isMemoryEligibleForCaller(globalMem, caller)) {
+        memory = globalMem;
+        isInherited = true;
+      }
+    }
     if (memory) {
       this.audit(caller, 'MEMORY_RETRIEVED', {
         memoryId: memory.id,
         category: memory.category,
         scopeType: memory.scopeType,
-        scopeId: memory.scopeId
+        scopeId: memory.scopeId,
+        inherited: isInherited
       }, false);
     }
     return memory;
@@ -360,11 +391,19 @@ export class MemoryService {
       status = input.status ?? 'ACTIVE';
     }
 
+    const metadataWithOwnership = {
+      ...(input.metadata ?? {}),
+      ...(caller.scope.scopeType === 'GLOBAL' && caller.principalId && !input.metadata?.principalId
+        ? { principalId: caller.principalId, ownerId: caller.principalId }
+        : {})
+    };
+
     return this.memoryRepo.transaction(() => {
       const memory = this.memoryRepo.createMemory({
         ...input,
         scopeType: caller.scope.scopeType,
         scopeId: caller.scope.scopeId,
+        metadata: metadataWithOwnership,
         status
       });
 
@@ -898,19 +937,27 @@ export class MemoryService {
 
     // 2. Validate memory existence, scope, and ACTIVE status
     if (input.memoryId) {
-      let memory: Memory | null;
+      let memory: Memory | null = null;
       try {
         memory = this.memoryRepo.getMemoryById(input.memoryId, caller.scope);
       } catch (err) {
-        if (err instanceof MemoryScopeViolationError) {
-          this.audit(caller, 'MEMORY_ACCESS_DENIED', {
-            reason: 'TASK_MEMORY_SCOPE_MISMATCH',
-            taskId: input.taskId,
-            memoryId: input.memoryId,
-            callerScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
-          }, false);
+        if (!(err instanceof MemoryScopeViolationError)) {
+          throw err;
         }
-        throw err;
+      }
+
+      if (!memory && caller.scope.scopeType === 'WORKSPACE') {
+        try {
+          const globalMemory = this.memoryRepo.getMemoryById(input.memoryId, {
+            scopeType: 'GLOBAL',
+            scopeId: 'default'
+          });
+          if (globalMemory && this.isMemoryEligibleForCaller(globalMemory, caller)) {
+            memory = globalMemory;
+          }
+        } catch {
+          // not found or cross scope
+        }
       }
 
       if (!memory) {
@@ -924,10 +971,11 @@ export class MemoryService {
         );
       }
 
-      if (
-        memory.scopeType !== taskScope.scopeType ||
-        memory.scopeId !== taskScope.scopeId
-      ) {
+      const isAllowedScope =
+        (memory.scopeType === taskScope.scopeType && memory.scopeId === taskScope.scopeId) ||
+        (memory.scopeType === 'GLOBAL' && taskScope.scopeType === 'WORKSPACE' && this.isMemoryEligibleForCaller(memory, caller));
+
+      if (!isAllowedScope) {
         this.audit(caller, 'MEMORY_ACCESS_DENIED', {
           reason: 'TASK_MEMORY_SCOPE_MISMATCH',
           taskId: input.taskId,
@@ -1044,7 +1092,8 @@ export class MemoryService {
 
   /**
    * Builds a safe, bounded memory context block for task execution.
-   * Only ACTIVE memories within the caller's scope are considered.
+   * Only ACTIVE memories authorized for the caller (including inherited global memories for workspace tasks)
+   * are considered, with deterministic workspace-over-global conflict resolution.
    * Batch injection recording uses a database transaction to prevent partial writes.
    */
   public buildTaskMemoryContext(
@@ -1058,6 +1107,9 @@ export class MemoryService {
     if (typeof options.query !== 'string') {
       throw new ValidationError('Query must be a string.');
     }
+
+    // Reject explicit scope spoofing attempts
+    this.assertCallerScopeMatch(caller, (options as any).scopeType, (options as any).scopeId, 'buildTaskMemoryContext');
 
     // If taskId is provided, verify task exists and authoritative scope is compatible
     if (options.taskId) {
@@ -1088,13 +1140,8 @@ export class MemoryService {
       }
     }
 
-    // Query active memories within caller scope
-    const candidates = this.memoryRepo.listMemories({
-      scopeType: caller.scope.scopeType,
-      scopeId: caller.scope.scopeId,
-      status: 'ACTIVE',
-      category: options.category
-    });
+    // Query active memories eligible for caller (with inheritance and conflict resolution)
+    const candidates = this.getEligibleCandidateMemories(caller, options.category);
 
     // Configure context builder
     let builder = this.contextBuilder;
@@ -1113,13 +1160,7 @@ export class MemoryService {
       const taskId = options.taskId;
       this.memoryRepo.transaction(() => {
         for (const inc of context.included) {
-          const memory = this.memoryRepo.getMemoryById(inc.id, caller.scope);
-          if (!memory || memory.status !== 'ACTIVE') {
-            throw new ValidationError(
-              `Cannot record injection provenance: memory '${inc.id}' is not active.`
-            );
-          }
-          this.memoryRepo.recordInjection({
+          this.recordTaskInjection(caller, {
             taskId,
             memoryId: inc.id,
             charCount: context.totalChars,
@@ -1133,6 +1174,7 @@ export class MemoryService {
       this.audit(caller, 'MEMORY_RETRIEVED', {
         memoryIds: context.included.map((m) => m.id),
         count: context.included.length,
+        inheritedCount: context.included.filter((m) => m.isInherited).length,
         scopeType: caller.scope.scopeType,
         scopeId: caller.scope.scopeId,
         taskId: options.taskId
@@ -1145,6 +1187,7 @@ export class MemoryService {
   /**
    * Searches active memories within the caller's authorized scope using lexical and keyword ranking.
    * Enforces caller verification, READ permission, task scope alignment (if taskId provided),
+   * same-principal global memory inheritance for workspace callers,
    * strictly excludes zero-relevance results (score <= 0.0), and limits returned records (1-50, default 5).
    */
   public searchMemories(
@@ -1214,13 +1257,8 @@ export class MemoryService {
       }
     }
 
-    // Query active memories within caller scope
-    const candidates = this.memoryRepo.listMemories({
-      scopeType: caller.scope.scopeType,
-      scopeId: caller.scope.scopeId,
-      status: 'ACTIVE',
-      category: options.category
-    });
+    // Query active memories eligible for caller (with inheritance and conflict resolution)
+    const candidates = this.getEligibleCandidateMemories(caller, options.category);
 
     const query = options.query.trim();
     if (!query || candidates.length === 0) {
@@ -1231,10 +1269,21 @@ export class MemoryService {
     const relevant = ranked.filter((scored) => scored.score > 0);
     const limited = relevant.slice(0, limit);
 
-    if (limited.length > 0) {
+    const results: ScoredMemory[] = limited.map((scored) => ({
+      memory: scored.memory,
+      score: scored.score,
+      breakdown: scored.breakdown,
+      isInherited: Boolean(
+        (scored.memory as any)._isInherited ??
+        (scored.memory.scopeType === 'GLOBAL' && caller.scope.scopeType === 'WORKSPACE')
+      )
+    }));
+
+    if (results.length > 0) {
       this.audit(caller, 'MEMORY_RETRIEVED', {
-        memoryIds: limited.map((m) => m.memory.id),
-        count: limited.length,
+        memoryIds: results.map((m) => m.memory.id),
+        count: results.length,
+        inheritedCount: results.filter((m) => m.isInherited).length,
         scopeType: caller.scope.scopeType,
         scopeId: caller.scope.scopeId,
         taskId: options.taskId,
@@ -1242,7 +1291,200 @@ export class MemoryService {
       }, false);
     }
 
-    return limited;
+    return results;
+  }
+
+  /**
+   * Retrieves active candidate memories eligible for the caller, applying workspace isolation,
+   * same-principal global memory inheritance (for workspace callers), active/expiry checks,
+   * and deterministic workspace-over-global conflict resolution.
+   */
+  public getEligibleCandidateMemories(
+    caller: CallerContext,
+    category?: MemoryCategory
+  ): Memory[] {
+    if (caller.scope.scopeType === 'WORKSPACE') {
+      // 1. Retrieve current workspace candidates
+      const workspaceCandidates = this.memoryRepo.listMemories({
+        scopeType: 'WORKSPACE',
+        scopeId: caller.scope.scopeId,
+        status: 'ACTIVE',
+        category
+      }).filter((m) => this.isMemoryEligibleForCaller(m, caller));
+
+      for (const m of workspaceCandidates) {
+        (m as any)._isInherited = false;
+      }
+
+      // 2. Check if caller is authorized to inherit GLOBAL memories
+      const eligibleGlobal: Memory[] = [];
+      const canAccessGlobal =
+        !caller.permittedScopes ||
+        caller.permittedScopes.length === 0 ||
+        caller.permittedScopes.some(
+          (s) => s.scopeType === 'GLOBAL' && s.scopeId === 'default'
+        );
+
+      if (canAccessGlobal) {
+        const rawGlobal = this.memoryRepo.listMemories({
+          scopeType: 'GLOBAL',
+          scopeId: 'default',
+          status: 'ACTIVE',
+          category
+        });
+
+        for (const gm of rawGlobal) {
+          if (this.isMemoryEligibleForCaller(gm, caller)) {
+            (gm as any)._isInherited = true;
+            eligibleGlobal.push(gm);
+          }
+        }
+      }
+
+      // 3. Conflict resolution: deterministic workspace-over-global precedence.
+      // When the same normalized memory key exists in both scopes, the workspace record overrides.
+      const workspaceNormalizedKeys = new Set(
+        workspaceCandidates.map((m) => m.key.trim().toLowerCase())
+      );
+
+      const nonConflictingGlobal = eligibleGlobal.filter(
+        (gm) => !workspaceNormalizedKeys.has(gm.key.trim().toLowerCase())
+      );
+
+      return [...workspaceCandidates, ...nonConflictingGlobal];
+    } else {
+      // GLOBAL scope: retrieve authorized GLOBAL memories only. Never workspace memories.
+      const rawGlobal = this.memoryRepo.listMemories({
+        scopeType: 'GLOBAL',
+        scopeId: 'default',
+        status: 'ACTIVE',
+        category
+      });
+
+      const eligibleGlobal: Memory[] = [];
+      for (const gm of rawGlobal) {
+        if (this.isMemoryEligibleForCaller(gm, caller)) {
+          (gm as any)._isInherited = false;
+          eligibleGlobal.push(gm);
+        }
+      }
+
+      return eligibleGlobal;
+    }
+  }
+
+  /**
+   * Lists active global memories eligible for this caller (used by knowledge proposal duplicate suppression).
+   */
+  public listEligibleGlobalMemories(caller: CallerContext): Memory[] {
+    this.validateCaller(caller, 'READ');
+    const canAccessGlobal =
+      !caller.permittedScopes ||
+      caller.permittedScopes.length === 0 ||
+      caller.permittedScopes.some(
+        (s) => s.scopeType === 'GLOBAL' && s.scopeId === 'default'
+      );
+
+    if (!canAccessGlobal) {
+      return [];
+    }
+
+    const rawGlobal = this.memoryRepo.listMemories({
+      scopeType: 'GLOBAL',
+      scopeId: 'default',
+      status: 'ACTIVE'
+    });
+
+    return rawGlobal.filter((gm) => this.isMemoryEligibleForCaller(gm, caller));
+  }
+
+  /**
+   * Verifies that a memory is active, not expired, and authorized for the caller under
+   * strict same-principal and workspace isolation boundaries.
+   */
+  public isMemoryEligibleForCaller(memory: Memory, caller: CallerContext): boolean {
+    if (!memory || memory.status !== 'ACTIVE') {
+      return false;
+    }
+
+    // Expiry check
+    if (memory.metadataJson) {
+      try {
+        const meta = JSON.parse(memory.metadataJson);
+        if (meta && typeof meta === 'object') {
+          if (meta.expired === true) {
+            return false;
+          }
+          if (typeof meta.expiresAt === 'string') {
+            const expTime = new Date(meta.expiresAt).getTime();
+            if (!isNaN(expTime) && expTime <= Date.now()) {
+              return false;
+            }
+          }
+        }
+      } catch {
+        // malformed metadata handled as ineligible
+        return false;
+      }
+    }
+
+    if (memory.scopeType === 'WORKSPACE') {
+      return caller.scope.scopeType === 'WORKSPACE' && caller.scope.scopeId === memory.scopeId;
+    }
+
+    if (memory.scopeType === 'GLOBAL') {
+      // If caller is in WORKSPACE, verify permittedScopes includes GLOBAL
+      if (caller.scope.scopeType !== 'GLOBAL') {
+        if (caller.permittedScopes && caller.permittedScopes.length > 0) {
+          const hasGlobal = caller.permittedScopes.some(
+            (s) => s.scopeType === 'GLOBAL' && s.scopeId === 'default'
+          );
+          if (!hasGlobal) {
+            return false;
+          }
+        }
+      }
+
+      // Principal/tenant boundary verification
+      const memoryPrincipal = this.extractMemoryPrincipalId(memory);
+      const callerPrincipal = caller.principalId;
+
+      if (callerPrincipal) {
+        // Authenticated principal: memory must belong to the exact same principal
+        return memoryPrincipal === callerPrincipal;
+      }
+
+      // Unidentified caller: if memory has an assigned principal, fail closed
+      if (memoryPrincipal) {
+        return false;
+      }
+
+      // Both caller and memory have no principal (single-tenant local fallback)
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Extracts principal or tenant identifier from memory metadata if present.
+   */
+  public extractMemoryPrincipalId(memory: Memory): string | undefined {
+    if (!memory || !memory.metadataJson) {
+      return undefined;
+    }
+    try {
+      const meta = JSON.parse(memory.metadataJson);
+      if (meta && typeof meta === 'object') {
+        const pid = meta.principalId ?? meta.ownerId ?? meta.tenantId ?? meta.userId ?? meta.createdBy;
+        if (typeof pid === 'string' && pid.trim() !== '') {
+          return pid.trim();
+        }
+      }
+    } catch {
+      return undefined;
+    }
+    return undefined;
   }
 
   /**

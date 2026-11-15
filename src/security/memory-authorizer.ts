@@ -115,12 +115,16 @@ export interface AuthorizeAgentInput {
 export interface AuthorizeSystemInput {
   readonly scope: ScopeIdentifier;
   readonly taskId?: string;
+  readonly principalId?: string;
+  readonly permittedScopes?: readonly ScopeIdentifier[];
 }
 
 export interface CreateTaskWithScopeInput {
   readonly id?: string;
   readonly goal: string;
   readonly scope: ScopeIdentifier;
+  readonly principalId?: string;
+  readonly permittedScopes?: readonly ScopeIdentifier[];
   readonly metadata?: Record<string, unknown>;
 }
 
@@ -296,7 +300,9 @@ export class MemoryAuthorizer {
       actor: 'USER',
       scope,
       permissions,
-      taskId: input.taskId
+      taskId: input.taskId,
+      principalId: principal.principalId,
+      permittedScopes: principal.permittedScopes
     });
   }
 
@@ -327,11 +333,39 @@ export class MemoryAuthorizer {
     // Authoritative scope derived strictly from verified host attestation
     const scope = this.verifyTaskScope(task);
 
+    let principalId: string | undefined;
+    let permittedScopes: readonly ScopeIdentifier[] | undefined;
+
+    if (task.metadataJson) {
+      try {
+        const meta = JSON.parse(task.metadataJson);
+        if (meta && typeof meta === 'object') {
+          if (typeof meta._principalId === 'string' && meta._principalId.trim() !== '') {
+            principalId = meta._principalId.trim();
+          } else if (typeof meta.principalId === 'string' && meta.principalId.trim() !== '') {
+            principalId = meta.principalId.trim();
+          } else if (typeof meta.ownerId === 'string' && meta.ownerId.trim() !== '') {
+            principalId = meta.ownerId.trim();
+          }
+
+          if (Array.isArray(meta._permittedScopes)) {
+            permittedScopes = meta._permittedScopes;
+          } else if (Array.isArray(meta.permittedScopes)) {
+            permittedScopes = meta.permittedScopes;
+          }
+        }
+      } catch {
+        // metadata json error handled in verifyTaskScope
+      }
+    }
+
     return this.#sealContext({
       actor: 'AGENT',
       scope,
       permissions: AGENT_PERMISSIONS,
-      taskId: input.taskId
+      taskId: input.taskId,
+      principalId,
+      permittedScopes
     });
   }
 
@@ -457,6 +491,8 @@ export class MemoryAuthorizer {
     readonly scope: ScopeIdentifier;
     readonly permissions: ReadonlySet<MemoryPermission>;
     readonly taskId?: string;
+    readonly principalId?: string;
+    readonly permittedScopes?: readonly ScopeIdentifier[];
   }): CallerContext {
     const nonce = randomBytes(16).toString('hex');
     const signature = this.#computeHmac(
@@ -475,6 +511,14 @@ export class MemoryAuthorizer {
       }),
       permissions: Object.freeze(new Set(params.permissions)),
       taskId: params.taskId,
+      ...(params.principalId !== undefined ? { principalId: params.principalId } : {}),
+      ...(params.permittedScopes !== undefined
+        ? {
+            permittedScopes: Object.freeze(
+              params.permittedScopes.map((s) => Object.freeze({ scopeType: s.scopeType, scopeId: s.scopeId }))
+            )
+          }
+        : {}),
       _proof: Object.freeze({
         signature,
         nonce
