@@ -49,7 +49,8 @@ const VALID_STATUSES: ReadonlySet<EmbeddingJobStatus> = new Set([
   'PENDING',
   'RUNNING',
   'COMPLETED',
-  'FAILED'
+  'FAILED',
+  'CANCELLED'
 ]);
 
 export class EmbeddingJobRepository {
@@ -82,7 +83,7 @@ export class EmbeddingJobRepository {
     const now = new Date().toISOString();
     const scheduledAt = input.scheduledAt ?? now;
 
-    return this.transaction(() => {
+    const execute = () => {
       // Check for existing PENDING job
       const checkSql = `
         SELECT id FROM embedding_jobs
@@ -153,7 +154,12 @@ export class EmbeddingJobRepository {
         throw new DatabaseError(`Failed to retrieve newly enqueued embedding job '${id}'.`);
       }
       return created;
-    });
+    };
+
+    if (this.db.currentTransactionDepth > 0) {
+      return execute();
+    }
+    return this.transaction(execute);
   }
 
   /**
@@ -161,7 +167,7 @@ export class EmbeddingJobRepository {
    * Enforces strict concurrency = 1 (returns null if any job is already RUNNING).
    */
   public claimNextJob(now = new Date().toISOString(), modelId?: string): EmbeddingJob | null {
-    return this.transaction(() => {
+    const execute = () => {
       // Concurrency Gate: Concurrency is fixed at 1. If any job is currently RUNNING, do not claim.
       const runningRow = this.db.prepare(
         "SELECT id FROM embedding_jobs WHERE status = 'RUNNING' LIMIT 1"
@@ -200,7 +206,12 @@ export class EmbeddingJobRepository {
       }
 
       return this.getJobById(candidate.id);
-    });
+    };
+
+    if (this.db.currentTransactionDepth > 0) {
+      return execute();
+    }
+    return this.transaction(execute);
   }
 
   /**
@@ -212,7 +223,7 @@ export class EmbeddingJobRepository {
       throw new ValidationError('Job ID must be a non-empty string.');
     }
 
-    this.transaction(() => {
+    const execute = () => {
       const updateSql = `
         UPDATE embedding_jobs
         SET status = 'COMPLETED', updated_at = ?
@@ -228,11 +239,67 @@ export class EmbeddingJobRepository {
           AND id != ?
       `;
       this.db.prepare(pruneSql).run(id, id);
-    });
+    };
+
+    if (this.db.currentTransactionDepth > 0) {
+      execute();
+    } else {
+      this.transaction(execute);
+    }
+  }
+
+  /**
+   * Marks a job as CANCELLED. Completed or terminal FAILED jobs cannot be cancelled.
+   */
+  public markJobCancelled(id: string, now = new Date().toISOString()): void {
+    if (!id || typeof id !== 'string' || id.trim() === '') {
+      throw new ValidationError('Job ID must be a non-empty string.');
+    }
+
+    const execute = () => {
+      const sql = `
+        UPDATE embedding_jobs
+        SET status = 'CANCELLED', updated_at = ?
+        WHERE id = ? AND status NOT IN ('COMPLETED', 'FAILED')
+      `;
+      this.db.prepare(sql).run(now, id);
+    };
+
+    if (this.db.currentTransactionDepth > 0) {
+      execute();
+    } else {
+      this.transaction(execute);
+    }
+  }
+
+  /**
+   * Cancels all pending embedding jobs for a given memory ID.
+   * Returns the count of cancelled jobs.
+   */
+  public cancelPendingJobsByMemoryId(memoryId: string, now = new Date().toISOString()): number {
+    if (!memoryId || typeof memoryId !== 'string' || memoryId.trim() === '') {
+      throw new ValidationError('memoryId must be a non-empty string.');
+    }
+
+    const execute = () => {
+      const sql = `
+        UPDATE embedding_jobs
+        SET status = 'CANCELLED', updated_at = ?
+        WHERE memory_id = ? AND status = 'PENDING'
+      `;
+      const result = this.db.prepare(sql).run(now, memoryId);
+      return Number(result.changes);
+    };
+
+    if (this.db.currentTransactionDepth > 0) {
+      return execute();
+    }
+    return this.transaction(execute);
   }
 
   /**
    * Reschedules a job for a future retry attempt.
+   * Cannot revive terminal (FAILED), CANCELLED, or COMPLETED jobs.
    */
   public rescheduleJob(
     id: string,
@@ -248,13 +315,14 @@ export class EmbeddingJobRepository {
     const sql = `
       UPDATE embedding_jobs
       SET status = 'PENDING', attempt_count = ?, scheduled_at = ?, last_error = ?, updated_at = ?
-      WHERE id = ?
+      WHERE id = ? AND status NOT IN ('FAILED', 'CANCELLED', 'COMPLETED')
     `;
     this.db.prepare(sql).run(attemptCount, nextScheduledAt, error ?? null, now, id);
   }
 
   /**
    * Marks a job as terminally FAILED after retry exhaustion or unrecoverable error.
+   * CANCELLED or COMPLETED jobs cannot be marked FAILED.
    */
   public markJobFailed(
     id: string,
@@ -269,7 +337,7 @@ export class EmbeddingJobRepository {
     const sql = `
       UPDATE embedding_jobs
       SET status = 'FAILED', attempt_count = ?, last_error = ?, updated_at = ?
-      WHERE id = ?
+      WHERE id = ? AND status NOT IN ('CANCELLED', 'COMPLETED')
     `;
     this.db.prepare(sql).run(attemptCount, error, now, id);
   }
@@ -278,9 +346,10 @@ export class EmbeddingJobRepository {
    * Recovers jobs left in 'RUNNING' status following process crash or restart.
    * If a job has reached or exceeded maxAttempts, it is marked terminally FAILED.
    * Otherwise it is reset to 'PENDING' with incremented attempt count and scheduled immediately.
+   * Never reactivates CANCELLED, COMPLETED, or FAILED jobs.
    */
   public recoverInterruptedJobs(now = new Date().toISOString()): EmbeddingJob[] {
-    return this.transaction(() => {
+    const execute = () => {
       const selectSql = `
         SELECT * FROM embedding_jobs
         WHERE status = 'RUNNING'
@@ -295,7 +364,7 @@ export class EmbeddingJobRepository {
           const failSql = `
             UPDATE embedding_jobs
             SET status = 'FAILED', attempt_count = ?, last_error = ?, updated_at = ?
-            WHERE id = ?
+            WHERE id = ? AND status = 'RUNNING'
           `;
           this.db.prepare(failSql).run(
             nextAttempt,
@@ -307,7 +376,7 @@ export class EmbeddingJobRepository {
           const retrySql = `
             UPDATE embedding_jobs
             SET status = 'PENDING', attempt_count = ?, scheduled_at = ?, last_error = ?, updated_at = ?
-            WHERE id = ?
+            WHERE id = ? AND status = 'RUNNING'
           `;
           this.db.prepare(retrySql).run(
             nextAttempt,
@@ -325,7 +394,12 @@ export class EmbeddingJobRepository {
       }
 
       return recovered;
-    });
+    };
+
+    if (this.db.currentTransactionDepth > 0) {
+      return execute();
+    }
+    return this.transaction(execute);
   }
 
   /**

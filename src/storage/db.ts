@@ -388,7 +388,7 @@ export class DatabaseManager {
               scope_id TEXT NOT NULL,
               model_id TEXT NOT NULL,
               model_revision TEXT NOT NULL DEFAULT 'main',
-              status TEXT NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED')),
+              status TEXT NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED')),
               attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
               max_attempts INTEGER NOT NULL DEFAULT 5 CHECK (max_attempts > 0),
               scheduled_at TEXT NOT NULL,

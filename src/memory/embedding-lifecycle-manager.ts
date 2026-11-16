@@ -314,6 +314,12 @@ export class EmbeddingLifecycleManager {
 
     // 6. Post-Inference Revalidation & Atomic Persistence:
     this.db.transaction(() => {
+      // Check if job itself was cancelled or deleted during inference
+      const currentJob = this.jobRepo.getJobById(job.id);
+      if (!currentJob || currentJob.status === 'CANCELLED') {
+        return;
+      }
+
       let postMemory: Memory | null = null;
       try {
         postMemory = this.memoryRepo.getMemoryById(job.memoryId, {

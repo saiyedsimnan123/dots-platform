@@ -200,7 +200,7 @@ export interface SyncScopeEmbeddingsResult {
 /**
  * Execution status for asynchronous embedding generation jobs.
  */
-export type EmbeddingJobStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+export type EmbeddingJobStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 
 /**
  * Domain entity representing a persistent, SQLite-backed embedding job.

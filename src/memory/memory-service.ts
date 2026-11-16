@@ -749,6 +749,18 @@ export class MemoryService {
       }
 
       const archived = this.memoryRepo.archiveMemory(id, caller.scope);
+
+      // Phase 4C.6C Archive Lifecycle Cleanup:
+      // 1. Remove stored embeddings for this memory
+      if (this.embeddingRepo) {
+        this.embeddingRepo.deleteEmbeddingsByMemoryId(id);
+      }
+
+      // 2. Cancel pending embedding jobs for this memory
+      if (this.embeddingJobRepo) {
+        this.embeddingJobRepo.cancelPendingJobsByMemoryId(id);
+      }
+
       this.audit(caller, 'MEMORY_ARCHIVED', {
         memoryId: archived.id,
         category: archived.category,
@@ -956,6 +968,15 @@ export class MemoryService {
           modelId,
           modelRevision
         });
+      }
+
+      if (newStatus === 'ARCHIVED') {
+        if (this.embeddingRepo) {
+          this.embeddingRepo.deleteEmbeddingsByMemoryId(updated.id);
+        }
+        if (this.embeddingJobRepo) {
+          this.embeddingJobRepo.cancelPendingJobsByMemoryId(updated.id);
+        }
       }
 
       // Mandatory audit write for proposal decision
