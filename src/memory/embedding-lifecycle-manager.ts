@@ -132,10 +132,11 @@ export class EmbeddingLifecycleManager {
    * 1. Stops accepting or claiming new jobs immediately.
    * 2. Clears polling timers.
    * 3. Awaits completion of any in-flight inference/persistence up to timeoutMs.
+   * Returns true if all in-flight work drained successfully; false if timed out while in-flight work is still active.
    */
-  public async stop(timeoutMs = 5000): Promise<void> {
-    if (!this.isRunning && !this.isStopping) {
-      return;
+  public async stop(timeoutMs = 5000): Promise<boolean> {
+    if (!this.isRunning && !this.isStopping && !this.isProcessing) {
+      return true;
     }
 
     this.isStopping = true;
@@ -146,15 +147,56 @@ export class EmbeddingLifecycleManager {
       this.pollTimer = null;
     }
 
+    let drained = true;
     if (this.inFlightPromise) {
-      await Promise.race([
-        this.inFlightPromise,
-        new Promise((resolve) => setTimeout(resolve, timeoutMs))
+      let timer: NodeJS.Timeout | null = null;
+      const timeoutPromise = new Promise<'timeout'>((resolve) => {
+        timer = setTimeout(() => resolve('timeout'), Math.max(1, timeoutMs));
+      });
+
+      const outcome = await Promise.race([
+        this.inFlightPromise.then(() => 'drained' as const, () => 'drained' as const),
+        timeoutPromise
       ]);
+
+      if (timer) {
+        clearTimeout(timer);
+      }
+
+      if (outcome === 'timeout') {
+        drained = false;
+      }
     }
 
+    if (drained) {
+      this.isStopping = false;
+      this.isStopped = true;
+    }
+
+    return drained;
+  }
+
+  /**
+   * Unconditionally waits for any currently active in-flight embedding operation to finish.
+   * Guarantees that the worker has completely finished interacting with SQLite before database closure.
+   */
+  public async waitForInFlight(): Promise<void> {
+    if (this.inFlightPromise) {
+      try {
+        await this.inFlightPromise;
+      } catch {
+        // Prevent unhandled rejections during shutdown
+      }
+    }
     this.isStopping = false;
     this.isStopped = true;
+  }
+
+  /**
+   * Reports whether there is currently an in-flight job being processed.
+   */
+  public get hasInFlightWork(): boolean {
+    return this.isProcessing || this.inFlightPromise !== null;
   }
 
   /**
@@ -175,7 +217,7 @@ export class EmbeddingLifecycleManager {
    * Returns true if a job was processed; false if the queue was empty or worker is busy.
    */
   public async processNextJob(now = new Date().toISOString()): Promise<boolean> {
-    if (this.isStopped || this.isStopping || this.isProcessing) {
+    if (this.isStopped || this.isStopping || this.isProcessing || !this.db.isOpen) {
       return false;
     }
 
@@ -313,6 +355,10 @@ export class EmbeddingLifecycleManager {
     }
 
     // 6. Post-Inference Revalidation & Atomic Persistence:
+    if (!this.db.isOpen || this.isStopped) {
+      return;
+    }
+
     this.db.transaction(() => {
       // Check if job itself was cancelled or deleted during inference
       const currentJob = this.jobRepo.getJobById(job.id);

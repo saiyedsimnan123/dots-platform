@@ -31,6 +31,19 @@ This document describes the **implemented** Phase 8A–8C operational interfaces
 | `DOTS_ENABLE_DYNAMIC_REPLAN` | `false` | Enable dynamic replanning on step exhaustion. |
 | `DOTS_ENABLE_COMPENSATION` | `true` | Roll back workspace mutations on failed workflows. |
 | `DOTS_ENABLE_SCHEDULER` | `true` | Enable persistent scheduler loop in `DotsRuntime.start()`. |
+| `DOTS_EMBEDDING_PROVIDER` | `none` | Embedding provider mode (`none`, `local`, `mock`). Default `none` preserves lexical-only operation. |
+| `DOTS_EMBEDDING_MODEL_ID` | `onnx-community/all-MiniLM-L6-v2-ONNX` (or `mock-deterministic-v1` for `mock`) | Identifier of sentence embedding model. |
+| `DOTS_EMBEDDING_MODEL_REVISION` | `main` | Git revision or commit tag of the embedding model. |
+| `DOTS_EMBEDDING_POLL_INTERVAL_MS` | `1000` | Background embedding lifecycle manager queue poll interval in milliseconds. |
+| `DOTS_EMBEDDING_LOCAL_MODEL_PATH` | *Optional* | Absolute path to local pre-downloaded model assets for offline `local` provider execution. |
+
+### Memory Embedding Subsystem & Local Model Availability
+
+The platform features an asynchronous, local-first memory embedding subsystem:
+- **`none` (Default)**: Memory creation, proposal approval, and retrieval function 100% in deterministic lexical mode without background embedding workers.
+- **`local`**: Uses `@huggingface/transformers` with ONNX Runtime CPU execution. By default, `allowRemoteModels = false` to guarantee that no unexpected remote network calls or downloads take place. Models must be pre-downloaded or pointed to via `DOTS_EMBEDDING_LOCAL_MODEL_PATH`.
+- **`mock`**: Deterministic offline test provider using pseudo-random hashing for reproducible automated testing without model files.
+- **Graceful Drain on Shutdown**: When `DotsRuntime.stop()` is invoked, the embedding worker is stopped and in-flight operations are drained before SQLite is closed, preventing unhandled connection errors.
 
 ---
 

@@ -77,9 +77,16 @@ import { AgentRegistry, ResearchAgent, AnalyticsAgent, DeveloperAgent, type Agen
 import { TaskScheduler } from '../scheduler/task-scheduler.ts';
 import { RuntimeEventBus } from './event-bus.ts';
 import { OperationalLogger } from './logger.ts';
+import { MemoryEmbeddingRepository } from '../storage/memory-embedding-repository.ts';
+import { EmbeddingJobRepository } from '../storage/embedding-job-repository.ts';
+import type { IEmbeddingProvider } from '../memory/embedding-types.ts';
+import { EmbeddingLifecycleManager } from '../memory/embedding-lifecycle-manager.ts';
+import { LocalEmbeddingProvider } from '../memory/local-embedding-provider.ts';
+import { DeterministicMockEmbeddingProvider } from '../memory/mock-embedding-provider.ts';
 import {
   loadRuntimeConfig,
   type ConfiguredWebSearchProviderMode,
+  type ConfiguredEmbeddingProviderMode,
   type DotsRuntimeConfig,
   type LoadRuntimeConfigOverrides
 } from './config.ts';
@@ -148,9 +155,11 @@ export function toPublicMessageView(m: ConversationMessage): PublicMessageView {
   };
 }
 
-export interface DotsRuntimeOptions extends Omit<LoadRuntimeConfigOverrides, 'webSearchProvider'> {
+export interface DotsRuntimeOptions extends Omit<LoadRuntimeConfigOverrides, 'webSearchProvider' | 'embeddingProvider'> {
   readonly modelProvider?: IModelProvider;
   readonly webSearchProvider?: IWebSearchProvider | ConfiguredWebSearchProviderMode;
+  readonly embeddingProvider?: IEmbeddingProvider | ConfiguredEmbeddingProviderMode;
+  readonly lifecycleManager?: EmbeddingLifecycleManager;
   readonly logger?: OperationalLogger;
   readonly eventBus?: RuntimeEventBus;
   readonly agentRegistry?: AgentRegistry;
@@ -206,6 +215,10 @@ export class DotsRuntime {
   public readonly auditRepo: AuditRepository;
   public readonly memoryRepo: MemoryRepository;
   public readonly scheduleRepo: ScheduleRepository;
+  public readonly embeddingRepo: MemoryEmbeddingRepository;
+  public readonly embeddingJobRepo: EmbeddingJobRepository;
+  public readonly embeddingProvider: IEmbeddingProvider | null;
+  public readonly lifecycleManager: EmbeddingLifecycleManager | null;
   public readonly identityProvider: TokenIdentityProvider;
   public readonly authorizer: MemoryAuthorizer;
   public readonly memoryService: MemoryService;
@@ -230,14 +243,24 @@ export class DotsRuntime {
   private stopped: boolean = false;
 
   constructor(options: DotsRuntimeOptions = {}) {
-    const { webSearchProvider: searchOverride, ...configOverrides } = options;
+    const {
+      webSearchProvider: searchOverride,
+      embeddingProvider: embeddingOverride,
+      lifecycleManager: customLifecycleManager,
+      ...configOverrides
+    } = options;
     const searchMode =
       typeof searchOverride === 'string'
         ? (searchOverride as ConfiguredWebSearchProviderMode)
         : undefined;
+    const embeddingMode =
+      typeof embeddingOverride === 'string'
+        ? (embeddingOverride as ConfiguredEmbeddingProviderMode)
+        : undefined;
     this.config = loadRuntimeConfig({
       ...configOverrides,
-      ...(searchMode ? { webSearchProvider: searchMode } : {})
+      ...(searchMode ? { webSearchProvider: searchMode } : {}),
+      ...(embeddingMode ? { embeddingProvider: embeddingMode } : {})
     });
     this.logger =
       options.logger ??
@@ -252,6 +275,45 @@ export class DotsRuntime {
     this.auditRepo = new AuditRepository(this.db);
     this.memoryRepo = new MemoryRepository(this.db);
     this.scheduleRepo = new ScheduleRepository(this.db);
+    this.embeddingRepo = new MemoryEmbeddingRepository(this.db);
+    this.embeddingJobRepo = new EmbeddingJobRepository(this.db);
+
+    if (embeddingOverride && typeof embeddingOverride === 'object') {
+      this.embeddingProvider = embeddingOverride;
+    } else if (this.config.embeddingProvider === 'local') {
+      this.embeddingProvider = new LocalEmbeddingProvider({
+        modelId: this.config.embeddingModelId,
+        modelRevision: this.config.embeddingModelRevision,
+        dimensions: this.config.embeddingDimensions,
+        localModelPath: this.config.embeddingLocalModelPath,
+        allowRemoteModels: false
+      });
+    } else if (this.config.embeddingProvider === 'mock') {
+      this.embeddingProvider = new DeterministicMockEmbeddingProvider({
+        modelId: this.config.embeddingModelId,
+        modelRevision: this.config.embeddingModelRevision,
+        dimensions: this.config.embeddingDimensions
+      });
+    } else {
+      this.embeddingProvider = null;
+    }
+
+    if (customLifecycleManager) {
+      this.lifecycleManager = customLifecycleManager;
+    } else if (this.embeddingProvider) {
+      this.lifecycleManager = new EmbeddingLifecycleManager({
+        db: this.db,
+        jobRepo: this.embeddingJobRepo,
+        memoryRepo: this.memoryRepo,
+        embeddingRepo: this.embeddingRepo,
+        provider: this.embeddingProvider,
+        auditRepo: this.auditRepo,
+        pollIntervalMs: this.config.embeddingPollIntervalMs,
+        autoStart: false
+      });
+    } else {
+      this.lifecycleManager = null;
+    }
 
     this.identityProvider = new TokenIdentityProvider(this.config.tokens);
     this.hostAuthority = new HostMemoryAuthority({
@@ -266,7 +328,11 @@ export class DotsRuntime {
       auditRepo: this.auditRepo,
       taskRepo: this.taskRepo,
       authorizer: this.authorizer,
-      hostAuthority: this.hostAuthority
+      hostAuthority: this.hostAuthority,
+      embeddingRepo: this.embeddingRepo,
+      embeddingJobRepo: this.embeddingJobRepo,
+      embeddingProvider: this.embeddingProvider ?? undefined,
+      lifecycleManager: this.lifecycleManager ?? undefined
     });
 
     this.toolRegistry = new ToolRegistry();
@@ -397,9 +463,35 @@ export class DotsRuntime {
       await this.scheduler.start();
     }
 
+    if (this.lifecycleManager) {
+      try {
+        await this.lifecycleManager.start();
+        this.logger.info('runtime', 'embedding_worker_started', {
+          provider: this.embeddingProvider?.name,
+          modelId: this.embeddingProvider?.modelId,
+          modelRevision: (this.embeddingProvider as any)?.modelRevision,
+          pollIntervalMs: this.config.embeddingPollIntervalMs
+        });
+      } catch (err) {
+        this.logger.error('runtime', 'embedding_worker_start_failed', {
+          error: err instanceof Error ? err.message : String(err)
+        });
+        if (this.config.enableScheduler) {
+          try {
+            await this.scheduler.stop();
+          } catch {
+            // best-effort cleanup
+          }
+        }
+        this.started = false;
+        throw err;
+      }
+    }
+
     this.logger.info('runtime', 'started', {
       provider: this.modelProvider.name,
       schedulerEnabled: this.config.enableScheduler,
+      embeddingProvider: this.embeddingProvider ? this.embeddingProvider.name : 'none',
       workspaceRoot: this.config.workspaceRoot
     });
   }
@@ -411,7 +503,21 @@ export class DotsRuntime {
     this.stopped = true;
     this.started = false;
 
+    // 1. Stop persistent scheduler loop
     await this.scheduler.stop();
+
+    // 2. Stop embedding lifecycle manager worker and drain in-flight operations
+    if (this.lifecycleManager) {
+      const drained = await this.lifecycleManager.stop(5000);
+      if (!drained) {
+        this.logger.warn('runtime', 'embedding_worker_drain_timeout', {
+          message: 'In-flight embedding operation exceeded stop timeout. Awaiting completion before closing database.'
+        });
+        await this.lifecycleManager.waitForInFlight();
+      }
+    }
+
+    // 3. Close database connection
     this.db.close();
 
     this.logger.info('runtime', 'stopped');
@@ -423,7 +529,10 @@ export class DotsRuntime {
       uptimeMs: Date.now() - this.startedAtMs,
       schedulerEnabled: this.config.enableScheduler,
       provider: this.modelProvider.name,
-      modelId: this.modelProvider.modelId
+      modelId: this.modelProvider.modelId,
+      embeddingProvider: this.embeddingProvider ? this.embeddingProvider.name : 'none',
+      embeddingEnabled: Boolean(this.embeddingProvider),
+      embeddingWorkerActive: Boolean(this.lifecycleManager?.active)
     };
   }
 
@@ -773,3 +882,9 @@ export class DotsRuntime {
     };
   }
 }
+
+/**
+ * Backward and alias compatibility: DotsApp is the operational application runtime.
+ */
+export const DotsApp = DotsRuntime;
+export type DotsApp = DotsRuntime;

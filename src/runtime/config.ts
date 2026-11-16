@@ -15,9 +15,15 @@ import { validateScope } from '../security/memory-authorizer.ts';
 import type { TokenPrincipalConfig } from '../security/token-identity-provider.ts';
 import type { LogLevel } from './logger.ts';
 import { ValidationError } from '../domain/errors.ts';
+import {
+  DEFAULT_LOCAL_EMBEDDING_MODEL,
+  DEFAULT_LOCAL_EMBEDDING_REVISION,
+  DEFAULT_LOCAL_EMBEDDING_DIMENSIONS
+} from '../memory/local-embedding-provider.ts';
 
 export type ConfiguredProviderMode = 'mock' | 'gemini';
 export type ConfiguredWebSearchProviderMode = 'duckduckgo' | 'searxng' | 'mock' | 'none';
+export type ConfiguredEmbeddingProviderMode = 'none' | 'local' | 'mock';
 
 export interface DotsRuntimeConfig {
   readonly dbPath: string;
@@ -42,6 +48,12 @@ export interface DotsRuntimeConfig {
   readonly maxConversationHistory: number;
   readonly webSearchProvider: ConfiguredWebSearchProviderMode;
   readonly searxngUrl?: string;
+  readonly embeddingProvider: ConfiguredEmbeddingProviderMode;
+  readonly embeddingModelId: string;
+  readonly embeddingModelRevision: string;
+  readonly embeddingPollIntervalMs: number;
+  readonly embeddingDimensions: number;
+  readonly embeddingLocalModelPath?: string;
 }
 
 export interface LoadRuntimeConfigOverrides {
@@ -67,6 +79,12 @@ export interface LoadRuntimeConfigOverrides {
   readonly maxConversationHistory?: number;
   readonly webSearchProvider?: ConfiguredWebSearchProviderMode;
   readonly searxngUrl?: string;
+  readonly embeddingProvider?: ConfiguredEmbeddingProviderMode;
+  readonly embeddingModelId?: string;
+  readonly embeddingModelRevision?: string;
+  readonly embeddingPollIntervalMs?: number;
+  readonly embeddingDimensions?: number;
+  readonly embeddingLocalModelPath?: string;
   readonly requireTokens?: boolean;
   readonly env?: Record<string, string | undefined>;
 }
@@ -255,6 +273,49 @@ export function loadRuntimeConfig(overrides: LoadRuntimeConfigOverrides = {}): D
     throw new ValidationError("Web search provider 'searxng' selected but DOTS_SEARXNG_URL is not configured.");
   }
 
+  const embeddingProviderRaw = (
+    overrides.embeddingProvider ??
+    env.DOTS_EMBEDDING_PROVIDER?.trim() ??
+    'none'
+  ).toLowerCase();
+
+  const VALID_EMBEDDING_PROVIDERS: ReadonlySet<string> = new Set(['none', 'local', 'mock']);
+  if (!VALID_EMBEDDING_PROVIDERS.has(embeddingProviderRaw)) {
+    throw new ValidationError(
+      `Invalid embedding provider '${embeddingProviderRaw}'. Must be 'none', 'local', or 'mock'.`
+    );
+  }
+
+  const embeddingPollIntervalMs =
+    overrides.embeddingPollIntervalMs ??
+    parsePositiveInt(env.DOTS_EMBEDDING_POLL_INTERVAL_MS, 1000, 'DOTS_EMBEDDING_POLL_INTERVAL_MS');
+
+  const rawModelId = overrides.embeddingModelId ?? env.DOTS_EMBEDDING_MODEL_ID?.trim();
+  if (rawModelId !== undefined && rawModelId.trim() === '') {
+    throw new ValidationError("Configuration 'DOTS_EMBEDDING_MODEL_ID' must be a non-empty string.");
+  }
+  const defaultModelId = embeddingProviderRaw === 'mock'
+    ? 'mock-deterministic-v1'
+    : DEFAULT_LOCAL_EMBEDDING_MODEL;
+  const embeddingModelId = rawModelId || defaultModelId;
+
+  const rawRevision = overrides.embeddingModelRevision ?? env.DOTS_EMBEDDING_MODEL_REVISION?.trim();
+  if (rawRevision !== undefined && rawRevision.trim() === '') {
+    throw new ValidationError("Configuration 'DOTS_EMBEDDING_MODEL_REVISION' must be a non-empty string.");
+  }
+  const embeddingModelRevision = rawRevision || DEFAULT_LOCAL_EMBEDDING_REVISION;
+
+  if (overrides.embeddingDimensions !== undefined) {
+    if (!Number.isInteger(overrides.embeddingDimensions) || overrides.embeddingDimensions <= 0) {
+      throw new ValidationError(
+        `Configuration 'embeddingDimensions' must be a positive integer. Received '${overrides.embeddingDimensions}'.`
+      );
+    }
+  }
+  const embeddingDimensions = overrides.embeddingDimensions ?? DEFAULT_LOCAL_EMBEDDING_DIMENSIONS;
+
+  const embeddingLocalModelPath = overrides.embeddingLocalModelPath ?? (env.DOTS_EMBEDDING_LOCAL_MODEL_PATH?.trim() || undefined);
+
   return {
     dbPath,
     workspaceRoot,
@@ -281,6 +342,12 @@ export function loadRuntimeConfig(overrides: LoadRuntimeConfigOverrides = {}): D
       overrides.maxConversationHistory ??
       parsePositiveInt(env.DOTS_MAX_CONVERSATION_HISTORY, 50, 'DOTS_MAX_CONVERSATION_HISTORY'),
     webSearchProvider: webSearchProviderRaw as ConfiguredWebSearchProviderMode,
-    searxngUrl
+    searxngUrl,
+    embeddingProvider: embeddingProviderRaw as ConfiguredEmbeddingProviderMode,
+    embeddingModelId,
+    embeddingModelRevision,
+    embeddingPollIntervalMs,
+    embeddingDimensions,
+    embeddingLocalModelPath
   };
 }

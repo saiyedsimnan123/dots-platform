@@ -44,6 +44,7 @@ export interface RecordedEmbeddingCall {
 export interface MockEmbeddingProviderOptions {
   readonly name?: string;
   readonly modelId?: string;
+  readonly modelRevision?: string;
   readonly dimensions?: number;
   readonly available?: boolean;
 }
@@ -51,6 +52,7 @@ export interface MockEmbeddingProviderOptions {
 export class DeterministicMockEmbeddingProvider implements IEmbeddingProvider {
   public readonly name: string;
   public readonly modelId: string;
+  public readonly modelRevision: string;
   public readonly dimensions: number;
 
   private _available: boolean;
@@ -62,6 +64,7 @@ export class DeterministicMockEmbeddingProvider implements IEmbeddingProvider {
   constructor(options: MockEmbeddingProviderOptions = {}) {
     this.name = options.name ?? 'mock-embedding-provider';
     this.modelId = options.modelId ?? 'mock-deterministic-v1';
+    this.modelRevision = options.modelRevision ?? 'main';
     this.dimensions = options.dimensions ?? 384;
     this._available = options.available ?? true;
 
