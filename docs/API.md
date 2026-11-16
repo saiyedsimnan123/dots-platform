@@ -45,6 +45,62 @@ The platform features an asynchronous, local-first memory embedding subsystem:
 - **`mock`**: Deterministic offline test provider using pseudo-random hashing for reproducible automated testing without model files.
 - **Graceful Drain on Shutdown**: When `DotsRuntime.stop()` is invoked, the embedding worker is stopped and in-flight operations are drained before SQLite is closed, preventing unhandled connection errors.
 
+### Real Local MiniLM Embedding Guide (Phase 4C.9A)
+
+To enable real local semantic memory retrieval powered by `onnx-community/all-MiniLM-L6-v2-ONNX`:
+
+#### 1. Install Optional Runtime
+The `@huggingface/transformers` runtime is an optional dependency to keep the core platform lightweight and free of mandatory native binary dependencies:
+```bash
+npm install --save-optional @huggingface/transformers@^3.8.1
+```
+
+#### 2. Model Preparation & Cache Location
+Dots enforces strict offline-first execution (`allowRemoteModels = false`), meaning the platform will never initiate unannounced downloads from the Hugging Face Hub during operation.
+
+Model assets must be placed in a local directory outside the repository:
+- **Default cache directory**: `~/.cache/dots-models` (Linux/macOS: `$HOME/.cache/dots-models`, Windows: `%USERPROFILE%\.cache\dots-models`)
+- **Custom directory**: Configure via `DOTS_EMBEDDING_LOCAL_MODEL_PATH=/path/to/models`
+
+Required model structure:
+```text
+<cache-dir>/onnx-community/all-MiniLM-L6-v2-ONNX/
+├── config.json
+├── tokenizer.json
+├── tokenizer_config.json
+└── onnx/
+    ├── model.onnx
+    └── model.onnx_data
+```
+
+#### 3. Windows and Linux Environment Considerations
+- **Operating Systems**: Supported on Linux (x64/arm64) and Windows (x64).
+- **Execution Backend**: Uses ONNX Runtime CPU/WASM execution. No GPU drivers or CUDA configurations required.
+- **Paths**: On Windows, forward slashes (`/`) or escaped backslashes (`\\`) may be used in `DOTS_EMBEDDING_LOCAL_MODEL_PATH`. Standard home directory expansion resolves correctly across both Windows (`%USERPROFILE%`) and POSIX (`$HOME`).
+- **Memory Footprint**: Designed and validated for constrained environments (e.g., 8 GB RAM laptop). Measured memory overhead: ~14 MB heap delta and ~120 MB RSS for ONNX runtime shared libraries.
+
+#### 4. Offline Execution Configuration
+To run Dots in local semantic embedding mode:
+```bash
+export DOTS_EMBEDDING_PROVIDER=local
+export DOTS_EMBEDDING_LOCAL_MODEL_PATH=~/.cache/dots-models  # optional if using default location
+```
+When `DOTS_EMBEDDING_PROVIDER=local`, active memories automatically trigger durable embedding jobs processed in the background by `EmbeddingLifecycleManager`. Memory retrieval automatically uses hybrid scoring combining lexical relevance and cosine similarity.
+
+#### 5. Real-Model Validation Command
+To execute the comprehensive real ONNX validation suite:
+```bash
+DOTS_RUN_REAL_MODEL_TESTS=1 node --test tests/unit/real-local-embedding-validation.test.ts
+```
+
+#### 6. Troubleshooting
+- **`EmbeddingProviderUnavailableError` (Package not installed)**:
+  Run `npm install --save-optional @huggingface/transformers@^3.8.1`.
+- **`EmbeddingProviderUnavailableError` (Model not found)**:
+  Ensure model assets are present in `~/.cache/dots-models` or the path specified by `DOTS_EMBEDDING_LOCAL_MODEL_PATH`. Because `allowRemoteModels = false` by default, Dots will not automatically fetch missing files over the network.
+- **Fallback to Lexical Retrieval**:
+  If the embedding provider is disabled (`DOTS_EMBEDDING_PROVIDER=none`) or temporarily unavailable, memory search automatically degrades gracefully to lexical retrieval (`LEXICAL_ONLY` or `LEXICAL_FALLBACK`) without crashing or aborting user queries.
+
 ---
 
 ## 2. Authentication, Scope Isolation & Roles

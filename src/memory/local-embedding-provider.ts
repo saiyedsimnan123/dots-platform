@@ -21,6 +21,9 @@
  *    and integration tests run deterministically without internet access or package installation.
  */
 
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import type { IEmbeddingProvider, EmbeddingOptions } from './embedding-types.ts';
 import { MAX_EMBEDDING_TEXT_LENGTH, MAX_EMBEDDING_BATCH_SIZE } from './embedding-types.ts';
 import {
@@ -130,6 +133,25 @@ export interface EmbeddingModelDescriptor {
 }
 
 /**
+ * Resolves the default local directory where pre-downloaded model assets reside.
+ * Checks DOTS_EMBEDDING_LOCAL_MODEL_PATH first, then ~/.cache/dots-models.
+ */
+export function resolveDefaultLocalModelPath(): string | undefined {
+  if (process.env.DOTS_EMBEDDING_LOCAL_MODEL_PATH?.trim()) {
+    return process.env.DOTS_EMBEDDING_LOCAL_MODEL_PATH.trim();
+  }
+  try {
+    const defaultDir = join(homedir(), '.cache', 'dots-models');
+    if (existsSync(defaultDir)) {
+      return defaultDir;
+    }
+  } catch {
+    // Graceful fallback if filesystem access is restricted
+  }
+  return undefined;
+}
+
+/**
  * Production pipeline loader that dynamically loads `@huggingface/transformers` at runtime.
  * Fails safely with EmbeddingProviderUnavailableError if the package is not installed.
  */
@@ -209,7 +231,7 @@ export class LocalEmbeddingProvider implements IEmbeddingProvider {
     this.modelRevision = options.modelRevision ?? DEFAULT_LOCAL_EMBEDDING_REVISION;
     this.dimensions = options.dimensions ?? DEFAULT_LOCAL_EMBEDDING_DIMENSIONS;
     this.runtimeVersion = DEFAULT_LOCAL_RUNTIME_VERSION;
-    this.localModelPath = options.localModelPath;
+    this.localModelPath = options.localModelPath ?? resolveDefaultLocalModelPath();
     this.allowRemoteModels = options.allowRemoteModels ?? false;
     this.device = options.device ?? 'cpu';
     this.pipelineLoader = options.pipelineLoader ?? defaultTransformersPipelineLoader;

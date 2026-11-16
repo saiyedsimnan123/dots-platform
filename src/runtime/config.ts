@@ -7,6 +7,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { ScopeIdentifier } from '../domain/types.ts';
@@ -314,7 +315,12 @@ export function loadRuntimeConfig(overrides: LoadRuntimeConfigOverrides = {}): D
   }
   const embeddingDimensions = overrides.embeddingDimensions ?? DEFAULT_LOCAL_EMBEDDING_DIMENSIONS;
 
-  const embeddingLocalModelPath = overrides.embeddingLocalModelPath ?? (env.DOTS_EMBEDDING_LOCAL_MODEL_PATH?.trim() || undefined);
+  const defaultLocalModelPath =
+    env.DOTS_EMBEDDING_LOCAL_MODEL_PATH?.trim() ||
+    (existsSync(resolve(homedir(), '.cache', 'dots-models'))
+      ? resolve(homedir(), '.cache', 'dots-models')
+      : undefined);
+  const embeddingLocalModelPath = overrides.embeddingLocalModelPath ?? defaultLocalModelPath;
 
   return {
     dbPath,

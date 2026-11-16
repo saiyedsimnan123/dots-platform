@@ -368,7 +368,21 @@ test('LocalEmbeddingProvider - throws EmbeddingProviderUnavailableError when opt
   );
 });
 
-test('LocalEmbeddingProvider - default pipeline loader throws EmbeddingProviderUnavailableError when package is not installed', async () => {
+test('LocalEmbeddingProvider - default pipeline loader throws EmbeddingProviderUnavailableError when package is not installed', async (t) => {
+  let isPackageInstalled = false;
+  try {
+    // @ts-ignore
+    await import('@huggingface/transformers');
+    isPackageInstalled = true;
+  } catch {
+    isPackageInstalled = false;
+  }
+
+  if (isPackageInstalled) {
+    t.skip('Package @huggingface/transformers is installed in environment.');
+    return;
+  }
+
   // Construct provider without injecting custom loader (using defaultTransformersPipelineLoader)
   const provider = new LocalEmbeddingProvider();
   assert.equal(await provider.isAvailable(), false);

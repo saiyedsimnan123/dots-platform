@@ -15,6 +15,9 @@
  * 10. Optional real model execution gated behind explicit environment configuration.
  */
 
+import { unlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -424,18 +427,16 @@ test('5. Security: Multi-tenant workspace isolation is strictly preserved in loc
 });
 
 // ============================================================================
-// 6. Optional Real Model Execution (Gated by DOTS_RUN_REAL_MODEL_TESTS)
+// 6. Real ONNX Model Validation Suite (Gated by DOTS_RUN_REAL_MODEL_TESTS)
 // ============================================================================
 
-test('6. Real ONNX Model: Optional execution when explicitly enabled via DOTS_RUN_REAL_MODEL_TESTS', async (t) => {
+test('6A. Real ONNX Model: Actual inference, dimensions, normalization, semantic separation, and batching', async (t) => {
   const runReal = process.env.DOTS_RUN_REAL_MODEL_TESTS === '1';
-
   if (!runReal) {
     t.skip('Real ONNX model test skipped (DOTS_RUN_REAL_MODEL_TESTS != 1). Run with DOTS_RUN_REAL_MODEL_TESTS=1 when model is downloaded.');
     return;
   }
 
-  // If explicitly enabled, test real Transformers.js pipeline
   let transformers: any;
   try {
     // @ts-ignore
@@ -452,7 +453,305 @@ test('6. Real ONNX Model: Optional execution when explicitly enabled via DOTS_RU
     return;
   }
 
-  const vec = await realProvider.embed('Real ONNX sentence embedding validation');
-  assert.equal(vec.length, 384);
-  assert.ok(isNormalized(vec));
+  // Test sentences
+  const sDevOps1 = 'Kubernetes infrastructure deployment and container cluster management';
+  const sDevOps2 = 'Docker container pod orchestration in cloud environments';
+  const sFinance = 'Corporate annual tax accounting and financial audit reporting';
+  const sFood = 'Fresh Mediterranean salad recipe with olive oil and cucumber';
+
+  // 1. Generate real ONNX embeddings
+  const vDevOps1 = await realProvider.embed(sDevOps1);
+  const vDevOps2 = await realProvider.embed(sDevOps2);
+  const vFinance = await realProvider.embed(sFinance);
+  const vFood = await realProvider.embed(sFood);
+
+  // 2. Exact 384 dimensions
+  assert.equal(vDevOps1.length, 384);
+  assert.equal(vDevOps2.length, 384);
+  assert.equal(vFinance.length, 384);
+  assert.equal(vFood.length, 384);
+
+  // 3. Finite numbers
+  validateVector(vDevOps1, 384, 'vDevOps1');
+  validateVector(vDevOps2, 384, 'vDevOps2');
+  validateVector(vFinance, 384, 'vFinance');
+  validateVector(vFood, 384, 'vFood');
+
+  // 4. L2 Normalization (||v|| = 1.0)
+  assert.ok(isNormalized(vDevOps1, 1e-4));
+  assert.ok(isNormalized(vDevOps2, 1e-4));
+  assert.ok(isNormalized(vFinance, 1e-4));
+  assert.ok(isNormalized(vFood, 1e-4));
+
+  // 5. Semantic similarity: related sentences score high
+  const simRelated = cosineSimilarity(vDevOps1, vDevOps2);
+  assert.ok(
+    simRelated >= 0.60,
+    `Related DevOps sentences must have high cosine similarity (expected >= 0.60, got ${simRelated.toFixed(4)})`
+  );
+
+  // 6. Semantic dissimilarity: unrelated sentences score low
+  const simFinance = cosineSimilarity(vDevOps1, vFinance);
+  assert.ok(
+    simFinance <= 0.20,
+    `DevOps vs Finance must have low cosine similarity (expected <= 0.20, got ${simFinance.toFixed(4)})`
+  );
+
+  const simFood = cosineSimilarity(vDevOps1, vFood);
+  assert.ok(
+    simFood <= 0.20,
+    `DevOps vs Food must have low cosine similarity (expected <= 0.20, got ${simFood.toFixed(4)})`
+  );
+
+  // 7. Deterministic repeatability
+  const vDevOps1Repeat = await realProvider.embed(sDevOps1);
+  assert.equal(cosineSimilarity(vDevOps1, vDevOps1Repeat), 1.0);
+  for (let i = 0; i < 384; i++) {
+    assert.equal(vDevOps1[i], vDevOps1Repeat[i]);
+  }
+
+  // 8. Batch inference
+  const batchVectors = await realProvider.embedBatch([sDevOps1, sDevOps2]);
+  assert.equal(batchVectors.length, 2);
+  assert.equal(batchVectors[0].length, 384);
+  assert.equal(batchVectors[1].length, 384);
+  for (let i = 0; i < 384; i++) {
+    assert.equal(batchVectors[0][i], vDevOps1[i]);
+    assert.equal(batchVectors[1][i], vDevOps2[i]);
+  }
+});
+
+test('6B. Real ONNX Model: End-to-end Dots runtime integration, SQLite persistence, retrieval, and isolation', async (t) => {
+  const runReal = process.env.DOTS_RUN_REAL_MODEL_TESTS === '1';
+  if (!runReal) {
+    t.skip('Real ONNX model test skipped (DOTS_RUN_REAL_MODEL_TESTS != 1).');
+    return;
+  }
+
+  const realProvider = new LocalEmbeddingProvider();
+  if (!(await realProvider.isAvailable())) {
+    t.skip('Local model not available.');
+    return;
+  }
+
+  const tmpDbPath = join(tmpdir(), `dots-real-e2e-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+  const testTokens = [
+    {
+      token: 'admin-secret-token-real',
+      principalId: 'real-admin',
+      role: 'ADMIN' as const,
+      permittedScopes: [
+        { scopeType: 'WORKSPACE' as const, scopeId: 'tenant-a' },
+        { scopeType: 'WORKSPACE' as const, scopeId: 'tenant-b' }
+      ]
+    }
+  ];
+
+  try {
+    // 1. Start Dots with real local provider
+    const runtime = new DotsRuntime({
+      dbPath: tmpDbPath,
+      tokens: testTokens,
+      embeddingProvider: 'local',
+      silentLogs: true
+    });
+
+    const callerA = runtime.authenticateUser('admin-secret-token-real', { scopeType: 'WORKSPACE', scopeId: 'tenant-a' }).caller;
+    const callerB = runtime.authenticateUser('admin-secret-token-real', { scopeType: 'WORKSPACE', scopeId: 'tenant-b' }).caller;
+
+    // 2. Create synthetic active memories
+    const memK8s = runtime.memoryService.createMemory(callerA, {
+      scopeType: 'WORKSPACE',
+      scopeId: 'tenant-a',
+      category: 'PROJECT_FACT',
+      key: 'k8s.infra',
+      content: 'Kubernetes infrastructure deployment and cluster management',
+      status: 'ACTIVE'
+    });
+
+    runtime.memoryService.createMemory(callerA, {
+      scopeType: 'WORKSPACE',
+      scopeId: 'tenant-a',
+      category: 'PROJECT_FACT',
+      key: 'tax.audit',
+      content: 'Corporate annual revenue assessment and tax audit documentation',
+      status: 'ACTIVE'
+    });
+
+    // 3. Verify durable jobs created
+    const pendingCount = runtime.embeddingJobRepo.countJobs({ status: 'PENDING' });
+    assert.equal(pendingCount, 2);
+
+    // 4. Verify worker processes jobs
+    const processed = await runtime.lifecycleManager?.processPendingJobs();
+    assert.equal(processed, 2);
+
+    // 5. Verify real vectors persisted in SQLite
+    const embK8s = runtime.embeddingRepo.getEmbedding(memK8s.id, 'onnx-community/all-MiniLM-L6-v2-ONNX', 'main');
+    assert.ok(embK8s);
+    assert.equal(embK8s.embedding.length, 384);
+    assert.ok(isNormalized(embK8s.embedding, 1e-4));
+
+    // 6. Semantic-only retrieval (limited lexical overlap)
+    const semResults = await runtime.memoryService.searchMemories(callerA, {
+      query: 'Docker container pod orchestration',
+      limit: 5
+    });
+    assert.ok(semResults.length > 0);
+    assert.equal(semResults[0].memory.key, 'k8s.infra');
+    assert.equal(semResults[0].provenance, 'SEMANTIC_ONLY');
+    assert.equal(semResults[0].lexicalScore, 0);
+    assert.ok(semResults[0].semanticScore !== null && semResults[0].semanticScore! > 0.35);
+
+    // 7. Hybrid retrieval
+    const hybridResults = await runtime.memoryService.searchMemories(callerA, {
+      query: 'Kubernetes infrastructure',
+      limit: 5
+    });
+    assert.ok(hybridResults.length > 0);
+    assert.equal(hybridResults[0].memory.key, 'k8s.infra');
+    assert.equal(hybridResults[0].provenance, 'HYBRID');
+    assert.ok(hybridResults[0].lexicalScore > 0);
+    assert.ok(hybridResults[0].semanticScore !== null && hybridResults[0].semanticScore! > 0.70);
+
+    // 8. Workspace isolation: Tenant B searching identical query finds 0 results
+    const resultsTenantB = await runtime.memoryService.searchMemories(callerB, {
+      query: 'Docker container pod orchestration',
+      limit: 5
+    });
+    assert.equal(resultsTenantB.length, 0, 'Tenant B must receive 0 memories from Tenant A');
+
+    await runtime.stop();
+
+    // 9. Cold restart verification: Recreate runtime on same SQLite DB
+    const rebootRuntime = new DotsRuntime({
+      dbPath: tmpDbPath,
+      tokens: testTokens,
+      embeddingProvider: 'local',
+      silentLogs: true
+    });
+    const rebootCallerA = rebootRuntime.authenticateUser('admin-secret-token-real', { scopeType: 'WORKSPACE', scopeId: 'tenant-a' }).caller;
+
+    const rebootResults = await rebootRuntime.memoryService.searchMemories(rebootCallerA, {
+      query: 'Docker container pod orchestration',
+      limit: 5
+    });
+    assert.ok(rebootResults.length > 0);
+    assert.equal(rebootResults[0].memory.key, 'k8s.infra');
+    assert.equal(rebootResults[0].provenance, 'SEMANTIC_ONLY');
+
+    await rebootRuntime.stop();
+
+    // 10. Lexical-only retrieval when provider is unconfigured (none)
+    const noneRuntime = new DotsRuntime({
+      dbPath: tmpDbPath,
+      tokens: testTokens,
+      embeddingProvider: 'none',
+      silentLogs: true
+    });
+    const noneCallerA = noneRuntime.authenticateUser('admin-secret-token-real', { scopeType: 'WORKSPACE', scopeId: 'tenant-a' }).caller;
+
+    const noneResults = await noneRuntime.memoryService.searchMemories(noneCallerA, {
+      query: 'Kubernetes infrastructure',
+      limit: 5
+    });
+    assert.ok(noneResults.length > 0);
+    assert.equal(noneResults[0].memory.key, 'k8s.infra');
+    assert.equal(noneResults[0].provenance, 'LEXICAL_ONLY');
+
+    await noneRuntime.stop();
+
+    // 11. Lexical fallback when local provider is configured but model is unavailable
+    const unavailableRuntime = new DotsRuntime({
+      dbPath: tmpDbPath,
+      tokens: testTokens,
+      embeddingProvider: 'local',
+      embeddingLocalModelPath: '/tmp/missing-model-dir-for-fallback',
+      silentLogs: true
+    });
+    const unavailCallerA = unavailableRuntime.authenticateUser('admin-secret-token-real', { scopeType: 'WORKSPACE', scopeId: 'tenant-a' }).caller;
+
+    const fallbackResults = await unavailableRuntime.memoryService.searchMemories(unavailCallerA, {
+      query: 'Kubernetes infrastructure',
+      limit: 5
+    });
+    assert.ok(fallbackResults.length > 0);
+    assert.equal(fallbackResults[0].memory.key, 'k8s.infra');
+    assert.equal(fallbackResults[0].provenance, 'LEXICAL_FALLBACK');
+
+    await unavailableRuntime.stop();
+  } finally {
+    try { unlinkSync(tmpDbPath); } catch {}
+    try { unlinkSync(`${tmpDbPath}-wal`); } catch {}
+    try { unlinkSync(`${tmpDbPath}-shm`); } catch {}
+  }
+});
+
+test('6C. Real ONNX Model: Bounded performance measurements and memory tracking', async (t) => {
+  const runReal = process.env.DOTS_RUN_REAL_MODEL_TESTS === '1';
+  if (!runReal) {
+    t.skip('Real ONNX model test skipped (DOTS_RUN_REAL_MODEL_TESTS != 1).');
+    return;
+  }
+
+  const realProvider = new LocalEmbeddingProvider();
+  if (!(await realProvider.isAvailable())) {
+    t.skip('Local model not available.');
+    return;
+  }
+
+  const memBefore = process.memoryUsage();
+  const startCold = performance.now();
+  await realProvider.embed('First cold inference for timing measurement');
+  const coldDuration = performance.now() - startCold;
+
+  const startWarm = performance.now();
+  await realProvider.embed('Second warm inference for timing measurement');
+  const warmDuration = performance.now() - startWarm;
+
+  const startBatch = performance.now();
+  await realProvider.embedBatch([
+    'Batch sentence alpha for timing validation',
+    'Batch sentence beta for timing validation',
+    'Batch sentence gamma for timing validation'
+  ]);
+  const batchDuration = performance.now() - startBatch;
+
+  const memAfter = process.memoryUsage();
+  const heapDeltaMb = (memAfter.heapUsed - memBefore.heapUsed) / (1024 * 1024);
+
+  // Assert bounds suitable for an 8 GB RAM laptop
+  assert.ok(coldDuration < 500, `Cold inference should be < 500ms, got ${coldDuration.toFixed(2)}ms`);
+  assert.ok(warmDuration < 100, `Warm inference should be < 100ms, got ${warmDuration.toFixed(2)}ms`);
+  assert.ok(batchDuration < 500, `Batch inference should be < 500ms, got ${batchDuration.toFixed(2)}ms`);
+  assert.ok(heapDeltaMb < 100, `Heap delta should be < 100MB, got ${heapDeltaMb.toFixed(2)}MB`);
+});
+
+test('6D. Real ONNX Model: Offline safety and missing model error reporting', async (t) => {
+  const runReal = process.env.DOTS_RUN_REAL_MODEL_TESTS === '1';
+  if (!runReal) {
+    t.skip('Real ONNX model test skipped (DOTS_RUN_REAL_MODEL_TESTS != 1).');
+    return;
+  }
+
+  // 1. Remote models strictly disabled by default
+  const defaultProvider = new LocalEmbeddingProvider();
+  assert.equal(defaultProvider.allowRemoteModels, false);
+
+  // 2. Pointing to missing model path produces actionable EmbeddingProviderUnavailableError
+  const missingPathProvider = new LocalEmbeddingProvider({
+    localModelPath: '/tmp/missing-dots-model-path-test',
+    allowRemoteModels: false
+  });
+
+  await assert.rejects(
+    () => missingPathProvider.embed('Test missing model safety'),
+    (err: unknown) => {
+      return (
+        err instanceof EmbeddingProviderUnavailableError &&
+        err.message.includes("Local embedding model 'onnx-community/all-MiniLM-L6-v2-ONNX' was not found") &&
+        err.message.includes('allowRemoteModels=false')
+      );
+    }
+  );
 });
