@@ -176,6 +176,8 @@ export interface SyncScopeEmbeddingsOptions {
   readonly batchSize?: number;
   readonly limit?: number;
   readonly provider?: IEmbeddingProvider;
+  readonly modelId?: string;
+  readonly modelRevision?: string;
 }
 
 /**
@@ -194,6 +196,39 @@ export interface SyncScopeEmbeddingsResult {
   readonly alreadyEmbeddedOrSkipped: number;
   readonly staleResultsDiscarded: number;
   readonly failed: number;
+  readonly remaining?: number;
+  readonly errors?: readonly string[];
+}
+
+/**
+ * Execution options for explicit model revision backfill operations.
+ */
+export interface BackfillModelRevisionOptions {
+  readonly scopeType?: MemoryScopeType;
+  readonly scopeId?: string;
+  readonly batchSize?: number;
+  readonly limit?: number;
+  readonly provider?: IEmbeddingProvider;
+  readonly modelId?: string;
+  readonly modelRevision?: string;
+}
+
+/**
+ * Structured outcome DTO from a model revision backfill operation.
+ */
+export interface BackfillModelRevisionResult {
+  readonly success: boolean;
+  readonly scope: {
+    readonly scopeType: MemoryScopeType;
+    readonly scopeId: string;
+  };
+  readonly modelId: string;
+  readonly modelRevision: string;
+  readonly processed: number;
+  readonly generated: number;
+  readonly skipped: number;
+  readonly failed: number;
+  readonly remaining: number;
   readonly errors?: readonly string[];
 }
 

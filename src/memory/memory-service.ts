@@ -81,6 +81,8 @@ import type {
   MemoryEmbedding,
   SyncScopeEmbeddingsOptions,
   SyncScopeEmbeddingsResult,
+  BackfillModelRevisionOptions,
+  BackfillModelRevisionResult,
   MissingEmbeddingMemoryRecord
 } from './embedding-types.ts';
 import type { AuditRepository } from '../storage/audit-repository.ts';
@@ -121,7 +123,12 @@ export interface SearchMemoriesOptions {
   readonly scopeId?: string;
 }
 
-export type { SyncScopeEmbeddingsOptions, SyncScopeEmbeddingsResult };
+export type {
+  SyncScopeEmbeddingsOptions,
+  SyncScopeEmbeddingsResult,
+  BackfillModelRevisionOptions,
+  BackfillModelRevisionResult
+};
 
 export interface MemoryServiceOptions {
   readonly memoryRepo: MemoryRepository;
@@ -1162,8 +1169,8 @@ export class MemoryService {
       };
     }
 
-    const modelId = effectiveProvider.modelId;
-    const modelRevision = (effectiveProvider as any).modelRevision ?? 'main';
+    const modelId = options?.modelId ?? effectiveProvider.modelId;
+    const modelRevision = options?.modelRevision ?? (effectiveProvider as any).modelRevision ?? 'main';
 
     let isAvailable = false;
     try {
@@ -1196,6 +1203,12 @@ export class MemoryService {
     });
 
     if (candidates.length === 0) {
+      const remaining = this.memoryRepo.countMemoriesMissingEmbeddings(
+        targetScopeType,
+        targetScopeId,
+        modelId,
+        modelRevision
+      );
       return {
         success: true,
         scope: { scopeType: targetScopeType, scopeId: targetScopeId },
@@ -1205,7 +1218,8 @@ export class MemoryService {
         embeddingsGenerated: 0,
         alreadyEmbeddedOrSkipped: 0,
         staleResultsDiscarded: 0,
-        failed: 0
+        failed: 0,
+        remaining
       };
     }
 
@@ -1316,6 +1330,13 @@ export class MemoryService {
       failed
     }, false);
 
+    const remaining = this.memoryRepo.countMemoriesMissingEmbeddings(
+      targetScopeType,
+      targetScopeId,
+      modelId,
+      modelRevision
+    );
+
     return {
       success: failed === 0,
       scope: { scopeType: targetScopeType, scopeId: targetScopeId },
@@ -1326,7 +1347,38 @@ export class MemoryService {
       alreadyEmbeddedOrSkipped,
       staleResultsDiscarded,
       failed,
+      remaining,
       ...(errors.length > 0 ? { errors } : {})
+    };
+  }
+
+  /**
+   * Safe, explicit backfill operation to generate embeddings for active memories
+   * missing vectors for a specific model ID and revision.
+   * 
+   * Reuses syncScopeEmbeddings to guarantee:
+   * 1. Bounded batching and sequential execution (concurrency = 1).
+   * 2. Inference executes strictly OUTSIDE SQLite write transactions.
+   * 3. Pre-persist revalidation guarantees stale results are discarded.
+   * 4. Multi-tenant scope isolation and authorization boundaries are enforced.
+   * 5. Embeddings for other model revisions are preserved untouched.
+   */
+  public async backfillModelRevision(
+    caller: CallerContext,
+    options?: BackfillModelRevisionOptions
+  ): Promise<BackfillModelRevisionResult> {
+    const syncResult = await this.syncScopeEmbeddings(caller, options);
+    return {
+      success: syncResult.success,
+      scope: syncResult.scope,
+      modelId: syncResult.modelId,
+      modelRevision: syncResult.modelRevision,
+      processed: syncResult.candidatesDiscovered,
+      generated: syncResult.embeddingsGenerated,
+      skipped: syncResult.alreadyEmbeddedOrSkipped + syncResult.staleResultsDiscarded,
+      failed: syncResult.failed,
+      remaining: syncResult.remaining ?? 0,
+      ...(syncResult.errors && syncResult.errors.length > 0 ? { errors: syncResult.errors } : {})
     };
   }
 
@@ -2566,10 +2618,15 @@ export class MemoryService {
     }
 
     // 4. Atomic Database Mutation
-    return this.memoryRepo.transaction(() => {
+    let enqueuedActiveCount = 0;
+
+    const importResult = this.memoryRepo.transaction(() => {
       let importedCount = 0;
       let skippedCount = 0;
       let overwrittenCount = 0;
+
+      const modelId = this.embeddingProvider?.modelId ?? this.lifecycleManager?.provider.modelId ?? 'default';
+      const modelRevision = (this.embeddingProvider as any)?.modelRevision ?? (this.lifecycleManager?.provider as any)?.modelRevision ?? 'main';
 
       for (const item of bundle.memories) {
         const status: MemoryStatus = item.status ?? 'ACTIVE';
@@ -2594,9 +2651,17 @@ export class MemoryService {
               // Archive existing active record (preserves the old record with status ARCHIVED)
               this.memoryRepo.archiveMemory(existing.id, caller.scope);
 
+              // Phase 4C.6D: Clean up existing embeddings and cancel pending jobs for the archived existing record
+              if (this.embeddingRepo) {
+                this.embeddingRepo.deleteEmbeddingsByMemoryId(existing.id);
+              }
+              if (this.embeddingJobRepo) {
+                this.embeddingJobRepo.cancelPendingJobsByMemoryId(existing.id);
+              }
+
               // Insert imported record as new ACTIVE record
               // Tags and metadata replace existing values rather than merging
-              this.memoryRepo.createMemory({
+              const created = this.memoryRepo.createMemory({
                 key,
                 content: item.content.trim(),
                 category: item.category,
@@ -2608,6 +2673,18 @@ export class MemoryService {
                 metadata: item.metadata ?? {}
               });
 
+              // Durable Embedding Automation: Enqueue job for overwritten active memory
+              if (this.embeddingJobRepo) {
+                this.embeddingJobRepo.enqueueJob({
+                  memoryId: created.id,
+                  scopeType: created.scopeType,
+                  scopeId: created.scopeId,
+                  modelId,
+                  modelRevision
+                });
+                enqueuedActiveCount++;
+              }
+
               overwrittenCount++;
               continue;
             }
@@ -2615,7 +2692,7 @@ export class MemoryService {
         }
 
         // Non-conflicting insert (new ACTIVE or ARCHIVED)
-        this.memoryRepo.createMemory({
+        const created = this.memoryRepo.createMemory({
           key,
           content: item.content.trim(),
           category: item.category,
@@ -2626,6 +2703,18 @@ export class MemoryService {
           tags: item.tags ?? [],
           metadata: item.metadata ?? {}
         });
+
+        // Durable Embedding Automation: Enqueue job only if status is ACTIVE
+        if (status === 'ACTIVE' && this.embeddingJobRepo) {
+          this.embeddingJobRepo.enqueueJob({
+            memoryId: created.id,
+            scopeType: created.scopeType,
+            scopeId: created.scopeId,
+            modelId,
+            modelRevision
+          });
+          enqueuedActiveCount++;
+        }
 
         importedCount++;
       }
@@ -2657,6 +2746,12 @@ export class MemoryService {
         overwrittenCount
       };
     });
+
+    if (enqueuedActiveCount > 0) {
+      this.lifecycleManager?.trigger();
+    }
+
+    return importResult;
   }
 
   /**
