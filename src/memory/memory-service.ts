@@ -74,7 +74,13 @@ import {
 } from '../domain/errors.ts';
 import { MemoryRepository } from '../storage/memory-repository.ts';
 import type { MemoryEmbeddingRepository } from '../storage/memory-embedding-repository.ts';
-import type { IEmbeddingProvider, MemoryEmbedding } from './embedding-types.ts';
+import type {
+  IEmbeddingProvider,
+  MemoryEmbedding,
+  SyncScopeEmbeddingsOptions,
+  SyncScopeEmbeddingsResult,
+  MissingEmbeddingMemoryRecord
+} from './embedding-types.ts';
 import type { AuditRepository } from '../storage/audit-repository.ts';
 import type { TaskRepository } from '../storage/task-repository.ts';
 import type { DatabaseManager } from '../storage/db.ts';
@@ -112,6 +118,8 @@ export interface SearchMemoriesOptions {
   readonly scopeType?: MemoryScopeType;
   readonly scopeId?: string;
 }
+
+export type { SyncScopeEmbeddingsOptions, SyncScopeEmbeddingsResult };
 
 export interface MemoryServiceOptions {
   readonly memoryRepo: MemoryRepository;
@@ -993,6 +1001,245 @@ export class MemoryService {
     });
 
     return embedding;
+  }
+
+  /**
+   * Reconciles missing vector embeddings for active memories within an authorized scope.
+   * 
+   * Invariants:
+   * 1. Requires WRITE permission and strict scope matching (workspace callers cannot sync global scope).
+   * 2. Bounded batch size (1-25) and limit (default 100).
+   * 3. Model inference executes strictly OUTSIDE SQLite database transactions.
+   * 4. Pre-persist revalidation: detects concurrent deletions, archive transitions, or content updates,
+   *    discarding stale embeddings without corrupting the database.
+   * 5. Safe failure: if provider is unavailable or throws, returns structured result without crashing.
+   * 6. Appends a privacy-safe MEMORY_EMBEDDINGS_SYNCED audit event with execution telemetry.
+   */
+  public async syncScopeEmbeddings(
+    caller: CallerContext,
+    options?: SyncScopeEmbeddingsOptions
+  ): Promise<SyncScopeEmbeddingsResult> {
+    if (!this.embeddingRepo) {
+      throw new ValidationError('Memory embedding repository is not configured on MemoryService.');
+    }
+
+    this.validateCaller(caller, 'WRITE');
+
+    if (options !== undefined && options !== null) {
+      if (typeof options !== 'object') {
+        throw new ValidationError('SyncScopeEmbeddingsOptions must be an object if provided.');
+      }
+      this.assertCallerScopeMatch(caller, options.scopeType, options.scopeId, 'syncScopeEmbeddings');
+    }
+
+    const targetScopeType = options?.scopeType ?? caller.scope.scopeType;
+    const targetScopeId = options?.scopeId ?? caller.scope.scopeId;
+
+    const batchSize = options?.batchSize ?? 25;
+    if (
+      typeof batchSize !== 'number' ||
+      !Number.isInteger(batchSize) ||
+      batchSize < 1 ||
+      batchSize > 25
+    ) {
+      throw new ValidationError(
+        `batchSize must be an integer between 1 and 25, received '${String(batchSize)}'.`
+      );
+    }
+
+    const limit = options?.limit ?? 100;
+    if (
+      typeof limit !== 'number' ||
+      !Number.isInteger(limit) ||
+      limit < 1
+    ) {
+      throw new ValidationError(
+        `limit must be a positive integer, received '${String(limit)}'.`
+      );
+    }
+
+    const effectiveProvider = options?.provider ?? this.embeddingProvider;
+    if (!effectiveProvider) {
+      return {
+        success: false,
+        scope: { scopeType: targetScopeType, scopeId: targetScopeId },
+        modelId: 'none',
+        modelRevision: 'main',
+        candidatesDiscovered: 0,
+        embeddingsGenerated: 0,
+        alreadyEmbeddedOrSkipped: 0,
+        staleResultsDiscarded: 0,
+        failed: 0,
+        errors: ['No embedding provider configured or supplied for vector synchronization.']
+      };
+    }
+
+    const modelId = effectiveProvider.modelId;
+    const modelRevision = (effectiveProvider as any).modelRevision ?? 'main';
+
+    let isAvailable = false;
+    try {
+      isAvailable = await effectiveProvider.isAvailable();
+    } catch {
+      isAvailable = false;
+    }
+
+    if (!isAvailable) {
+      return {
+        success: false,
+        scope: { scopeType: targetScopeType, scopeId: targetScopeId },
+        modelId,
+        modelRevision,
+        candidatesDiscovered: 0,
+        embeddingsGenerated: 0,
+        alreadyEmbeddedOrSkipped: 0,
+        staleResultsDiscarded: 0,
+        failed: 0,
+        errors: [`Embedding provider '${effectiveProvider.name}' is unavailable.`]
+      };
+    }
+
+    const candidates = this.embeddingRepo.getMemoriesMissingEmbeddings({
+      scopeType: targetScopeType,
+      scopeId: targetScopeId,
+      modelId,
+      modelRevision,
+      limit
+    });
+
+    if (candidates.length === 0) {
+      return {
+        success: true,
+        scope: { scopeType: targetScopeType, scopeId: targetScopeId },
+        modelId,
+        modelRevision,
+        candidatesDiscovered: 0,
+        embeddingsGenerated: 0,
+        alreadyEmbeddedOrSkipped: 0,
+        staleResultsDiscarded: 0,
+        failed: 0
+      };
+    }
+
+    const candidatesDiscovered = candidates.length;
+    let embeddingsGenerated = 0;
+    let alreadyEmbeddedOrSkipped = 0;
+    let staleResultsDiscarded = 0;
+    let failed = 0;
+    const errors: string[] = [];
+
+    for (let i = 0; i < candidates.length; i += batchSize) {
+      const batch = candidates.slice(i, i + batchSize);
+      const texts = batch.map((c) => `${c.key}: ${c.content}`);
+
+      let vectors: Float32Array[];
+      try {
+        // Model inference executed strictly OUTSIDE any SQLite transaction!
+        vectors = await effectiveProvider.embedBatch(texts);
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        errors.push(`Batch inference failed for ${batch.length} items: ${errorMsg}`);
+        failed += batch.length;
+        continue;
+      }
+
+      if (!Array.isArray(vectors) || vectors.length !== batch.length) {
+        errors.push(`Provider returned ${vectors ? vectors.length : 0} vectors for ${batch.length} items.`);
+        failed += batch.length;
+        continue;
+      }
+
+      for (let j = 0; j < batch.length; j++) {
+        const candidate = batch[j];
+        const vector = vectors[j];
+
+        try {
+          validateVector(vector, effectiveProvider.dimensions, `embedding for memory ${candidate.id}`);
+        } catch (err) {
+          const errorMsg = err instanceof Error ? err.message : String(err);
+          errors.push(`Vector validation failed for memory '${candidate.id}': ${errorMsg}`);
+          failed++;
+          continue;
+        }
+
+        try {
+          this.embeddingRepo.transaction(() => {
+            let currentMemory: Memory | null = null;
+            try {
+              currentMemory = this.memoryRepo.getMemoryById(candidate.id, {
+                scopeType: targetScopeType,
+                scopeId: targetScopeId
+              });
+            } catch {
+              staleResultsDiscarded++;
+              return;
+            }
+
+            if (!currentMemory) {
+              staleResultsDiscarded++;
+              return;
+            }
+
+            if (currentMemory.status !== 'ACTIVE') {
+              staleResultsDiscarded++;
+              return;
+            }
+
+            if (
+              currentMemory.updatedAt !== candidate.updatedAt ||
+              currentMemory.content !== candidate.content
+            ) {
+              staleResultsDiscarded++;
+              return;
+            }
+
+            const existing = this.embeddingRepo!.getEmbedding(candidate.id, modelId, modelRevision);
+            if (existing) {
+              alreadyEmbeddedOrSkipped++;
+              return;
+            }
+
+            this.embeddingRepo!.insertEmbedding({
+              memoryId: candidate.id,
+              modelId,
+              modelRevision,
+              dimensions: effectiveProvider.dimensions,
+              embedding: vector
+            });
+            embeddingsGenerated++;
+          });
+        } catch (err) {
+          const errorMsg = err instanceof Error ? err.message : String(err);
+          errors.push(`Failed to persist embedding for memory '${candidate.id}': ${errorMsg}`);
+          failed++;
+        }
+      }
+    }
+
+    this.audit(caller, 'MEMORY_EMBEDDINGS_SYNCED', {
+      scopeType: targetScopeType,
+      scopeId: targetScopeId,
+      modelId,
+      modelRevision,
+      candidatesDiscovered,
+      embeddingsGenerated,
+      alreadyEmbeddedOrSkipped,
+      staleResultsDiscarded,
+      failed
+    }, false);
+
+    return {
+      success: failed === 0,
+      scope: { scopeType: targetScopeType, scopeId: targetScopeId },
+      modelId,
+      modelRevision,
+      candidatesDiscovered,
+      embeddingsGenerated,
+      alreadyEmbeddedOrSkipped,
+      staleResultsDiscarded,
+      failed,
+      ...(errors.length > 0 ? { errors } : {})
+    };
   }
 
   /**

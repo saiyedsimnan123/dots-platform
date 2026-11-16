@@ -16,6 +16,8 @@
  * 6. Cancellation via AbortSignal is respected before and during operations.
  */
 
+import type { MemoryScopeType } from '../domain/types.ts';
+
 /**
  * Maximum character length permitted for a single embedding text input.
  */
@@ -143,4 +145,56 @@ export interface ListEmbeddingMetadataFilter {
   readonly limit?: number;
   readonly offset?: number;
 }
+
+/**
+ * Lightweight representation of an active memory record lacking an embedding vector.
+ */
+export interface MissingEmbeddingMemoryRecord {
+  readonly id: string;
+  readonly key: string;
+  readonly content: string;
+  readonly updatedAt: string;
+}
+
+/**
+ * Filtering parameters for querying memories missing vector embeddings.
+ */
+export interface ListMissingEmbeddingsFilter {
+  readonly scopeType: MemoryScopeType;
+  readonly scopeId: string;
+  readonly modelId: string;
+  readonly modelRevision?: string;
+  readonly limit?: number;
+}
+
+/**
+ * Execution options for batch memory embedding reconciliation across a scope.
+ */
+export interface SyncScopeEmbeddingsOptions {
+  readonly scopeType?: MemoryScopeType;
+  readonly scopeId?: string;
+  readonly batchSize?: number;
+  readonly limit?: number;
+  readonly provider?: IEmbeddingProvider;
+}
+
+/**
+ * Structured outcome DTO from a batch memory embedding synchronization operation.
+ */
+export interface SyncScopeEmbeddingsResult {
+  readonly success: boolean;
+  readonly scope: {
+    readonly scopeType: MemoryScopeType;
+    readonly scopeId: string;
+  };
+  readonly modelId: string;
+  readonly modelRevision: string;
+  readonly candidatesDiscovered: number;
+  readonly embeddingsGenerated: number;
+  readonly alreadyEmbeddedOrSkipped: number;
+  readonly staleResultsDiscarded: number;
+  readonly failed: number;
+  readonly errors?: readonly string[];
+}
+
 

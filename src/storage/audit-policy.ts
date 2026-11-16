@@ -25,6 +25,7 @@ export const MEMORY_AUDIT_EVENT_TYPES = [
   'MEMORY_EXPORTED',
   'MEMORIES_IMPORTED',
   'MEMORIES_PURGED',
+  'MEMORY_EMBEDDINGS_SYNCED',
 ] as const;
 
 export type MemoryAuditEventType = (typeof MEMORY_AUDIT_EVENT_TYPES)[number];
@@ -121,6 +122,17 @@ export const MEMORY_AUDIT_ALLOWLIST: Record<MemoryAuditEventType, readonly strin
     'purgedCount',
     'batchSizeLimit',
     'cutoffTimestamp'
+  ],
+  MEMORY_EMBEDDINGS_SYNCED: [
+    'scopeType',
+    'scopeId',
+    'modelId',
+    'modelRevision',
+    'candidatesDiscovered',
+    'embeddingsGenerated',
+    'alreadyEmbeddedOrSkipped',
+    'staleResultsDiscarded',
+    'failed'
   ],
   MEMORY_ACCESS_DENIED: [
     'reason',
@@ -417,6 +429,13 @@ export function validateMemoryAuditFieldValue(
     return typeof value === 'string' && STRICT_SCOPE_STRING_REGEX.test(value) ? value : undefined;
   }
 
+  // Model identity strings
+  if (key === 'modelId' || key === 'modelRevision') {
+    return typeof value === 'string' && value.trim() !== '' && value.length <= 128
+      ? value
+      : undefined;
+  }
+
   // Non-negative finite integers
   if (
     key === 'count' ||
@@ -426,7 +445,12 @@ export function validateMemoryAuditFieldValue(
     key === 'importedCount' ||
     key === 'skippedCount' ||
     key === 'overwrittenCount' ||
-    key === 'purgedCount'
+    key === 'purgedCount' ||
+    key === 'candidatesDiscovered' ||
+    key === 'embeddingsGenerated' ||
+    key === 'alreadyEmbeddedOrSkipped' ||
+    key === 'staleResultsDiscarded' ||
+    key === 'failed'
   ) {
     return typeof value === 'number' && Number.isInteger(value) && Number.isFinite(value) && value >= 0
       ? value

@@ -26,6 +26,10 @@ import type {
   RecordMemoryInjectionInput,
   ScopeIdentifier
 } from '../domain/types.ts';
+import type {
+  MissingEmbeddingMemoryRecord,
+  ListMissingEmbeddingsFilter
+} from '../memory/embedding-types.ts';
 import {
   ValidationError,
   MemoryNotFoundError,
@@ -309,6 +313,103 @@ export class MemoryRepository {
     `);
     const row = stmt.get(scope.scopeType, scope.scopeId, cutoffTimestamp) as unknown as { count: number };
     return row.count;
+  }
+
+  /**
+   * Queries active memories within an authoritative scope that are missing embeddings
+   * for an exact (modelId, modelRevision) pair.
+   * Deterministically ordered by (created_at ASC, id ASC).
+   */
+  public getMemoriesMissingEmbeddings(
+    filter: ListMissingEmbeddingsFilter
+  ): MissingEmbeddingMemoryRecord[] {
+    if (!filter || typeof filter !== 'object') {
+      throw new ValidationError('ListMissingEmbeddingsFilter must be provided.');
+    }
+    this.validateScope(filter.scopeType, filter.scopeId);
+    if (!filter.modelId || typeof filter.modelId !== 'string' || filter.modelId.trim() === '') {
+      throw new ValidationError('modelId must be a non-empty string.');
+    }
+    if (filter.limit !== undefined) {
+      if (typeof filter.limit !== 'number' || !Number.isInteger(filter.limit) || filter.limit <= 0) {
+        throw new ValidationError('limit must be a positive integer.');
+      }
+    }
+
+    const modelRevision = filter.modelRevision ?? 'main';
+    let sql = `
+      SELECT m.id, m.key, m.content, m.updated_at
+      FROM memories m
+      LEFT JOIN memory_embeddings me
+        ON me.memory_id = m.id
+        AND me.model_id = ?
+        AND me.model_revision = ?
+      WHERE m.scope_type = ?
+        AND m.scope_id = ?
+        AND m.status = 'ACTIVE'
+        AND me.id IS NULL
+      ORDER BY m.created_at ASC, m.id ASC
+    `;
+
+    const params: SqlParam[] = [
+      filter.modelId,
+      modelRevision,
+      filter.scopeType,
+      filter.scopeId
+    ];
+
+    if (filter.limit !== undefined) {
+      sql += ' LIMIT ?';
+      params.push(filter.limit);
+    }
+
+    const stmt = this.db.prepare(sql);
+    const rows = stmt.all(...params) as unknown as Array<{
+      id: string;
+      key: string;
+      content: string;
+      updated_at: string;
+    }>;
+
+    return rows.map((r) => ({
+      id: r.id,
+      key: r.key,
+      content: r.content,
+      updatedAt: r.updated_at
+    }));
+  }
+
+  /**
+   * Counts active memories within an authoritative scope that are missing embeddings
+   * for an exact (modelId, modelRevision) pair.
+   */
+  public countMemoriesMissingEmbeddings(
+    scopeType: MemoryScopeType,
+    scopeId: string,
+    modelId: string,
+    modelRevision = 'main'
+  ): number {
+    this.validateScope(scopeType, scopeId);
+    if (!modelId || typeof modelId !== 'string' || modelId.trim() === '') {
+      throw new ValidationError('modelId must be a non-empty string.');
+    }
+
+    const sql = `
+      SELECT COUNT(*) as count
+      FROM memories m
+      LEFT JOIN memory_embeddings me
+        ON me.memory_id = m.id
+        AND me.model_id = ?
+        AND me.model_revision = ?
+      WHERE m.scope_type = ?
+        AND m.scope_id = ?
+        AND m.status = 'ACTIVE'
+        AND me.id IS NULL
+    `;
+
+    const stmt = this.db.prepare(sql);
+    const row = stmt.get(modelId, modelRevision, scopeType, scopeId) as unknown as { count: number } | undefined;
+    return Number(row?.count ?? 0);
   }
 
   /**
