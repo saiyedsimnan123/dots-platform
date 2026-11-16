@@ -617,7 +617,7 @@ export function createMemorySearchTool(
       }
 
       // 4. Perform search via MemoryService
-      const scoredMemories = memoryService.searchMemories(caller, {
+      const scoredMemories = await memoryService.searchMemories(caller, {
         query,
         limit,
         category,

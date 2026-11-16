@@ -619,7 +619,7 @@ export class TaskCoordinator {
           }
 
           try {
-            memoryContext = this.memoryService.buildTaskMemoryContext(agentCaller, {
+            memoryContext = await this.memoryService.buildTaskMemoryContext(agentCaller, {
               query: task.goal,
               taskId: task.id,
               recordInjections: false,
@@ -883,7 +883,7 @@ export class TaskCoordinator {
             );
           }
 
-          memoryContext = this.memoryService.buildTaskMemoryContext(agentCaller, {
+          memoryContext = await this.memoryService.buildTaskMemoryContext(agentCaller, {
             query: task.goal,
             taskId: task.id,
             recordInjections: false,

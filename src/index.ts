@@ -53,6 +53,7 @@ export * from './verification/verifier.ts';
 // Memory Subsystem
 export * from './memory/relevance-matcher.ts';
 export * from './memory/context-builder.ts';
+export * from './memory/hybrid-retriever.ts';
 export * from './memory/memory-service.ts';
 export * from './memory/canonical-json.ts';
 export type * from './memory/embedding-types.ts';

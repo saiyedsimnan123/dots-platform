@@ -35,7 +35,8 @@ import type {
   IncludedMemoryInfo,
   ExcludedMemoryInfo,
   SerializedMemoryRecord,
-  SerializedMemoryPayload
+  SerializedMemoryPayload,
+  ScoredMemory
 } from '../domain/types.ts';
 import { ValidationError } from '../domain/errors.ts';
 import { RelevanceMatcher } from './relevance-matcher.ts';
@@ -106,8 +107,13 @@ export class MemoryContextBuilder {
 
   /**
    * Accepts candidate memories and a task query, returning a bounded, safe, structured memory context.
+   * Optionally accepts pre-ranked candidates (e.g. from HybridRetriever) to preserve hybrid scores.
    */
-  public buildContext(query: string, candidates: readonly Memory[]): BuiltMemoryContext {
+  public buildContext(
+    query: string,
+    candidates: readonly Memory[],
+    scoredCandidates?: readonly ScoredMemory[]
+  ): BuiltMemoryContext {
     const includedInfo: IncludedMemoryInfo[] = [];
     const excludedInfo: ExcludedMemoryInfo[] = [];
 
@@ -127,11 +133,17 @@ export class MemoryContextBuilder {
       }
     }
 
-    // 2. Rank valid candidates deterministically using the relevance matcher
-    const rankedCandidates = this.matcher.rank(query, validCandidates);
+    // 2. Rank valid candidates deterministically using the relevance matcher or pre-ranked candidates
+    let rankedCandidates: readonly ScoredMemory[];
+    if (scoredCandidates && scoredCandidates.length > 0) {
+      const validCandidateIdSet = new Set(validCandidates.map((c) => c.id));
+      rankedCandidates = scoredCandidates.filter((s) => validCandidateIdSet.has(s.memory.id));
+    } else {
+      rankedCandidates = this.matcher.rank(query, validCandidates);
+    }
 
     // 3. Filter candidates by relevance threshold
-    const relevantCandidates: typeof rankedCandidates = [];
+    const relevantCandidates: ScoredMemory[] = [];
     for (const scored of rankedCandidates) {
       if (scored.score <= this.relevanceThreshold) {
         excludedInfo.push({

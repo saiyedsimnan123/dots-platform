@@ -643,10 +643,85 @@ Phase 4C.4 implements durable, secure SQLite storage and lifecycle management fo
   - Workspace callers cannot retrieve or generate embeddings for memories belonging to foreign workspaces (`MemoryScopeViolationError`).
   - Inherited global memory embeddings require verified same-principal eligibility (`isMemoryEligibleForCaller`) before vectors are returned.
   - All SQL queries are 100% parameterized.
-- **Strict Scope Boundary: Hybrid Retrieval Not Yet Implemented**:
-  - Phase 4C.4 is strictly about vector persistence and lifecycle management.
-  - Lexical retrieval (`searchMemories`, `buildTaskMemoryContext`, `RelevanceMatcher`) continues to function as the platform's primary, trusted retrieval mechanism.
-  - Hybrid scoring, vector indexing, and cosine similarity ranking are deferred to Phase 4C.5.
+- **Strict Scope Boundary: Hybrid Retrieval Implemented in Phase 4C.5**:
+  - Phase 4C.4 established persistent vector storage and lifecycle management.
+  - Hybrid semantic and lexical retrieval is fully operational in Phase 4C.5 (Section 17 below).
+
+---
+
+## 17. Phase 4C.5 — Hybrid Semantic and Lexical Memory Retrieval
+
+Phase 4C.5 integrates the `IEmbeddingProvider` abstraction and SQLite `MemoryEmbeddingRepository` into the platform's memory retrieval pipeline (`MemoryService`, `HybridRetriever`, `MemoryContextBuilder`, `TaskCoordinator`, and `memory_search` tool), enabling hybrid memory ranking while preserving all authorization, workspace isolation, provenance, and zero-runtime-dependency constraints:
+
+- **Dual-Signal Hybrid Ranking Engine (`src/memory/hybrid-retriever.ts`)**:
+  - Combines lexical relevance from `RelevanceMatcher` with semantic similarity from `cosineSimilarity` over L2-normalized Float32Array embeddings.
+  - **Deterministic Formula**:
+    $$\text{hybridScore} = \text{round}_4((\text{lexicalScore} \times W_{\text{lex}}) + (\text{semanticScore} \times W_{\text{sem}}))$$
+  - **Default Weights**:
+    - Lexical weight ($W_{\text{lex}}$): `0.40`
+    - Semantic weight ($W_{\text{sem}}$): `0.60`
+    - Weights sum strictly to `1.0` within `WEIGHT_TOLERANCE = 0.0001` and must be non-negative finite numbers.
+  - **Scale Calibration & Negative Cosine Protection**:
+    - Lexical scores are bounded in $[0.0, 1.0]$.
+    - Raw cosine similarities range across $[-1.0, 1.0]$.
+    - To prevent negative similarity from producing artificial relevance or negative composite scores, raw cosine is clamped:
+      $$\text{calibratedSemantic} = \max(0.0, \min(1.0, \text{rawCosine}))$$
+      $$\text{semanticScore} = \text{round}_4(\text{calibratedSemantic})$$
+    - Negative cosine similarities are treated as $0.0$ semantic similarity and tagged with `LEXICAL_ONLY` provenance.
+  - **Zero-Lexical Recall**:
+    - Candidates with zero lexical overlap ($\text{lexicalScore} = 0.0$) remain eligible for retrieval if their semantic similarity is sufficiently high (e.g. $\text{semanticScore} = 0.85 \implies \text{hybridScore} = 0.5100 > 0.0$).
+    - Enables discovering relevant procedures and facts expressed with completely different terminology or synonyms.
+  - **Explainable Retrieval Provenance**:
+    - `HYBRID`: Both lexical $> 0.0$ and semantic $> 0.0$ signals contributed to the final score.
+    - `SEMANTIC_ONLY`: Zero lexical overlap ($\text{lexicalScore} = 0.0$), retrieved entirely via semantic similarity ($\text{semanticScore} > 0.0$).
+    - `LEXICAL_ONLY`: Lexical match present ($\text{lexicalScore} > 0.0$) and semantic is $0.0$ or no embedding provider was configured.
+    - `LEXICAL_FALLBACK`: Semantic retrieval was attempted or candidate vector was missing/mismatched, so the score safely fell back to the lexical score.
+  - **Deterministic 5-Tier Tie-Breaking**:
+    1. Score DESC (composite hybrid score)
+    2. Priority DESC (100 before 50 before 0)
+    3. CreatedAt DESC (newer records break ties)
+    4. Key ASC (alphabetical for stability)
+    5. ID ASC (absolute deterministic tie-breaker)
+  - **Defensive Immutability**: Candidate memories and vector buffers are never mutated.
+
+- **Critical Security Invariant: Authorization-Before-Vector-Retrieval**:
+  - The platform strictly enforces that vector retrieval and similarity computation occur **only** after authoritative caller authentication and memory eligibility gates have executed:
+    1. **Caller Authentication**: Host-verified cryptographic HMAC token and role verification (`validateCaller`).
+    2. **Scope Match Assertion**: Explicit caller scope match and authoritative task scope alignment.
+    3. **Eligible Candidate Resolution**: `getEligibleCandidateMemories()` executes workspace isolation, same-principal global memory inheritance, permitted scope checks, and deterministic workspace-over-global conflict resolution.
+    4. **Candidate-ID-Filtered Vector Retrieval**: `embeddingRepo.getEmbeddingsForMemories(candidateIds, modelId, modelRevision)` queries embeddings **strictly and exclusively** for the authorized candidate IDs. Foreign workspace vectors and unauthorized global vectors are **never** fetched from SQLite.
+    5. **Similarity Calculation**: Cosine similarities are computed solely for authorized candidates.
+    6. **Ranked Delivery**: Authorized candidates are returned ordered by hybrid score.
+  - Security violations remain fail-closed and throw `MemoryScopeViolationError` or `SecurityViolationError` immediately without falling back to lexical search.
+
+- **Safe Semantic Fallback & Resilient Failure Handling**:
+  - The platform functions reliably as a 100% local-first system even without active embedding infrastructure:
+    - **No Provider Configured**: `MemoryService` defaults to pure lexical ranking with `LEXICAL_ONLY` provenance.
+    - **Provider Unavailable**: If `isAvailable()` resolves to `false`, retrieval falls back to lexical ranking with `LEXICAL_FALLBACK`.
+    - **Inference Failure**: If `embed(query)` rejects (e.g. CPU/GPU memory pressure), retrieval falls back to lexical with `LEXICAL_FALLBACK`.
+    - **Missing Stored Vectors**: Candidates without stored vectors fall back to their individual lexical scores without penalizing or failing the rest of the result set.
+    - **Model ID / Revision / Dimension Mismatch**: Stored embeddings whose model identity or dimensionality do not match the active provider are safely skipped, falling back to lexical scoring for that record. Cross-model vector comparisons are strictly prevented.
+  - Failures in the embedding provider never crash task execution or corrupt memory state.
+  - Diagnostic and audit records log operational metadata without exposing raw vector embeddings or sensitive memory content.
+
+- **Integration into Memory Entry Points**:
+  - **`searchMemories()` & `searchMemoriesAsync()`**:
+    - Executes caller authorization, candidate eligibility, and hybrid ranking.
+    - Implements dual sync/async pattern: returns `HybridScoredMemory[] & PromiseLike<HybridScoredMemory[]>` ensuring synchronous callers receive an immediate Array while asynchronous callers (`await`) receive the hybrid-ranked results.
+    - Preserves pagination limits (1–50, default 5) and zero-relevance filtering (`score > 0.0`).
+  - **`buildTaskMemoryContext()` & `buildTaskMemoryContextAsync()`**:
+    - Uses the identical hybrid ranking engine.
+    - Pre-ranked candidate memories are fed into `MemoryContextBuilder.buildContext()`.
+    - **Budget Ceiling Preservation**: The 4,000-character ceiling, greedy knapsack allocation, and untrusted-data boundary markers are strictly preserved.
+    - **Provenance Tracking**: Task injection provenance (`recordTaskInjection`) is atomically recorded for hybrid-selected memories when `recordInjections: true`.
+  - **Orchestration Integration**:
+    - `TaskCoordinator` awaits hybrid memory context in `executeAgentTask` and `planTask`.
+    - `memory_search` agent tool awaits `searchMemories` and returns sanitized, hybrid-ranked memories.
+
+- **Explicit Vector Lifecycle (No Automatic Generation on Retrieval)**:
+  - Hybrid retrieval queries only existing stored vectors. Missing embeddings are **not** automatically or silently generated during retrieval.
+  - Stored embeddings originate exclusively through explicit lifecycle operations (`generateMemoryEmbedding`), preserving local CPU/GPU resources and maintaining predictable memory operations.
+
 
 
 
