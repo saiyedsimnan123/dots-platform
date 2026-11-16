@@ -74,6 +74,8 @@ import {
 } from '../domain/errors.ts';
 import { MemoryRepository } from '../storage/memory-repository.ts';
 import type { MemoryEmbeddingRepository } from '../storage/memory-embedding-repository.ts';
+import type { EmbeddingJobRepository } from '../storage/embedding-job-repository.ts';
+import type { EmbeddingLifecycleManager } from './embedding-lifecycle-manager.ts';
 import type {
   IEmbeddingProvider,
   MemoryEmbedding,
@@ -125,6 +127,8 @@ export interface MemoryServiceOptions {
   readonly memoryRepo: MemoryRepository;
   readonly embeddingRepo?: MemoryEmbeddingRepository;
   readonly embeddingProvider?: IEmbeddingProvider;
+  readonly embeddingJobRepo?: EmbeddingJobRepository;
+  readonly lifecycleManager?: EmbeddingLifecycleManager;
   readonly auditRepo?: AuditRepository;
   readonly taskRepo?: TaskRepository;
   readonly authorizer?: MemoryAuthorizer;
@@ -200,6 +204,8 @@ export class MemoryService {
   private readonly memoryRepo: MemoryRepository;
   private readonly embeddingRepo?: MemoryEmbeddingRepository;
   private readonly embeddingProvider?: IEmbeddingProvider;
+  private readonly embeddingJobRepo?: EmbeddingJobRepository;
+  private readonly lifecycleManager?: EmbeddingLifecycleManager;
   private readonly auditRepo?: AuditRepository;
   private readonly taskRepo?: TaskRepository;
   readonly #authorizer: MemoryAuthorizer;
@@ -242,6 +248,13 @@ export class MemoryService {
       );
     }
 
+    // EmbeddingJobRepository must also share the same DatabaseManager if provided.
+    if (options.embeddingJobRepo && options.embeddingJobRepo.db !== options.memoryRepo.db) {
+      throw new ValidationError(
+        'MemoryRepository and EmbeddingJobRepository must share the exact same DatabaseManager instance.'
+      );
+    }
+
     // Authorization boundary consistency: if both authorizer and hostAuthority are supplied,
     // authorizer must be the exact authorizer instance owned by hostAuthority.
     if (options.authorizer && options.hostAuthority && options.authorizer !== options.hostAuthority.authorizer) {
@@ -253,6 +266,8 @@ export class MemoryService {
     this.memoryRepo = options.memoryRepo;
     this.embeddingRepo = options.embeddingRepo;
     this.embeddingProvider = options.embeddingProvider;
+    this.embeddingJobRepo = options.embeddingJobRepo ?? options.lifecycleManager?.jobRepo;
+    this.lifecycleManager = options.lifecycleManager;
     this.auditRepo = options.auditRepo;
     this.taskRepo = options.taskRepo;
     this.#authorizer = options.authorizer ?? options.hostAuthority?.authorizer ?? new MemoryAuthorizer({ taskRepo: options.taskRepo });
@@ -428,7 +443,7 @@ export class MemoryService {
         : {})
     };
 
-    return this.memoryRepo.transaction(() => {
+    const createdMemory = this.memoryRepo.transaction(() => {
       const memory = this.memoryRepo.createMemory({
         ...input,
         scopeType: caller.scope.scopeType,
@@ -446,6 +461,19 @@ export class MemoryService {
           scopeId: memory.scopeId,
           status: 'ACTIVE'
         }, true);
+
+        // Durable Embedding Automation: Enqueue job for active memory creation
+        if (this.embeddingJobRepo) {
+          const modelId = this.embeddingProvider?.modelId ?? this.lifecycleManager?.provider.modelId ?? 'default';
+          const modelRevision = (this.embeddingProvider as any)?.modelRevision ?? (this.lifecycleManager?.provider as any)?.modelRevision ?? 'main';
+          this.embeddingJobRepo.enqueueJob({
+            memoryId: memory.id,
+            scopeType: memory.scopeType,
+            scopeId: memory.scopeId,
+            modelId,
+            modelRevision
+          });
+        }
       } else {
         this.audit(caller, 'MEMORY_PROPOSAL_SUBMITTED', {
           memoryId: memory.id,
@@ -463,6 +491,12 @@ export class MemoryService {
 
       return memory;
     });
+
+    if (createdMemory.status === 'ACTIVE') {
+      this.lifecycleManager?.trigger();
+    }
+
+    return createdMemory;
   }
 
   /**
@@ -601,6 +635,18 @@ export class MemoryService {
         if (this.embeddingRepo) {
           this.embeddingRepo.deleteEmbeddingsByMemoryId(id);
         }
+        // Durable Embedding Automation: Enqueue replacement job for content update
+        if (this.embeddingJobRepo) {
+          const modelId = this.embeddingProvider?.modelId ?? this.lifecycleManager?.provider.modelId ?? 'default';
+          const modelRevision = (this.embeddingProvider as any)?.modelRevision ?? (this.lifecycleManager?.provider as any)?.modelRevision ?? 'main';
+          this.embeddingJobRepo.enqueueJob({
+            memoryId: updated.id,
+            scopeType: updated.scopeType,
+            scopeId: updated.scopeId,
+            modelId,
+            modelRevision
+          });
+        }
       }
 
       // Mandatory audit write for state update
@@ -621,6 +667,10 @@ export class MemoryService {
 
     if (!outcome.ok) {
       throw outcome.error;
+    }
+
+    if (input.content !== undefined) {
+      this.lifecycleManager?.trigger();
     }
 
     return outcome.memory;
@@ -895,6 +945,19 @@ export class MemoryService {
       const newStatus: MemoryStatus = input.decision === 'APPROVED' ? 'ACTIVE' : 'ARCHIVED';
       const updated = this.memoryRepo.updateMemory(input.memoryId, caller.scope, { status: newStatus });
 
+      // Durable Embedding Automation: Enqueue job when proposal is approved (transitions to ACTIVE)
+      if (newStatus === 'ACTIVE' && this.embeddingJobRepo) {
+        const modelId = this.embeddingProvider?.modelId ?? this.lifecycleManager?.provider.modelId ?? 'default';
+        const modelRevision = (this.embeddingProvider as any)?.modelRevision ?? (this.lifecycleManager?.provider as any)?.modelRevision ?? 'main';
+        this.embeddingJobRepo.enqueueJob({
+          memoryId: updated.id,
+          scopeType: updated.scopeType,
+          scopeId: updated.scopeId,
+          modelId,
+          modelRevision
+        });
+      }
+
       // Mandatory audit write for proposal decision
       this.audit(caller, 'MEMORY_PROPOSAL_DECIDED', {
         memoryId: updated.id,
@@ -916,6 +979,10 @@ export class MemoryService {
 
     if (!outcome.ok) {
       throw outcome.error;
+    }
+
+    if (outcome.memory.status === 'ACTIVE') {
+      this.lifecycleManager?.trigger();
     }
 
     return outcome.memory;

@@ -375,6 +375,39 @@ export class DatabaseManager {
             CREATE INDEX IF NOT EXISTS idx_memory_embeddings_model ON memory_embeddings(model_id, model_revision);
           `);
         }
+      },
+      {
+        version: '006_embedding_jobs',
+        up: (db) => {
+          db.exec(`
+            -- Embedding jobs queue: durable SQLite-backed queue for asynchronous embedding generation
+            CREATE TABLE IF NOT EXISTS embedding_jobs (
+              id TEXT PRIMARY KEY,
+              memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+              scope_type TEXT NOT NULL CHECK (scope_type IN ('GLOBAL', 'WORKSPACE')),
+              scope_id TEXT NOT NULL,
+              model_id TEXT NOT NULL,
+              model_revision TEXT NOT NULL DEFAULT 'main',
+              status TEXT NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED')),
+              attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+              max_attempts INTEGER NOT NULL DEFAULT 5 CHECK (max_attempts > 0),
+              scheduled_at TEXT NOT NULL,
+              last_error TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_embedding_jobs_claim 
+              ON embedding_jobs(status, scheduled_at, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_embedding_jobs_memory 
+              ON embedding_jobs(memory_id);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_jobs_pending_unique 
+              ON embedding_jobs(memory_id, model_id, model_revision) 
+              WHERE status = 'PENDING';
+          `);
+        }
       }
     ];
 

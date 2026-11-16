@@ -15,6 +15,7 @@ export * from './storage/audit-repository.ts';
 export * from './storage/recovery.ts';
 export * from './storage/memory-repository.ts';
 export * from './storage/memory-embedding-repository.ts';
+export * from './storage/embedding-job-repository.ts';
 
 // Model Gateway & Intelligence Layer
 export type * from './model/types.ts';
@@ -61,6 +62,7 @@ export * from './memory/embedding-types.ts';
 export * from './memory/vector-utils.ts';
 export * from './memory/mock-embedding-provider.ts';
 export * from './memory/local-embedding-provider.ts';
+export * from './memory/embedding-lifecycle-manager.ts';
 
 // Orchestration Layer
 export * from './orchestrator/coordinator.ts';

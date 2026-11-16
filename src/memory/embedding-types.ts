@@ -197,4 +197,70 @@ export interface SyncScopeEmbeddingsResult {
   readonly errors?: readonly string[];
 }
 
+/**
+ * Execution status for asynchronous embedding generation jobs.
+ */
+export type EmbeddingJobStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+
+/**
+ * Domain entity representing a persistent, SQLite-backed embedding job.
+ */
+export interface EmbeddingJob {
+  /** Unique primary key ID */
+  readonly id: string;
+  /** Foreign key referencing parent memory */
+  readonly memoryId: string;
+  /** Authoritative memory scope type */
+  readonly scopeType: MemoryScopeType;
+  /** Authoritative memory scope identifier */
+  readonly scopeId: string;
+  /** Identifier of the target embedding model */
+  readonly modelId: string;
+  /** Revision string of target embedding model (default: 'main') */
+  readonly modelRevision: string;
+  /** Current execution status */
+  readonly status: EmbeddingJobStatus;
+  /** Number of execution attempts completed so far */
+  readonly attemptCount: number;
+  /** Maximum retry attempts before marking terminally FAILED */
+  readonly maxAttempts: number;
+  /** Scheduled execution timestamp (ISO 8601 UTC) */
+  readonly scheduledAt: string;
+  /** Last failure error message, if any */
+  readonly lastError: string | null;
+  /** ISO 8601 UTC creation timestamp */
+  readonly createdAt: string;
+  /** ISO 8601 UTC last update timestamp */
+  readonly updatedAt: string;
+}
+
+/**
+ * Input DTO for enqueueing an embedding job.
+ */
+export interface EnqueueEmbeddingJobInput {
+  readonly id?: string;
+  readonly memoryId: string;
+  readonly scopeType: MemoryScopeType;
+  readonly scopeId: string;
+  readonly modelId: string;
+  readonly modelRevision?: string;
+  readonly maxAttempts?: number;
+  readonly scheduledAt?: string;
+}
+
+/**
+ * Filtering options for listing or counting embedding jobs.
+ */
+export interface ListEmbeddingJobsFilter {
+  readonly memoryId?: string;
+  readonly scopeType?: MemoryScopeType;
+  readonly scopeId?: string;
+  readonly modelId?: string;
+  readonly modelRevision?: string;
+  readonly status?: EmbeddingJobStatus;
+  readonly limit?: number;
+  readonly offset?: number;
+}
+
+
 
