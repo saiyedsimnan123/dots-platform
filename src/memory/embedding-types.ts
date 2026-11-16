@@ -79,3 +79,68 @@ export interface IEmbeddingProvider {
    */
   embedBatch(texts: readonly string[], options?: EmbeddingOptions): Promise<Float32Array[]>;
 }
+
+/**
+ * Domain entity representing a persisted vector embedding for a memory record.
+ */
+export interface MemoryEmbedding {
+  /** Unique primary key ID of the embedding record */
+  readonly id: string;
+  /** Foreign key referencing the parent memory record */
+  readonly memoryId: string;
+  /** Identifier of the model that generated this embedding (e.g. 'all-MiniLM-L6-v2') */
+  readonly modelId: string;
+  /** Model revision/version string (defaults to 'main') */
+  readonly modelRevision: string;
+  /** Vector dimensionality (e.g. 384) */
+  readonly dimensions: number;
+  /** The unit-normalized Float32Array embedding vector */
+  readonly embedding: Float32Array;
+  /** ISO 8601 UTC creation timestamp */
+  readonly createdAt: string;
+  /** ISO 8601 UTC update timestamp */
+  readonly updatedAt: string;
+}
+
+/**
+ * Input DTO for persisting or updating a memory embedding.
+ */
+export interface InsertMemoryEmbeddingInput {
+  /** Optional custom ID; generates UUID v4 if omitted */
+  readonly id?: string;
+  /** Target memory ID */
+  readonly memoryId: string;
+  /** Model identifier */
+  readonly modelId: string;
+  /** Model revision (defaults to 'main') */
+  readonly modelRevision?: string;
+  /** Vector dimensionality */
+  readonly dimensions: number;
+  /** The unit-normalized Float32Array vector */
+  readonly embedding: Float32Array;
+}
+
+/**
+ * Lightweight metadata summary of a persisted memory embedding (omits the raw vector).
+ */
+export interface MemoryEmbeddingMetadata {
+  readonly id: string;
+  readonly memoryId: string;
+  readonly modelId: string;
+  readonly modelRevision: string;
+  readonly dimensions: number;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+/**
+ * Filtering options for listing embedding metadata.
+ */
+export interface ListEmbeddingMetadataFilter {
+  readonly memoryId?: string;
+  readonly modelId?: string;
+  readonly modelRevision?: string;
+  readonly limit?: number;
+  readonly offset?: number;
+}
+

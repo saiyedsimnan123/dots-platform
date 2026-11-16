@@ -353,6 +353,28 @@ export class DatabaseManager {
               WHERE client_message_id IS NOT NULL;
           `);
         }
+      },
+      {
+        version: '005_memory_embeddings',
+        up: (db) => {
+          db.exec(`
+            -- Memory embeddings table: persistent Float32 vector embeddings for memories
+            CREATE TABLE IF NOT EXISTS memory_embeddings (
+              id TEXT PRIMARY KEY,
+              memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+              model_id TEXT NOT NULL,
+              model_revision TEXT NOT NULL DEFAULT 'main',
+              dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+              embedding BLOB NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE (memory_id, model_id, model_revision)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_embeddings_memory_id ON memory_embeddings(memory_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_embeddings_model ON memory_embeddings(model_id, model_revision);
+          `);
+        }
       }
     ];
 

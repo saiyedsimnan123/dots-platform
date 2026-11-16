@@ -173,3 +173,146 @@ export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
   // Clamp between -1.0 and 1.0 to guard against floating-point drift
   return Math.max(-1.0, Math.min(1.0, similarity));
 }
+
+/**
+ * Validates that a vector is L2-normalized within the given tolerance.
+ * Throws InvalidVectorError if not normalized, contains non-finite values, or is empty.
+ */
+export function validateNormalizedVector(
+  vector: Float32Array,
+  tolerance = 1e-3,
+  vectorName = 'vector'
+): void {
+  validateVector(vector, undefined, vectorName);
+  if (!isNormalized(vector, tolerance)) {
+    const norm = l2Norm(vector);
+    throw new InvalidVectorError(
+      `${vectorName} is not L2-normalized: expected norm ~1.0, received ${norm.toFixed(6)}.`,
+      { norm }
+    );
+  }
+}
+
+/**
+ * Serialization options for converting Float32Array vectors to SQLite BLOBs.
+ */
+export interface SerializeVectorOptions {
+  /**
+   * If true, validates that the vector is unit-normalized (L2 norm ~1.0) before serializing.
+   */
+  readonly requireNormalized?: boolean;
+  /**
+   * Tolerance for L2 normalization check (defaults to 1e-3).
+   */
+  readonly tolerance?: number;
+}
+
+/**
+ * Serializes a Float32Array vector into a raw Uint8Array BLOB for SQLite storage.
+ * 
+ * Guarantees:
+ * 1. Validates that the input is a Float32Array with non-zero dimensions and finite numbers.
+ * 2. Rejects zero-magnitude vectors.
+ * 3. Optionally validates L2 normalization if requested.
+ * 4. Returns a defensive copy in a fresh ArrayBuffer, preventing external mutations.
+ * 5. Preserves exact bitwise Float32 values (standard IEEE 754 little-endian representation).
+ */
+export function serializeVectorToBlob(
+  vector: Float32Array,
+  options?: SerializeVectorOptions
+): Uint8Array {
+  validateVector(vector);
+
+  if (isZeroVector(vector)) {
+    throw new InvalidVectorError('Cannot serialize a zero-magnitude vector.');
+  }
+
+  if (options?.requireNormalized) {
+    validateNormalizedVector(vector, options.tolerance);
+  }
+
+  // Defensive copy into an independent ArrayBuffer to avoid leaking references
+  const buffer = new ArrayBuffer(vector.byteLength);
+  new Uint8Array(buffer).set(
+    new Uint8Array(vector.buffer, vector.byteOffset, vector.byteLength)
+  );
+  return new Uint8Array(buffer);
+}
+
+/**
+ * Deserialization options for converting SQLite BLOBs to Float32Array vectors.
+ */
+export interface DeserializeVectorOptions {
+  /**
+   * If true, validates that the vector is unit-normalized (L2 norm ~1.0) after deserializing.
+   */
+  readonly requireNormalized?: boolean;
+  /**
+   * Tolerance for L2 normalization check (defaults to 1e-3).
+   */
+  readonly tolerance?: number;
+}
+
+/**
+ * Deserializes a SQLite BLOB (Uint8Array) into an independent Float32Array vector.
+ * 
+ * Guarantees:
+ * 1. Validates that input is a Uint8Array with positive byteLength divisible by 4.
+ * 2. Rejects malformed BLOB sizes (e.g. not a multiple of 4 bytes).
+ * 3. Rejects dimension mismatches if expectedDimensions is provided.
+ * 4. Ensures safe 4-byte memory alignment by copying into a fresh ArrayBuffer,
+ *    protecting against RangeErrors from unaligned node:sqlite internal buffers.
+ * 5. Validates that all deserialized float values are finite (no NaN, Infinity).
+ * 6. Rejects zero-magnitude vectors.
+ * 7. Optionally validates L2 normalization if requested.
+ * 8. Returns a completely independent Float32Array instance.
+ */
+export function deserializeBlobToVector(
+  blob: unknown,
+  expectedDimensions?: number,
+  options?: DeserializeVectorOptions
+): Float32Array {
+  if (!blob || !(blob instanceof Uint8Array)) {
+    throw new InvalidVectorError('Vector BLOB must be an instance of Uint8Array.');
+  }
+
+  if (blob.byteLength === 0) {
+    throw new InvalidVectorError('Vector BLOB must not be empty (byteLength must be > 0).');
+  }
+
+  if (blob.byteLength % 4 !== 0) {
+    throw new InvalidVectorError(
+      `Malformed vector BLOB: byteLength (${blob.byteLength}) must be a multiple of 4 for Float32Array.`,
+      { byteLength: blob.byteLength }
+    );
+  }
+
+  const dimensions = blob.byteLength / 4;
+  if (expectedDimensions !== undefined && dimensions !== expectedDimensions) {
+    throw new InvalidVectorError(
+      `Vector dimension mismatch: expected ${expectedDimensions}, but BLOB contains ${dimensions} dimensions (${blob.byteLength} bytes).`,
+      { expectedDimensions, actualDimensions: dimensions, byteLength: blob.byteLength }
+    );
+  }
+
+  // Ensure 4-byte alignment and defensive copying
+  const alignedBuffer = new ArrayBuffer(blob.byteLength);
+  new Uint8Array(alignedBuffer).set(
+    new Uint8Array(blob.buffer, blob.byteOffset, blob.byteLength)
+  );
+  const vector = new Float32Array(alignedBuffer);
+
+  // Validate values (no NaN, no Infinity)
+  validateVector(vector, expectedDimensions);
+
+  if (isZeroVector(vector)) {
+    throw new InvalidVectorError('Deserialized vector cannot be a zero-magnitude vector.');
+  }
+
+  if (options?.requireNormalized) {
+    validateNormalizedVector(vector, options.tolerance, 'deserialized vector');
+  }
+
+  return vector;
+}
+

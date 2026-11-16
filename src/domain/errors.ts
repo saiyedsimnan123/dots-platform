@@ -369,6 +369,25 @@ export class EmbeddingInferenceError extends DomainError {
   }
 }
 
+/**
+ * Thrown when an embedding record cannot be found for a given memory.
+ */
+export class EmbeddingNotFoundError extends DomainError {
+  public readonly memoryId: string;
+  public readonly modelId?: string;
+
+  constructor(memoryId: string, modelId?: string, details: Record<string, unknown> = {}) {
+    super(
+      `Embedding for memory '${memoryId}'${modelId ? ` and model '${modelId}'` : ''} was not found.`,
+      'EMBEDDING_NOT_FOUND',
+      { memoryId, modelId, ...details }
+    );
+    this.memoryId = memoryId;
+    this.modelId = modelId;
+  }
+}
+
+
 
 
 

@@ -68,9 +68,13 @@ import {
   MemoryScopeViolationError,
   MemoryNotFoundError,
   MemoryConflictError,
-  TaskNotFoundError
+  TaskNotFoundError,
+  EmbeddingProviderUnavailableError,
+  EmbeddingNotFoundError
 } from '../domain/errors.ts';
 import { MemoryRepository } from '../storage/memory-repository.ts';
+import type { MemoryEmbeddingRepository } from '../storage/memory-embedding-repository.ts';
+import type { IEmbeddingProvider, MemoryEmbedding } from './embedding-types.ts';
 import type { AuditRepository } from '../storage/audit-repository.ts';
 import type { TaskRepository } from '../storage/task-repository.ts';
 import type { DatabaseManager } from '../storage/db.ts';
@@ -109,6 +113,8 @@ export interface SearchMemoriesOptions {
 
 export interface MemoryServiceOptions {
   readonly memoryRepo: MemoryRepository;
+  readonly embeddingRepo?: MemoryEmbeddingRepository;
+  readonly embeddingProvider?: IEmbeddingProvider;
   readonly auditRepo?: AuditRepository;
   readonly taskRepo?: TaskRepository;
   readonly authorizer?: MemoryAuthorizer;
@@ -181,6 +187,8 @@ function validateAndNormalizeUtcTimestamp(timestamp: unknown, fieldName: string)
 
 export class MemoryService {
   private readonly memoryRepo: MemoryRepository;
+  private readonly embeddingRepo?: MemoryEmbeddingRepository;
+  private readonly embeddingProvider?: IEmbeddingProvider;
   private readonly auditRepo?: AuditRepository;
   private readonly taskRepo?: TaskRepository;
   readonly #authorizer: MemoryAuthorizer;
@@ -215,6 +223,13 @@ export class MemoryService {
       );
     }
 
+    // EmbeddingRepository must also share the same DatabaseManager if provided.
+    if (options.embeddingRepo && options.embeddingRepo.db !== options.memoryRepo.db) {
+      throw new ValidationError(
+        'MemoryRepository and MemoryEmbeddingRepository must share the exact same DatabaseManager instance.'
+      );
+    }
+
     // Authorization boundary consistency: if both authorizer and hostAuthority are supplied,
     // authorizer must be the exact authorizer instance owned by hostAuthority.
     if (options.authorizer && options.hostAuthority && options.authorizer !== options.hostAuthority.authorizer) {
@@ -224,6 +239,8 @@ export class MemoryService {
     }
 
     this.memoryRepo = options.memoryRepo;
+    this.embeddingRepo = options.embeddingRepo;
+    this.embeddingProvider = options.embeddingProvider;
     this.auditRepo = options.auditRepo;
     this.taskRepo = options.taskRepo;
     this.#authorizer = options.authorizer ?? options.hostAuthority?.authorizer ?? new MemoryAuthorizer({ taskRepo: options.taskRepo });
@@ -565,6 +582,14 @@ export class MemoryService {
 
       const updated = this.memoryRepo.updateMemory(id, caller.scope, input);
 
+      // Invalidate existing embeddings if embedding-relevant content changes.
+      // Priority, tag, category, and metadata updates do not trigger embedding invalidation.
+      if (input.content !== undefined) {
+        if (this.embeddingRepo) {
+          this.embeddingRepo.deleteEmbeddingsByMemoryId(id);
+        }
+      }
+
       // Mandatory audit write for state update
       this.audit(caller, 'MEMORY_UPDATED', {
         memoryId: updated.id,
@@ -881,6 +906,169 @@ export class MemoryService {
     }
 
     return outcome.memory;
+  }
+
+  /**
+   * Generates and persists a vector embedding for an authorized ACTIVE memory record.
+   * 
+   * Guarantees:
+   * 1. Requires WRITE permission and authoritative memory scope validation.
+   * 2. Rejects PENDING_APPROVAL proposals: only ACTIVE memories may receive embeddings.
+   * 3. Model inference executes strictly OUTSIDE of database transactions.
+   * 4. Safe failure: if provider inference fails, memory records remain uncorrupted.
+   * 5. Persists the vector into the persistent SQLite embedding repository.
+   */
+  public async generateMemoryEmbedding(
+    caller: CallerContext,
+    memoryId: string,
+    provider?: IEmbeddingProvider
+  ): Promise<MemoryEmbedding> {
+    this.validateCaller(caller, 'WRITE');
+    if (!memoryId || typeof memoryId !== 'string' || memoryId.trim() === '') {
+      throw new ValidationError('Memory ID must be a non-empty string.');
+    }
+
+    if (!this.embeddingRepo) {
+      throw new ValidationError('Memory embedding repository is not configured on MemoryService.');
+    }
+
+    const effectiveProvider = provider ?? this.embeddingProvider;
+    if (!effectiveProvider) {
+      throw new EmbeddingProviderUnavailableError(
+        'none',
+        'No embedding provider configured or supplied for vector generation.'
+      );
+    }
+
+    // 1. Authoritative lookup of memory within caller scope
+    let memory: Memory | null;
+    try {
+      memory = this.memoryRepo.getMemoryById(memoryId, caller.scope);
+    } catch (err) {
+      if (err instanceof MemoryScopeViolationError) {
+        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+          reason: 'CROSS_SCOPE_EMBEDDING_GENERATE_ATTEMPT',
+          memoryId,
+          expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+        }, false);
+      }
+      throw err;
+    }
+
+    if (!memory) {
+      throw new MemoryNotFoundError(memoryId);
+    }
+
+    // 2. Strict status check: only ACTIVE memories can be embedded
+    if (memory.status === 'PENDING_APPROVAL') {
+      throw new ValidationError(
+        `Cannot generate embedding for proposal '${memoryId}': status is PENDING_APPROVAL. Proposals cannot receive embeddings until approved.`
+      );
+    }
+
+    if (memory.status !== 'ACTIVE') {
+      throw new ValidationError(
+        `Cannot generate embedding for memory '${memoryId}': status is '${memory.status}'. Only ACTIVE memories can receive embeddings.`
+      );
+    }
+
+    // 3. Format text for embedding: combine key and content
+    const textToEmbed = `${memory.key}: ${memory.content}`;
+
+    // 4. Model inference executed strictly outside any SQLite transaction!
+    const vector = await effectiveProvider.embed(textToEmbed);
+
+    // 5. Persist into embedding repository
+    const embedding = this.embeddingRepo.upsertEmbedding({
+      memoryId: memory.id,
+      modelId: effectiveProvider.modelId,
+      modelRevision: 'main',
+      dimensions: effectiveProvider.dimensions,
+      embedding: vector
+    });
+
+    return embedding;
+  }
+
+  /**
+   * Retrieves the stored embedding for an authorized memory item.
+   * Enforces caller authorization, workspace isolation, and global inheritance boundaries.
+   */
+  public getMemoryEmbedding(
+    caller: CallerContext,
+    memoryId: string,
+    modelId: string,
+    modelRevision = 'main'
+  ): MemoryEmbedding | null {
+    this.validateCaller(caller, 'READ');
+    if (!memoryId || typeof memoryId !== 'string' || memoryId.trim() === '') {
+      throw new ValidationError('Memory ID must be a non-empty string.');
+    }
+    if (!modelId || typeof modelId !== 'string' || modelId.trim() === '') {
+      throw new ValidationError('Model ID must be a non-empty string.');
+    }
+
+    if (!this.embeddingRepo) {
+      return null;
+    }
+
+    const memory = this.getMemoryById(caller, memoryId);
+    if (!memory) {
+      throw new MemoryNotFoundError(memoryId);
+    }
+
+    if (!this.isMemoryEligibleForCaller(memory, caller)) {
+      this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+        reason: 'UNAUTHORIZED_PRINCIPAL_EMBEDDING_ACCESS',
+        memoryId,
+        expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+      }, false);
+      throw new MemoryScopeViolationError(
+        `${caller.scope.scopeType}:${caller.scope.scopeId}`,
+        `${memory.scopeType}:${memory.scopeId}`,
+        memory.id
+      );
+    }
+
+    return this.embeddingRepo.getEmbedding(memory.id, modelId, modelRevision);
+  }
+
+  /**
+   * Retrieves embeddings for a list of candidate memory IDs, filtering strictly
+   * to those memories authorized for the caller under scope and inheritance rules.
+   */
+  public getMemoryEmbeddings(
+    caller: CallerContext,
+    memoryIds: readonly string[],
+    modelId: string,
+    modelRevision = 'main'
+  ): MemoryEmbedding[] {
+    this.validateCaller(caller, 'READ');
+    if (!memoryIds || !Array.isArray(memoryIds) || memoryIds.length === 0) {
+      return [];
+    }
+    if (!this.embeddingRepo) {
+      return [];
+    }
+
+    const authorizedMemoryIds: string[] = [];
+    for (const memId of memoryIds) {
+      if (typeof memId !== 'string' || memId.trim() === '') continue;
+      try {
+        const mem = this.getMemoryById(caller, memId);
+        if (mem && this.isMemoryEligibleForCaller(mem, caller)) {
+          authorizedMemoryIds.push(mem.id);
+        }
+      } catch {
+        // Unauthorized or non-existent memories are safely skipped
+      }
+    }
+
+    if (authorizedMemoryIds.length === 0) {
+      return [];
+    }
+
+    return this.embeddingRepo.getEmbeddingsForMemories(authorizedMemoryIds, modelId, modelRevision);
   }
 
   /**

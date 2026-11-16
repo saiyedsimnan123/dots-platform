@@ -593,5 +593,61 @@ Phase 4C.3 implements `LocalEmbeddingProvider`, a concrete local-first embedding
     npm uninstall @huggingface/transformers
     ```
 
+---
+
+## 16. Phase 4C.4 Persistent SQLite Vector Storage
+
+Phase 4C.4 implements durable, secure SQLite storage and lifecycle management for memory vector embeddings using Node.js 24's built-in `node:sqlite` API, zero external vector databases, and the provider abstractions established in Phases 4C.2 and 4C.3:
+
+- **SQLite Schema & Migration (`005_memory_embeddings`)**:
+  - Implemented in `src/storage/db.ts` under version `'005_memory_embeddings'`.
+  - Schema definition:
+    ```sql
+    CREATE TABLE IF NOT EXISTS memory_embeddings (
+      id TEXT PRIMARY KEY,
+      memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+      model_id TEXT NOT NULL,
+      model_revision TEXT NOT NULL DEFAULT 'main',
+      dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+      embedding BLOB NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE (memory_id, model_id, model_revision)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_memory_embeddings_memory_id ON memory_embeddings(memory_id);
+    CREATE INDEX IF NOT EXISTS idx_memory_embeddings_model ON memory_embeddings(model_id, model_revision);
+    ```
+  - **Foreign Key Cascade**: `memory_id REFERENCES memories(id) ON DELETE CASCADE` guarantees that deleting a memory from `memories` physically removes all associated vector embeddings automatically via SQLite's foreign key engine (`PRAGMA foreign_keys = ON;`).
+  - **Composite Uniqueness**: `UNIQUE (memory_id, model_id, model_revision)` prevents duplicate vector records for the same memory under the same model and revision.
+- **Binary BLOB Serialization & 4-Byte Alignment Safety (`src/memory/vector-utils.ts`)**:
+  - `serializeVectorToBlob(vector, options)`: Converts Float32Array to little-endian raw byte BLOBs (`Uint8Array`) inside an independent `ArrayBuffer`. Validates finite values, non-empty dimensions, non-zero magnitude, and unit normalization.
+  - `deserializeBlobToVector(blob, expectedDimensions, options)`: Deserializes SQLite BLOBs into independent `Float32Array` vectors.
+  - **Byte Alignment Invariant**: In Node.js 24 `node:sqlite`, returned BLOB `Uint8Array` slices can have unaligned buffer offsets (`byteOffset % 4 !== 0`). Direct `new Float32Array(blob.buffer, blob.byteOffset, ...)` will throw a runtime `RangeError`. `deserializeBlobToVector` defensively copies bytes into an aligned `ArrayBuffer` to guarantee 100% safe execution across all platforms.
+  - Bit-exact round trips: Values survive serialization bit-for-bit without floating-point precision loss.
+- **Model Identity & Revision Isolation**:
+  - Each stored vector is strictly partitioned by `(model_id, model_revision)`.
+  - The repository supports coexisting embeddings for the same memory across different models (e.g. `mock-model-384` vs `mock-model-512` or `onnx-community/all-MiniLM-L6-v2-ONNX@main` vs `@v2`).
+  - Querying or deleting embeddings for one model does not impact or cross-contaminate another model's vector space.
+- **Memory Lifecycle & Stale Embedding Invalidation**:
+  - **Strict Status Gate**: Only `ACTIVE` memories are eligible for vector embedding.
+  - **Proposals Gate**: `PENDING_APPROVAL` proposals can **never** receive embeddings. Calling `generateMemoryEmbedding` on a proposal fails closed with `ValidationError`.
+  - **Post-Approval Activation**: Once human approval activates a proposal via `decideProposal`, its embedding can be generated via explicit lifecycle operation.
+  - **Staleness Invalidation**: When a memory's embedding-relevant `content` is modified via `updateMemory`, existing embeddings for that memory are immediately purged from `memory_embeddings`. Updates to `priority`, `tags`, or `metadata` do not trigger invalidation.
+- **Zero Inference in SQLite Transactions**:
+  - Model inference (`provider.embed()`) is executed strictly **outside** any SQLite transaction.
+  - Only the resulting vector is written to the database in a fast, isolated transaction, preventing SQLite table locks or lock contention during slow model inference or GPU/CPU processing.
+  - Safe Failure: Provider inference failures throw `EmbeddingInferenceError` without leaving partial writes or corrupting memory state.
+- **Security & Authorization Boundaries**:
+  - Scope and caller verification are strictly host-enforced before accessing any embedding.
+  - Workspace callers cannot retrieve or generate embeddings for memories belonging to foreign workspaces (`MemoryScopeViolationError`).
+  - Inherited global memory embeddings require verified same-principal eligibility (`isMemoryEligibleForCaller`) before vectors are returned.
+  - All SQL queries are 100% parameterized.
+- **Strict Scope Boundary: Hybrid Retrieval Not Yet Implemented**:
+  - Phase 4C.4 is strictly about vector persistence and lifecycle management.
+  - Lexical retrieval (`searchMemories`, `buildTaskMemoryContext`, `RelevanceMatcher`) continues to function as the platform's primary, trusted retrieval mechanism.
+  - Hybrid scoring, vector indexing, and cosine similarity ranking are deferred to Phase 4C.5.
+
+
 
 
