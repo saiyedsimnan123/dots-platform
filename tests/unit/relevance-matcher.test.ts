@@ -106,12 +106,243 @@ test('RelevanceMatcher - tag overlap evaluates candidate tags against query term
     content: 'Nothing overlapping here.'
   });
 
-  // Query matches 2 of 3 tags ('postgres', 'database')
+  // Phase 4D.2A: Query non-stop tokens are ['connect', 'postgres', 'database', 'instance'] (size 4).
+  // Candidate tags match 2 query tokens ('postgres', 'database').
+  // Tag coverage formula: |matchedTags| / |queryTokenSet| = 2 / 4 = 0.5000 (replacing old buggy 2/3 candidate tag ratio).
   const scored = matcher.score('connect to postgres database instance', candidate);
-  assert.equal(scored.breakdown.tagMatch, 0.6667);
+  assert.equal(scored.breakdown.tagMatch, 0.5000);
   assert.deepEqual(scored.breakdown.matchedTags, ['postgres', 'database']);
-  // Tag weight: 0.30 * 0.6667 = 0.20
-  assert.equal(scored.score, 0.20);
+  // Tag weight: 0.30 * 0.5000 = 0.1500
+  assert.equal(scored.score, 0.1500);
+});
+
+test('RelevanceMatcher - Phase 4D.2A: richly tagged memories are not penalized vs sparsely tagged memories', () => {
+  const matcher = new RelevanceMatcher();
+
+  const sparseCandidate = createMockMemory({
+    id: 'mem-sparse',
+    key: 'unrelated.key.sparse',
+    tagsJson: '["database"]',
+    content: 'Nothing overlapping here.'
+  });
+
+  const richCandidate = createMockMemory({
+    id: 'mem-rich',
+    key: 'unrelated.key.rich',
+    tagsJson: '["postgres", "database", "sql", "rdbms", "storage", "backend", "cluster", "replication", "migrations", "acid"]',
+    content: 'Nothing overlapping here.'
+  });
+
+  const query = 'connect to postgres database';
+  // Query non-stop tokens: ['connect', 'postgres', 'database'] (size 3)
+
+  const sparseScore = matcher.score(query, sparseCandidate);
+  const richScore = matcher.score(query, richCandidate);
+
+  // Sparse matches 1 tag ('database') -> coverage: 1 / 3 = 0.3333
+  assert.equal(sparseScore.breakdown.tagMatch, 0.3333);
+  assert.deepEqual(sparseScore.breakdown.matchedTags, ['database']);
+
+  // Rich matches 2 tags ('postgres', 'database') -> coverage: 2 / 3 = 0.6667
+  assert.equal(richScore.breakdown.tagMatch, 0.6667);
+  assert.deepEqual(richScore.breakdown.matchedTags, ['postgres', 'database']);
+
+  // Acceptance Test 1: Rich candidate matching 2 query terms MUST NOT score below sparse candidate matching 1!
+  assert.ok(
+    richScore.breakdown.tagMatch > sparseScore.breakdown.tagMatch,
+    `Rich tag score (${richScore.breakdown.tagMatch}) must exceed sparse tag score (${sparseScore.breakdown.tagMatch})`
+  );
+  assert.ok(richScore.score > sparseScore.score);
+});
+
+test('RelevanceMatcher - Phase 4D.2A: adding unrelated tags to candidate never reduces tag score', () => {
+  const matcher = new RelevanceMatcher();
+
+  const baselineCandidate = createMockMemory({
+    key: 'unrelated.key',
+    tagsJson: '["docker", "container"]',
+    content: 'Nothing here.'
+  });
+
+  const augmentedCandidate = createMockMemory({
+    key: 'unrelated.key',
+    tagsJson: '["docker", "container", "unrelated1", "unrelated2", "unrelated3", "noise", "metadata", "extra"]',
+    content: 'Nothing here.'
+  });
+
+  const query = 'docker container deployment';
+  const scoreBase = matcher.score(query, baselineCandidate);
+  const scoreAugmented = matcher.score(query, augmentedCandidate);
+
+  // Acceptance Test 2: Adding 6 unrelated tags must NOT reduce the tag score!
+  assert.equal(scoreBase.breakdown.tagMatch, scoreAugmented.breakdown.tagMatch);
+  assert.equal(scoreBase.score, scoreAugmented.score);
+});
+
+test('RelevanceMatcher - Phase 4D.2A: adding relevant matching tags strictly increases or saturates tag score', () => {
+  const matcher = new RelevanceMatcher();
+
+  const cand1 = createMockMemory({
+    key: 'unrelated.key',
+    tagsJson: '["docker"]',
+    content: 'Nothing here.'
+  });
+
+  const cand2 = createMockMemory({
+    key: 'unrelated.key',
+    tagsJson: '["docker", "container"]',
+    content: 'Nothing here.'
+  });
+
+  const cand3 = createMockMemory({
+    key: 'unrelated.key',
+    tagsJson: '["docker", "container", "deployment"]',
+    content: 'Nothing here.'
+  });
+
+  const query = 'docker container deployment';
+  // Query non-stop tokens: ['docker', 'container', 'deployment'] (size 3)
+
+  const s1 = matcher.score(query, cand1);
+  const s2 = matcher.score(query, cand2);
+  const s3 = matcher.score(query, cand3);
+
+  // Acceptance Test 3: Monotonically increasing score with additional matching tags
+  assert.equal(s1.breakdown.tagMatch, 0.3333); // 1 / 3
+  assert.equal(s2.breakdown.tagMatch, 0.6667); // 2 / 3
+  assert.equal(s3.breakdown.tagMatch, 1.0000); // 3 / 3
+  assert.ok(s1.breakdown.tagMatch < s2.breakdown.tagMatch);
+  assert.ok(s2.breakdown.tagMatch < s3.breakdown.tagMatch);
+});
+
+test('RelevanceMatcher - Phase 4D.2A: empty tags, empty queries, and malformed tags never cause division by zero', () => {
+  const matcher = new RelevanceMatcher();
+
+  const emptyCandidate = createMockMemory({ tagsJson: '[]', content: 'content' });
+  const malformedCandidate = createMockMemory({ tagsJson: '{malformed json}', content: 'content' });
+  const nonArrayCandidate = createMockMemory({ tagsJson: '"string-not-array"', content: 'content' });
+
+  // Empty query
+  const resEmptyQuery = matcher.score('', emptyCandidate);
+  assert.equal(resEmptyQuery.breakdown.tagMatch, 0.0);
+  assert.equal(resEmptyQuery.score, 0.0);
+
+  // Stop-word-only query
+  const resStopOnly = matcher.score('what is the and or', emptyCandidate);
+  assert.equal(resStopOnly.breakdown.tagMatch, 0.0);
+
+  // Empty tags on candidate
+  const resEmptyTags = matcher.score('docker container', emptyCandidate);
+  assert.equal(resEmptyTags.breakdown.tagMatch, 0.0);
+
+  // Malformed JSON tags
+  const resMalformed = matcher.score('docker container', malformedCandidate);
+  assert.equal(resMalformed.breakdown.tagMatch, 0.0);
+
+  // Non-array JSON tags
+  const resNonArray = matcher.score('docker container', nonArrayCandidate);
+  assert.equal(resNonArray.breakdown.tagMatch, 0.0);
+});
+
+test('RelevanceMatcher - Phase 4D.2A.1: query token tag coverage regression tests', () => {
+  const matcher = new RelevanceMatcher();
+  const query = 'connect to postgres database';
+  // Non-stop query tokens: ['connect', 'postgres', 'database'] (size 3)
+
+  // 1. Query "connect to postgres database" with tag ["postgres database"] scores 0.6667
+  const candMultiwordPhrase = createMockMemory({
+    tagsJson: '["postgres database"]',
+    content: 'Unrelated body text'
+  });
+  const resMultiwordPhrase = matcher.score(query, candMultiwordPhrase);
+  assert.equal(resMultiwordPhrase.breakdown.tagMatch, 0.6667);
+  assert.deepEqual(resMultiwordPhrase.breakdown.matchedTags, ['postgres database']);
+
+  // 2. The same query with tags ["postgres", "database"] also scores 0.6667
+  const candSeparateTags = createMockMemory({
+    tagsJson: '["postgres", "database"]',
+    content: 'Unrelated body text'
+  });
+  const resSeparateTags = matcher.score(query, candSeparateTags);
+  assert.equal(resSeparateTags.breakdown.tagMatch, 0.6667);
+  assert.deepEqual(resSeparateTags.breakdown.matchedTags, ['postgres', 'database']);
+
+  // 3. Tag ["connect to postgres database"] scores 1.0
+  const candFullPhrase = createMockMemory({
+    tagsJson: '["connect to postgres database"]',
+    content: 'Unrelated body text'
+  });
+  const resFullPhrase = matcher.score(query, candFullPhrase);
+  assert.equal(resFullPhrase.breakdown.tagMatch, 1.0000);
+  assert.deepEqual(resFullPhrase.breakdown.matchedTags, ['connect to postgres database']);
+
+  // 4. Adding unrelated tags does not reduce the score
+  const candWithUnrelated = createMockMemory({
+    tagsJson: '["postgres", "database", "unrelated1", "noise_tag", "random"]',
+    content: 'Unrelated body text'
+  });
+  const resWithUnrelated = matcher.score(query, candWithUnrelated);
+  assert.equal(resWithUnrelated.breakdown.tagMatch, 0.6667);
+
+  // 5. Duplicate tags and duplicate words do not inflate the score
+  const candDuplicateTags = createMockMemory({
+    tagsJson: '["postgres", "postgres", "database", "database"]',
+    content: 'Unrelated body text'
+  });
+  const resDuplicateTags = matcher.score(query, candDuplicateTags);
+  assert.equal(resDuplicateTags.breakdown.tagMatch, 0.6667);
+
+  const candDuplicateWords = createMockMemory({
+    tagsJson: '["postgres postgres", "database database"]',
+    content: 'Unrelated body text'
+  });
+  const resDuplicateWords = matcher.score(query, candDuplicateWords);
+  assert.equal(resDuplicateWords.breakdown.tagMatch, 0.6667);
+
+  // 6. Tag ["to"] scores zero for the query above
+  const candStopWordTag = createMockMemory({
+    tagsJson: '["to"]',
+    content: 'Unrelated body text'
+  });
+  const resStopWordTag = matcher.score(query, candStopWordTag);
+  assert.equal(resStopWordTag.breakdown.tagMatch, 0.0);
+  assert.deepEqual(resStopWordTag.breakdown.matchedTags, []);
+
+  // 7. Case and punctuation variations normalize consistently
+  const candCasePunct = createMockMemory({
+    tagsJson: '["  POSTGRES  ", "DATABASE!!!", "Connect."]',
+    content: 'Unrelated body text'
+  });
+  const resCasePunct = matcher.score(query, candCasePunct);
+  assert.equal(resCasePunct.breakdown.tagMatch, 1.0000);
+
+  // 8. Hyphenated and underscored tags cover their constituent query tokens
+  const candHyphenated = createMockMemory({
+    tagsJson: '["postgres-database"]',
+    content: 'Unrelated body text'
+  });
+  const resHyphenated = matcher.score(query, candHyphenated);
+  assert.equal(resHyphenated.breakdown.tagMatch, 0.6667);
+
+  const candUnderscored = createMockMemory({
+    tagsJson: '["postgres_database"]',
+    content: 'Unrelated body text'
+  });
+  const resUnderscored = matcher.score(query, candUnderscored);
+  assert.equal(resUnderscored.breakdown.tagMatch, 0.6667);
+
+  const candPartialHyphen = createMockMemory({
+    tagsJson: '["postgres-db"]',
+    content: 'Unrelated body text'
+  });
+  const resPartialHyphen = matcher.score(query, candPartialHyphen);
+  // 'postgres' covers 1 query token out of 3 = 1 / 3 = 0.3333
+  assert.equal(resPartialHyphen.breakdown.tagMatch, 0.3333);
+
+  // 9. Empty and stop-word-only queries safely return zero
+  assert.equal(matcher.score('', candSeparateTags).breakdown.tagMatch, 0.0);
+  assert.equal(matcher.score('   ', candSeparateTags).breakdown.tagMatch, 0.0);
+  assert.equal(matcher.score('to and the or in at', candSeparateTags).breakdown.tagMatch, 0.0);
 });
 
 test('RelevanceMatcher - word overlap filters stop words and scores keyword recall', () => {
@@ -350,14 +581,16 @@ test('RelevanceMatcher - regression: bounded phrase matching prevents partial-wo
   assert.deepEqual(scoredPluralQueryOnSingular.breakdown.matchedTags, []);
 
   const scoredPluralQueryOnPlural = matcher.score('we need multiple databases', memPlural);
-  assert.equal(scoredPluralQueryOnPlural.breakdown.tagMatch, 1.0);
+  // Phase 4D.2A: Query tokens are ['need', 'multiple', 'databases'] (size 3). 1 matched tag yields 1/3 = 0.3333.
+  assert.equal(scoredPluralQueryOnPlural.breakdown.tagMatch, 0.3333);
   assert.deepEqual(scoredPluralQueryOnPlural.breakdown.matchedTags, ['databases']);
 
   // Query: "connect to database"
-  // Must match memSingular ('database') with tagMatch 1.0
+  // Must match memSingular ('database') with tagMatch > 0
   // Must NOT match memPlural ('databases')
   const scoredSingularQueryOnSingular = matcher.score('connect to database', memSingular);
-  assert.equal(scoredSingularQueryOnSingular.breakdown.tagMatch, 1.0);
+  // Phase 4D.2A: Query tokens are ['connect', 'database'] (size 2). 1 matched tag yields 1/2 = 0.5000.
+  assert.equal(scoredSingularQueryOnSingular.breakdown.tagMatch, 0.5000);
   assert.deepEqual(scoredSingularQueryOnSingular.breakdown.matchedTags, ['database']);
 
   const scoredSingularQueryOnPlural = matcher.score('connect to database', memPlural);

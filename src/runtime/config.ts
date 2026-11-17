@@ -55,6 +55,7 @@ export interface DotsRuntimeConfig {
   readonly embeddingPollIntervalMs: number;
   readonly embeddingDimensions: number;
   readonly embeddingLocalModelPath?: string;
+  readonly embeddingMinSemanticConfidence: number;
 }
 
 export interface LoadRuntimeConfigOverrides {
@@ -86,6 +87,7 @@ export interface LoadRuntimeConfigOverrides {
   readonly embeddingPollIntervalMs?: number;
   readonly embeddingDimensions?: number;
   readonly embeddingLocalModelPath?: string;
+  readonly embeddingMinSemanticConfidence?: number;
   readonly requireTokens?: boolean;
   readonly env?: Record<string, string | undefined>;
 }
@@ -322,6 +324,32 @@ export function loadRuntimeConfig(overrides: LoadRuntimeConfigOverrides = {}): D
       : undefined);
   const embeddingLocalModelPath = overrides.embeddingLocalModelPath ?? defaultLocalModelPath;
 
+  let embeddingMinSemanticConfidence = 0.20;
+  if (overrides.embeddingMinSemanticConfidence !== undefined) {
+    if (
+      typeof overrides.embeddingMinSemanticConfidence !== 'number' ||
+      !Number.isFinite(overrides.embeddingMinSemanticConfidence) ||
+      overrides.embeddingMinSemanticConfidence < 0 ||
+      overrides.embeddingMinSemanticConfidence > 1
+    ) {
+      throw new ValidationError(
+        `Configuration 'embeddingMinSemanticConfidence' must be a number between 0.0 and 1.0. Received '${overrides.embeddingMinSemanticConfidence}'.`
+      );
+    }
+    embeddingMinSemanticConfidence = overrides.embeddingMinSemanticConfidence;
+  } else if (
+    env.DOTS_EMBEDDING_MIN_SEMANTIC_CONFIDENCE !== undefined &&
+    env.DOTS_EMBEDDING_MIN_SEMANTIC_CONFIDENCE.trim() !== ''
+  ) {
+    const parsed = Number(env.DOTS_EMBEDDING_MIN_SEMANTIC_CONFIDENCE);
+    if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+      throw new ValidationError(
+        `Configuration 'DOTS_EMBEDDING_MIN_SEMANTIC_CONFIDENCE' must be a number between 0.0 and 1.0. Received '${env.DOTS_EMBEDDING_MIN_SEMANTIC_CONFIDENCE}'.`
+      );
+    }
+    embeddingMinSemanticConfidence = parsed;
+  }
+
   return {
     dbPath,
     workspaceRoot,
@@ -354,6 +382,7 @@ export function loadRuntimeConfig(overrides: LoadRuntimeConfigOverrides = {}): D
     embeddingModelRevision,
     embeddingPollIntervalMs,
     embeddingDimensions,
-    embeddingLocalModelPath
+    embeddingLocalModelPath,
+    embeddingMinSemanticConfidence
   };
 }

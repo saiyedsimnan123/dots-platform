@@ -13,8 +13,10 @@
  *    - Proportional ratio (matchedKeyTokens / totalKeyTokens) if non-stop key tokens match query tokens.
  *    - 0.0 if no key tokens match or key is empty.
  * 2. Tag Match (Default weight: 0.30):
- *    - Proportional ratio (matchedTags / totalCandidateTags) of candidate tags present in query.
- *    - 0.0 if candidate has no tags or none match.
+ *    - Query token tag coverage ratio: (|coveredQueryTokens| / |queryTokens|), bounded to [0.0, 1.0].
+ *    - Evaluates how thoroughly candidate tags cover query terms by token intersection.
+ *    - Adding tags never penalizes the score.
+ *    - 0.0 if candidate has no tags, query has no non-stop tokens, or none match.
  * 3. Word Overlap (Default weight: 0.20):
  *    - Query term recall: (|queryTokens ∩ candidateContentTokens| / |queryTokens|).
  *    - Independent of memory length bias; evaluates how thoroughly the candidate answers query terms.
@@ -311,7 +313,7 @@ export class RelevanceMatcher {
     queryTokenSet: Set<string>,
     tagsJson: string
   ): { score: number; matchedTags: string[] } {
-    if (!tagsJson || typeof tagsJson !== 'string') {
+    if (!tagsJson || typeof tagsJson !== 'string' || queryTokenSet.size === 0) {
       return { score: 0.0, matchedTags: [] };
     }
 
@@ -334,18 +336,42 @@ export class RelevanceMatcher {
       return { score: 0.0, matchedTags: [] };
     }
 
+    // Phase 4D.2A.1: Unique normalized query token coverage
+    // Intersect candidate tag tokens with non-stop-word query token set.
+    // Count each covered query token only once regardless of duplicate tags or repeated words.
+    const coveredQueryTokens = new Set<string>();
     const matchedTags: string[] = [];
+
     for (const tag of candidateTags) {
-      if (queryTokenSet.has(tag) || isBoundedPhraseMatch(normalizedQuery, tag)) {
+      const tagTokens = tokenizeText(tag, this.stopWords);
+      if (tagTokens.length === 0) {
+        continue;
+      }
+
+      for (const token of tagTokens) {
+        if (queryTokenSet.has(token)) {
+          coveredQueryTokens.add(token);
+        }
+      }
+
+      // Candidate tag is included in matchedTags if all its non-stop tokens match query terms
+      // or if it appears as a bounded phrase in the query.
+      const isTagMatched =
+        tagTokens.every((token) => queryTokenSet.has(token)) ||
+        isBoundedPhraseMatch(normalizedQuery, tag);
+
+      if (isTagMatched && !matchedTags.includes(tag)) {
         matchedTags.push(tag);
       }
     }
 
-    if (matchedTags.length === 0) {
+    if (coveredQueryTokens.size === 0) {
       return { score: 0.0, matchedTags: [] };
     }
 
-    const score = Math.round((matchedTags.length / candidateTags.length) * 10_000) / 10_000;
+    // tagScore = min(1.0, |coveredQueryTokens| / |queryTokenSet|)
+    const coverageRatio = coveredQueryTokens.size / queryTokenSet.size;
+    const score = Math.round(Math.min(1.0, coverageRatio) * 10_000) / 10_000;
     return { score, matchedTags };
   }
 

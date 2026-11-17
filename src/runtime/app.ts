@@ -332,7 +332,8 @@ export class DotsRuntime {
       embeddingRepo: this.embeddingRepo,
       embeddingJobRepo: this.embeddingJobRepo,
       embeddingProvider: this.embeddingProvider ?? undefined,
-      lifecycleManager: this.lifecycleManager ?? undefined
+      lifecycleManager: this.lifecycleManager ?? undefined,
+      minSemanticConfidence: this.config.embeddingMinSemanticConfidence
     });
 
     this.toolRegistry = new ToolRegistry();

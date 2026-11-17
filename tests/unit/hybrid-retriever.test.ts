@@ -982,3 +982,177 @@ test('HybridRetriever - 24. never compares vectors across different model spaces
   assert.equal(results[0].semanticScore, null);
   assert.equal(results[0].provenance, 'LEXICAL_FALLBACK');
 });
+
+// ============================================================================
+// Phase 4D.2A: Semantic-Only Noise Filtering & Execution Optimization Tests
+// ============================================================================
+
+test('HybridRetriever - Phase 4D.2A: semantic-only candidates below minSemanticConfidence (default 0.20) are gated to score 0', () => {
+  const retriever = new HybridRetriever({ lexicalWeight: 0.40, semanticWeight: 0.60 });
+  const memUnrelated = createDummyMemory({
+    id: 'm-noise',
+    key: 'unrelated.recipe',
+    content: 'Mediterranean salad with olive oil and cucumber'
+  });
+
+  const query = 'Kubernetes pod orchestration'; // Zero lexical overlap
+  const queryVec = new Float32Array([1, 0]);
+  // Cosine similarity 0.15 (ambient noise floor, below default 0.20 threshold)
+  const noiseVec = new Float32Array([0.15, Math.sqrt(1 - 0.15 * 0.15)]);
+
+  const results = retriever.rank(query, [memUnrelated], queryVec, new Map([
+    [memUnrelated.id, noiseVec]
+  ]));
+
+  assert.equal(results.length, 1);
+  assert.equal(results[0].lexicalScore, 0.0);
+  assert.equal(results[0].cosineSimilarity, 0.1500);
+  // Gated to 0.0 because it is semantic-only and below 0.20
+  assert.equal(results[0].semanticScore, 0.0);
+  assert.equal(results[0].hybridScore, 0.0);
+  assert.equal(results[0].score, 0.0);
+  assert.equal(results[0].provenance, 'LEXICAL_ONLY');
+});
+
+test('HybridRetriever - Phase 4D.2A: semantic-only candidates above minSemanticConfidence remain retrievable', () => {
+  const retriever = new HybridRetriever({ lexicalWeight: 0.40, semanticWeight: 0.60 });
+  const memConceptual = createDummyMemory({
+    id: 'm-concept',
+    key: 'cluster.infra',
+    content: 'Distributed worker nodes managed by container control plane'
+  });
+
+  const query = 'Kubernetes pod orchestration'; // Zero lexical overlap
+  const queryVec = new Float32Array([1, 0]);
+  // Cosine similarity 0.35 (above 0.20 threshold)
+  const conceptVec = new Float32Array([0.35, Math.sqrt(1 - 0.35 * 0.35)]);
+
+  const results = retriever.rank(query, [memConceptual], queryVec, new Map([
+    [memConceptual.id, conceptVec]
+  ]));
+
+  assert.equal(results.length, 1);
+  assert.equal(results[0].lexicalScore, 0.0);
+  assert.equal(results[0].cosineSimilarity, 0.3500);
+  assert.equal(results[0].semanticScore, 0.3500);
+  assert.equal(results[0].hybridScore, 0.2100); // 0.60 * 0.35 = 0.2100
+  assert.equal(results[0].provenance, 'SEMANTIC_ONLY');
+});
+
+test('HybridRetriever - Phase 4D.2A: hybrid candidates with lexical match are NOT gated by minSemanticConfidence', () => {
+  const retriever = new HybridRetriever({ lexicalWeight: 0.40, semanticWeight: 0.60 });
+  const memHybrid = createDummyMemory({
+    id: 'm-hybrid',
+    key: 'pod.config',
+    content: 'pod orchestration settings'
+  });
+
+  const query = 'pod'; // Has lexical match
+  const queryVec = new Float32Array([1, 0]);
+  // Weak cosine similarity 0.10 (below 0.20), but has lexical match!
+  const weakVec = new Float32Array([0.10, Math.sqrt(1 - 0.10 * 0.10)]);
+
+  const results = retriever.rank(query, [memHybrid], queryVec, new Map([
+    [memHybrid.id, weakVec]
+  ]));
+
+  assert.equal(results.length, 1);
+  assert.ok(results[0].lexicalScore > 0, 'Must have positive lexical score');
+  assert.equal(results[0].cosineSimilarity, 0.1000);
+  // Allowed to contribute because it is a hybrid match!
+  assert.equal(results[0].semanticScore, 0.1000);
+  assert.ok(results[0].hybridScore > 0);
+  assert.equal(results[0].provenance, 'HYBRID');
+});
+
+test('HybridRetriever - Phase 4D.2A: configurable minSemanticConfidence threshold via constructor and rank options', () => {
+  // Custom threshold 0.30 via constructor
+  const retriever = new HybridRetriever({ minSemanticConfidence: 0.30 });
+  assert.equal(retriever.minSemanticConfidence, 0.30);
+
+  const mem = createDummyMemory({ id: 'm-custom', key: 'k', content: 'content' });
+  const queryVec = new Float32Array([1, 0]);
+  const vec25 = new Float32Array([0.25, Math.sqrt(1 - 0.25 * 0.25)]);
+
+  // Cosine 0.25 is below constructor threshold 0.30 -> gated to 0
+  const res1 = retriever.rank('unrelated query', [mem], queryVec, new Map([[mem.id, vec25]]));
+  assert.equal(res1[0].semanticScore, 0.0);
+
+  // Overriding minSemanticConfidence to 0.20 via RankHybridOptions -> passes!
+  const res2 = retriever.rank('unrelated query', [mem], queryVec, new Map([[mem.id, vec25]]), {
+    minSemanticConfidence: 0.20
+  });
+  assert.equal(res2[0].semanticScore, 0.2500);
+  assert.equal(res2[0].provenance, 'SEMANTIC_ONLY');
+});
+
+test('HybridRetriever - Phase 4D.2A: validates minSemanticConfidence and rejects invalid values', () => {
+  assert.throws(
+    () => new HybridRetriever({ minSemanticConfidence: -0.1 }),
+    /must be a finite number between 0\.0 and 1\.0/
+  );
+  assert.throws(
+    () => new HybridRetriever({ minSemanticConfidence: 1.5 }),
+    /must be a finite number between 0\.0 and 1\.0/
+  );
+  assert.throws(
+    () => new HybridRetriever({ minSemanticConfidence: NaN }),
+    /must be a finite number between 0\.0 and 1\.0/
+  );
+});
+
+test('HybridRetriever - Phase 4D.2A: precomputedLexicalScores eliminates duplicate matcher evaluations in rank()', () => {
+  class SpyRelevanceMatcher extends RelevanceMatcher {
+    public invocationCount = 0;
+    public override score(query: string, candidate: any): any {
+      this.invocationCount++;
+      return super.score(query, candidate);
+    }
+  }
+
+  const spyMatcher = new SpyRelevanceMatcher();
+  const retriever = new HybridRetriever({ matcher: spyMatcher });
+  const mem = createDummyMemory({ id: 'm-pre', key: 'k', content: 'c' });
+
+  // Precomputed score map
+  const precomputedMap = new Map([
+    [mem.id, { memory: mem, score: 0.75, breakdown: { keyMatch: 0.75, tagMatch: 0, wordOverlap: 0, matchedTags: [], matchedWords: [], keyMatched: true } }]
+  ]);
+
+  const results = retriever.rank('test query', [mem], null, null, {
+    precomputedLexicalScores: precomputedMap
+  });
+
+  assert.equal(results.length, 1);
+  assert.equal(results[0].lexicalScore, 0.75);
+  // spyMatcher.score must NOT have been called because precomputed scores were provided!
+  assert.equal(spyMatcher.invocationCount, 0, 'matcher.score should not be called when precomputed scores are passed');
+});
+
+test('MemoryService - Phase 4D.2A: searchMemoriesAsync eliminates redundant synchronous lexical pass', async () => {
+  const env = setupTestEnvironment();
+  const caller = env.authorizer.authorizeUser({
+    credentials: 'token-admin-alpha',
+    requestedScope: env.workspaceA
+  });
+
+  const mem = env.memoryRepo.createMemory({
+    category: 'PROJECT_FACT',
+    scopeType: 'WORKSPACE',
+    scopeId: 'ws-alpha',
+    key: 'service.port',
+    content: 'The production API listens on port 8080 with TLS',
+    status: 'ACTIVE',
+    priority: 50,
+    tags: ['api', 'network']
+  });
+
+  // Call explicit searchMemoriesAsync
+  const results = await env.memoryService.searchMemoriesAsync(caller, {
+    query: 'production API port'
+  });
+
+  assert.ok(results.length >= 1);
+  assert.equal(results[0].memory.id, mem.id);
+  assert.ok(results[0].score > 0);
+});

@@ -143,6 +143,8 @@ export interface MemoryServiceOptions {
   readonly relevanceMatcher?: RelevanceMatcher;
   readonly contextBuilder?: MemoryContextBuilder;
   readonly hybridRetriever?: HybridRetriever;
+  /** Minimum cosine similarity threshold for semantic-only matches (lexicalScore === 0) */
+  readonly minSemanticConfidence?: number;
   /** Internal hook for testing transactional failure after audit append */
   readonly _testPostAuditHook?: () => void;
   /** Internal hook for testing transactional failure mid-purge */
@@ -284,7 +286,12 @@ export class MemoryService {
     this._testPostPurgeAuditHook = options._testPostPurgeAuditHook;
     this.relevanceMatcher = options.relevanceMatcher ?? new RelevanceMatcher();
     this.contextBuilder = options.contextBuilder ?? new MemoryContextBuilder({ matcher: this.relevanceMatcher });
-    this.hybridRetriever = options.hybridRetriever ?? new HybridRetriever({ matcher: this.relevanceMatcher });
+    this.hybridRetriever =
+      options.hybridRetriever ??
+      new HybridRetriever({
+        matcher: this.relevanceMatcher,
+        minSemanticConfidence: options.minSemanticConfidence
+      });
   }
 
   /**
@@ -1772,11 +1779,27 @@ export class MemoryService {
 
   /**
    * Explicit asynchronous version of buildTaskMemoryContext returning a Promise.
+   * Phase 4D.2A Optimization: Directly executes hybrid build context in a single pass without
+   * performing unused synchronous fallback context building upfront.
    */
   public async buildTaskMemoryContextAsync(
     caller: CallerContext,
     options: BuildTaskMemoryContextOptions
   ): Promise<BuiltMemoryContext> {
+    if (this.embeddingProvider && this.embeddingRepo) {
+      this.validateCaller(caller, 'READ');
+      this.assertCallerScopeMatch(caller, (options as any).scopeType, (options as any).scopeId, 'buildTaskMemoryContext');
+      const candidates = this.getEligibleCandidateMemories(caller, options.category);
+      let builder = this.contextBuilder;
+      if (options.maxBudgetChars !== undefined || options.relevanceThreshold !== undefined) {
+        builder = new MemoryContextBuilder({
+          maxBudgetChars: options.maxBudgetChars,
+          relevanceThreshold: options.relevanceThreshold,
+          matcher: this.relevanceMatcher
+        });
+      }
+      return this.executeHybridBuildContext(caller, options, candidates, builder);
+    }
     return Promise.resolve(this.buildTaskMemoryContext(caller, options));
   }
 
@@ -1784,7 +1807,8 @@ export class MemoryService {
     caller: CallerContext,
     options: BuildTaskMemoryContextOptions,
     candidates: Memory[],
-    builder: MemoryContextBuilder
+    builder: MemoryContextBuilder,
+    precomputedLexicalScores?: ReadonlyMap<string, ScoredMemory>
   ): Promise<BuiltMemoryContext> {
     const query = options.query.trim();
     let hybridRanked: HybridScoredMemory[] = [];
@@ -1792,7 +1816,8 @@ export class MemoryService {
     if (query && candidates.length > 0) {
       if (!this.embeddingRepo || !this.embeddingProvider) {
         hybridRanked = this.hybridRetriever.rank(query, candidates, null, null, {
-          fallbackProvenance: 'LEXICAL_ONLY'
+          fallbackProvenance: 'LEXICAL_ONLY',
+          precomputedLexicalScores
         });
       } else {
         let isAvailable = false;
@@ -1804,7 +1829,8 @@ export class MemoryService {
 
         if (!isAvailable) {
           hybridRanked = this.hybridRetriever.rank(query, candidates, null, null, {
-            fallbackProvenance: 'LEXICAL_FALLBACK'
+            fallbackProvenance: 'LEXICAL_FALLBACK',
+            precomputedLexicalScores
           });
         } else {
           let queryVec: Float32Array | null = null;
@@ -1817,7 +1843,8 @@ export class MemoryService {
 
           if (!queryVec) {
             hybridRanked = this.hybridRetriever.rank(query, candidates, null, null, {
-              fallbackProvenance: 'LEXICAL_FALLBACK'
+              fallbackProvenance: 'LEXICAL_FALLBACK',
+              precomputedLexicalScores
             });
           } else {
             // CRITICAL SECURITY INVARIANT:
@@ -1838,7 +1865,8 @@ export class MemoryService {
                 modelId: this.embeddingProvider.modelId,
                 modelRevision: (this.embeddingProvider as any).modelRevision ?? 'main',
                 modelDimensions: this.embeddingProvider.dimensions,
-                fallbackProvenance: 'LEXICAL_FALLBACK'
+                fallbackProvenance: 'LEXICAL_FALLBACK',
+                precomputedLexicalScores
               }
             );
           }
@@ -1956,10 +1984,13 @@ export class MemoryService {
 
     // Baseline synchronous lexical ranking
     let syncResults: HybridScoredMemory[] = [];
+    let precomputedLexicalScores: Map<string, ScoredMemory> | undefined;
+
     if (query && candidates.length > 0) {
       const ranked = this.hybridRetriever.rank(query, candidates, null, null, {
         fallbackProvenance: this.embeddingProvider ? 'LEXICAL_FALLBACK' : 'LEXICAL_ONLY'
       });
+      precomputedLexicalScores = new Map(ranked.map((s) => [s.memory.id, s]));
       const relevant = ranked.filter((scored) => scored.score > 0);
       syncResults = relevant.slice(0, limit).map((scored) => ({
         ...scored,
@@ -1986,19 +2017,127 @@ export class MemoryService {
       return syncResults as any;
     }
 
-    // Async hybrid search promise
-    const asyncPromise = this.executeHybridSearch(caller, options, candidates, query, limit);
+    // Async hybrid search promise - pass precomputed lexical scores to eliminate duplicate lexical ranking
+    const asyncPromise = this.executeHybridSearch(
+      caller,
+      options,
+      candidates,
+      query,
+      limit,
+      precomputedLexicalScores
+    );
     return createDualSearchResult(syncResults, asyncPromise);
   }
 
   /**
    * Explicit asynchronous version of searchMemories returning a Promise.
+   * Phase 4D.2A Optimization: Directly executes hybrid search in a single pass without
+   * performing unused synchronous fallback evaluations upfront.
    */
   public async searchMemoriesAsync(
     caller: CallerContext,
     options: SearchMemoriesOptions
   ): Promise<HybridScoredMemory[]> {
-    return Promise.resolve(this.searchMemories(caller, options));
+    this.validateCaller(caller, 'READ');
+    if (!options || typeof options !== 'object') {
+      throw new ValidationError('SearchMemoriesOptions must be provided.');
+    }
+    if (typeof options.query !== 'string') {
+      throw new ValidationError('Query must be a string.');
+    }
+
+    // Reject explicit scope spoofing attempts
+    this.assertCallerScopeMatch(caller, options.scopeType, options.scopeId, 'searchMemories');
+
+    // Limit validation
+    let limit = 5;
+    if (options.limit !== undefined) {
+      if (
+        typeof options.limit !== 'number' ||
+        !Number.isInteger(options.limit) ||
+        options.limit < 1 ||
+        options.limit > 50
+      ) {
+        throw new ValidationError(
+          `Memory search limit must be an integer between 1 and 50, received '${String(options.limit)}'.`
+        );
+      }
+      limit = options.limit;
+    }
+
+    // Category validation
+    if (options.category !== undefined && !VALID_CATEGORIES.has(options.category)) {
+      throw new ValidationError(
+        `Invalid memory category '${String(options.category)}'. Must be one of: ${Array.from(VALID_CATEGORIES).join(', ')}.`
+      );
+    }
+
+    // If taskId is provided, verify task exists and authoritative scope is compatible
+    if (options.taskId) {
+      if (!this.taskRepo) {
+        throw new ValidationError('TaskRepository is required for authoritative task lookup.');
+      }
+      const task = this.taskRepo.getTaskById(options.taskId);
+      if (!task) {
+        throw new TaskNotFoundError(options.taskId);
+      }
+      const taskScope = this.extractAuthoritativeTaskScope(task);
+      if (
+        taskScope.scopeType !== caller.scope.scopeType ||
+        taskScope.scopeId !== caller.scope.scopeId
+      ) {
+        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+          reason: 'TASK_CALLER_SCOPE_MISMATCH',
+          taskId: options.taskId,
+          callerScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`,
+          taskScope: `${taskScope.scopeType}:${taskScope.scopeId}`
+        }, false);
+        throw new MemoryScopeViolationError(
+          `${caller.scope.scopeType}:${caller.scope.scopeId}`,
+          `${taskScope.scopeType}:${taskScope.scopeId}`,
+          undefined,
+          { taskId: options.taskId }
+        );
+      }
+    }
+
+    // Query active memories eligible for caller (with inheritance and conflict resolution)
+    const candidates = this.getEligibleCandidateMemories(caller, options.category);
+    const query = options.query.trim();
+
+    if (!query || candidates.length === 0) {
+      return [];
+    }
+
+    // If no embedding provider/repo configured, execute single synchronous pass and return
+    if (!this.embeddingProvider || !this.embeddingRepo) {
+      const ranked = this.hybridRetriever.rank(query, candidates, null, null, {
+        fallbackProvenance: 'LEXICAL_ONLY'
+      });
+      const relevant = ranked.filter((scored) => scored.score > 0);
+      const results = relevant.slice(0, limit).map((scored) => ({
+        ...scored,
+        isInherited: Boolean(
+          (scored.memory as any)._isInherited ??
+          (scored.memory.scopeType === 'GLOBAL' && caller.scope.scopeType === 'WORKSPACE')
+        )
+      }));
+      if (results.length > 0) {
+        this.audit(caller, 'MEMORY_RETRIEVED', {
+          memoryIds: results.map((m) => m.memory.id),
+          count: results.length,
+          inheritedCount: results.filter((m) => m.isInherited).length,
+          scopeType: caller.scope.scopeType,
+          scopeId: caller.scope.scopeId,
+          taskId: options.taskId,
+          operation: 'searchMemories'
+        }, false);
+      }
+      return results;
+    }
+
+    // Phase 4D.2A: Directly execute single-pass hybrid search without duplicate lexical evaluation
+    return this.executeHybridSearch(caller, options, candidates, query, limit);
   }
 
   private async executeHybridSearch(
@@ -2006,7 +2145,8 @@ export class MemoryService {
     options: SearchMemoriesOptions,
     candidates: Memory[],
     query: string,
-    limit: number
+    limit: number,
+    precomputedLexicalScores?: ReadonlyMap<string, ScoredMemory>
   ): Promise<HybridScoredMemory[]> {
     if (!query || candidates.length === 0) {
       return [];
@@ -2016,7 +2156,8 @@ export class MemoryService {
 
     if (!this.embeddingRepo || !this.embeddingProvider) {
       hybridResults = this.hybridRetriever.rank(query, candidates, null, null, {
-        fallbackProvenance: 'LEXICAL_ONLY'
+        fallbackProvenance: 'LEXICAL_ONLY',
+        precomputedLexicalScores
       });
     } else {
       let isAvailable = false;
@@ -2028,7 +2169,8 @@ export class MemoryService {
 
       if (!isAvailable) {
         hybridResults = this.hybridRetriever.rank(query, candidates, null, null, {
-          fallbackProvenance: 'LEXICAL_FALLBACK'
+          fallbackProvenance: 'LEXICAL_FALLBACK',
+          precomputedLexicalScores
         });
       } else {
         let queryVec: Float32Array | null = null;
@@ -2041,7 +2183,8 @@ export class MemoryService {
 
         if (!queryVec) {
           hybridResults = this.hybridRetriever.rank(query, candidates, null, null, {
-            fallbackProvenance: 'LEXICAL_FALLBACK'
+            fallbackProvenance: 'LEXICAL_FALLBACK',
+            precomputedLexicalScores
           });
         } else {
           // CRITICAL SECURITY INVARIANT:
@@ -2062,7 +2205,8 @@ export class MemoryService {
               modelId: this.embeddingProvider.modelId,
               modelRevision: (this.embeddingProvider as any).modelRevision ?? 'main',
               modelDimensions: this.embeddingProvider.dimensions,
-              fallbackProvenance: 'LEXICAL_FALLBACK'
+              fallbackProvenance: 'LEXICAL_FALLBACK',
+              precomputedLexicalScores
             }
           );
         }

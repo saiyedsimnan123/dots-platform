@@ -66,6 +66,12 @@ export interface HybridRetrieverOptions {
   readonly lexicalWeight?: number;
   readonly semanticWeight?: number;
   readonly matcher?: RelevanceMatcher;
+  /**
+   * Minimum cosine similarity required for semantic-only matches (lexicalScore === 0).
+   * Filters out ambient vector noise without suppressing hybrid matches with lexical support.
+   * Default: 0.20
+   */
+  readonly minSemanticConfidence?: number;
 }
 
 export interface RankHybridOptions {
@@ -73,23 +79,36 @@ export interface RankHybridOptions {
   readonly modelRevision?: string;
   readonly modelDimensions?: number;
   readonly fallbackProvenance?: RetrievalProvenance;
+  /**
+   * Optional override for minimum cosine similarity required for semantic-only matches.
+   */
+  readonly minSemanticConfidence?: number;
+  /**
+   * Optional precomputed lexical scores to eliminate duplicate lexical evaluation across calls.
+   */
+  readonly precomputedLexicalScores?: ReadonlyMap<string, ScoredMemory>;
 }
 
 export class HybridRetriever {
   public static readonly DEFAULT_LEXICAL_WEIGHT = 0.40;
   public static readonly DEFAULT_SEMANTIC_WEIGHT = 0.60;
+  public static readonly DEFAULT_MIN_SEMANTIC_CONFIDENCE = 0.20;
   public static readonly WEIGHT_TOLERANCE = 0.0001;
 
   public readonly lexicalWeight: number;
   public readonly semanticWeight: number;
+  public readonly minSemanticConfidence: number;
   public readonly matcher: RelevanceMatcher;
 
   constructor(options: HybridRetrieverOptions = {}) {
     const lexicalWeight = options.lexicalWeight ?? HybridRetriever.DEFAULT_LEXICAL_WEIGHT;
     const semanticWeight = options.semanticWeight ?? HybridRetriever.DEFAULT_SEMANTIC_WEIGHT;
+    const minSemanticConfidence =
+      options.minSemanticConfidence ?? HybridRetriever.DEFAULT_MIN_SEMANTIC_CONFIDENCE;
 
     this.validateWeight('lexicalWeight', lexicalWeight);
     this.validateWeight('semanticWeight', semanticWeight);
+    this.validateConfidence('minSemanticConfidence', minSemanticConfidence);
 
     const sum = lexicalWeight + semanticWeight;
     if (Math.abs(sum - 1.0) > HybridRetriever.WEIGHT_TOLERANCE) {
@@ -105,7 +124,22 @@ export class HybridRetriever {
 
     this.lexicalWeight = lexicalWeight;
     this.semanticWeight = semanticWeight;
+    this.minSemanticConfidence = minSemanticConfidence;
     this.matcher = options.matcher ?? new RelevanceMatcher();
+  }
+
+  private validateConfidence(name: string, value: unknown): void {
+    if (
+      typeof value !== 'number' ||
+      !Number.isFinite(value) ||
+      Number.isNaN(value) ||
+      value < 0 ||
+      value > 1
+    ) {
+      throw new ValidationError(
+        `Hybrid scoring '${name}' must be a finite number between 0.0 and 1.0, received: ${String(value)}`
+      );
+    }
   }
 
   private validateWeight(name: string, value: unknown): void {
@@ -157,7 +191,9 @@ export class HybridRetriever {
     const scoredList: HybridScoredMemory[] = [];
 
     for (const candidate of candidates) {
-      const lexicalScored = this.matcher.score(query, candidate);
+      const lexicalScored =
+        options?.precomputedLexicalScores?.get(candidate.id) ??
+        this.matcher.score(query, candidate);
       const lexicalScore = lexicalScored.score;
 
       const candidateVector = vectorMap.get(candidate.id);
@@ -173,7 +209,16 @@ export class HybridRetriever {
           const cosineSim = Number.isFinite(rawCosine) ? rawCosine : 0.0;
           // Protect against negative cosine similarities producing artificially positive relevance
           const calibratedSemantic = Math.max(0.0, Math.min(1.0, cosineSim));
-          const semanticScore = Math.round(calibratedSemantic * 10_000) / 10_000;
+
+          // Phase 4D.2A Noise Floor Gating:
+          // When lexicalScore === 0 (no keyword overlap), require calibrated cosine similarity to meet
+          // or exceed the minimum semantic confidence threshold (default 0.20).
+          // For hybrid results (lexicalScore > 0), allow semantic similarity to contribute regardless of threshold.
+          const effectiveThreshold = options?.minSemanticConfidence ?? this.minSemanticConfidence;
+          const passesConfidence = lexicalScore > 0 || calibratedSemantic >= effectiveThreshold;
+          const semanticScore = passesConfidence
+            ? Math.round(calibratedSemantic * 10_000) / 10_000
+            : 0.0;
 
           const rawHybrid = (lexicalScore * this.lexicalWeight) + (semanticScore * this.semanticWeight);
           const hybridScore = Math.round(rawHybrid * 10_000) / 10_000;

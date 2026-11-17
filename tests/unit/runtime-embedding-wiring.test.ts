@@ -51,6 +51,7 @@ test('1. Config: Defaults to embeddingProvider none with valid defaults', () => 
   assert.equal(config.embeddingPollIntervalMs, 1000);
   assert.equal(config.embeddingDimensions, 384);
   assert.ok(config.embeddingModelId.length > 0);
+  assert.equal(config.embeddingMinSemanticConfidence, 0.20);
 });
 
 test('2. Config: Parses DOTS_EMBEDDING_PROVIDER and model settings from env', () => {
@@ -62,7 +63,8 @@ test('2. Config: Parses DOTS_EMBEDDING_PROVIDER and model settings from env', ()
       DOTS_EMBEDDING_MODEL_ID: 'custom-mock-v2',
       DOTS_EMBEDDING_MODEL_REVISION: 'v2.1',
       DOTS_EMBEDDING_POLL_INTERVAL_MS: '250',
-      DOTS_EMBEDDING_LOCAL_MODEL_PATH: '/tmp/models'
+      DOTS_EMBEDDING_LOCAL_MODEL_PATH: '/tmp/models',
+      DOTS_EMBEDDING_MIN_SEMANTIC_CONFIDENCE: '0.35'
     }
   });
 
@@ -71,6 +73,7 @@ test('2. Config: Parses DOTS_EMBEDDING_PROVIDER and model settings from env', ()
   assert.equal(configMock.embeddingModelRevision, 'v2.1');
   assert.equal(configMock.embeddingPollIntervalMs, 250);
   assert.equal(configMock.embeddingLocalModelPath, '/tmp/models');
+  assert.equal(configMock.embeddingMinSemanticConfidence, 0.35);
 
   const configLocal = loadRuntimeConfig({
     requireTokens: false,
@@ -425,4 +428,26 @@ test('11. None Mode: Functions normally in lexical-only mode without worker', as
 
   await runtime.stop();
   assert.equal(runtime.db.isOpen, false);
+});
+
+test('12. Config: Validates and rejects invalid embeddingMinSemanticConfidence', () => {
+  assert.throws(
+    () => loadRuntimeConfig({ requireTokens: false, env: { DOTS_EMBEDDING_MIN_SEMANTIC_CONFIDENCE: '-0.1' } }),
+    /must be a number between 0\.0 and 1\.0/
+  );
+
+  assert.throws(
+    () => loadRuntimeConfig({ requireTokens: false, env: { DOTS_EMBEDDING_MIN_SEMANTIC_CONFIDENCE: '1.5' } }),
+    /must be a number between 0\.0 and 1\.0/
+  );
+
+  assert.throws(
+    () => loadRuntimeConfig({ requireTokens: false, env: { DOTS_EMBEDDING_MIN_SEMANTIC_CONFIDENCE: 'not-a-number' } }),
+    /must be a number between 0\.0 and 1\.0/
+  );
+
+  assert.throws(
+    () => loadRuntimeConfig({ requireTokens: false, embeddingMinSemanticConfidence: -0.05 } as any),
+    /must be a number between 0\.0 and 1\.0/
+  );
 });
