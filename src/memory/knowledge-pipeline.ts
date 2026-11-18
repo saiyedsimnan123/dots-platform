@@ -559,37 +559,21 @@ export class KnowledgeProposalPipeline {
       return [];
     }
 
-    // Invariant 4: Duplicate suppression against existing memories the caller is authorized to inspect
-    let existingMemories: Memory[] = [];
-    try {
-      existingMemories = memoryService.listMemories(caller, {
-        scopeType: caller.scope.scopeType,
-        scopeId: caller.scope.scopeId
-      });
-      // Also inspect authorized inherited global memories if accessible
-      if (caller.scope.scopeType === 'WORKSPACE') {
-        const canAccessGlobal =
-          !caller.permittedScopes ||
-          caller.permittedScopes.length === 0 ||
-          caller.permittedScopes.some((s) => s.scopeType === 'GLOBAL' && s.scopeId === 'default');
-        if (canAccessGlobal) {
-          try {
-            const globalCandidates = memoryService.listEligibleGlobalMemories(caller);
-            existingMemories.push(...globalCandidates);
-          } catch {
-            // ignore if not permitted
-          }
-        }
-      }
-    } catch {
-      existingMemories = [];
-    }
-
-    const existingKeys = new Set(existingMemories.map((m) => m.key.toLowerCase()));
-    const existingContents = new Set(
-      existingMemories.map((m) => m.content.trim().toLowerCase())
-    );
-
+    // Invariant 4: Targeted duplicate suppression and history unpoisoning.
+    // Replaced unbounded listMemories() scan with indexed, scope-authorized key lookups.
+    //
+    // Trade-off Note (Cross-Key Content Deduplication):
+    // Previously, an unbounded full-table scan populated existingContents across all keys.
+    // Global cross-key exact-content detection without an unbounded scan would require a
+    // dedicated content hash column/index (requiring a schema migration) or unindexed
+    // full-table scans. In accordance with Phase 4D.3D.2 constraints (no schema migrations,
+    // bounded indexed lookups only), exact-content deduplication is preserved:
+    //   1. Within the same extraction run (runCandidateContents).
+    //   2. For matching key lookups (identical pending proposal suppression).
+    // Cross-key cross-task duplicate content detection is omitted in favor of O(1) indexed
+    // lookups, preventing memory exhaustion on large workspaces.
+    const runCandidateKeys = new Set<string>();
+    const runCandidateContents = new Set<string>();
     const submitted: Memory[] = [];
 
     for (const candidate of candidates) {
@@ -603,9 +587,33 @@ export class KnowledgeProposalPipeline {
         continue;
       }
 
-      // Suppress duplicate key or identical content
-      if (existingKeys.has(scrubbedKey) || existingContents.has(boundedContent.toLowerCase())) {
+      // 1. Intra-run duplicate suppression (same extraction run)
+      if (runCandidateKeys.has(scrubbedKey) || runCandidateContents.has(boundedContent.toLowerCase())) {
         continue;
+      }
+
+      // 2. Targeted lookup: suppress if an ACTIVE memory already exists for this key in scope
+      // (Phase 4D.3D.2 preserves active-key suppression; update proposals are deferred to Phase 4D.3D.3)
+      try {
+        const activeExisting = memoryService.getMemoryByKey(caller, scrubbedKey, 'ACTIVE');
+        if (activeExisting) {
+          continue;
+        }
+      } catch {
+        // Authorization or lookup failure fail-safes without aborting the loop
+      }
+
+      // 3. Targeted lookup: suppress if an identical PENDING_APPROVAL proposal already exists for this key
+      try {
+        const pendingExisting = memoryService.getMemoryByKey(caller, scrubbedKey, 'PENDING_APPROVAL');
+        if (pendingExisting) {
+          const isIdentical = pendingExisting.content.trim().toLowerCase() === boundedContent.toLowerCase();
+          if (isIdentical) {
+            continue;
+          }
+        }
+      } catch {
+        // Authorization or lookup failure fail-safes without aborting the loop
       }
 
       // Format tags
@@ -637,8 +645,8 @@ export class KnowledgeProposalPipeline {
         });
 
         submitted.push(memory);
-        existingKeys.add(scrubbedKey);
-        existingContents.add(boundedContent.toLowerCase());
+        runCandidateKeys.add(scrubbedKey);
+        runCandidateContents.add(boundedContent.toLowerCase());
       } catch {
         // Individual proposal submission error should not fail the pipeline or task
       }
