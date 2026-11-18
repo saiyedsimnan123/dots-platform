@@ -283,6 +283,7 @@ export class MemoryRepository {
     let sql = `
       SELECT * FROM memories 
       WHERE scope_type = ? AND scope_id = ? AND status = 'ARCHIVED' AND updated_at <= ?
+        AND supersedes_id IS NULL AND superseded_by IS NULL
       ORDER BY updated_at ASC, id ASC
     `;
     const params: SqlParam[] = [scope.scopeType, scope.scopeId, cutoffTimestamp];
@@ -318,6 +319,7 @@ export class MemoryRepository {
     const stmt = this.db.prepare(`
       SELECT COUNT(*) as count FROM memories 
       WHERE scope_type = ? AND scope_id = ? AND status = 'ARCHIVED' AND updated_at <= ?
+        AND supersedes_id IS NULL AND superseded_by IS NULL
     `);
     const row = stmt.get(scope.scopeType, scope.scopeId, cutoffTimestamp) as unknown as { count: number };
     return row.count;
@@ -565,6 +567,7 @@ export class MemoryRepository {
     const stmt = this.db.prepare(`
       DELETE FROM memories 
       WHERE id = ? AND scope_type = ? AND scope_id = ? AND status = 'ARCHIVED'
+        AND supersedes_id IS NULL AND superseded_by IS NULL
     `);
     const result = stmt.run(id, scope.scopeType, scope.scopeId);
     return result.changes === 1;

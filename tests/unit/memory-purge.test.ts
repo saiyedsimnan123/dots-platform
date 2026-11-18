@@ -985,3 +985,143 @@ test('purgeArchivedMemories - batch limits and empty selections behave safely', 
     (err: unknown) => err instanceof ValidationError
   );
 });
+
+test('purgeArchivedMemories - protects lineage-linked records across predecessor, successor, intermediate, and complete chain', () => {
+  const env = setupTestEnvironment();
+
+  // Create a complete v1 -> v2 -> v3 chain
+  const v1 = env.memoryRepo.createMemory({
+    key: 'service.endpoint',
+    content: 'http://v1.internal',
+    category: 'PROJECT_FACT',
+    scopeType: env.scopeAlpha.scopeType,
+    scopeId: env.scopeAlpha.scopeId,
+    status: 'ACTIVE'
+  });
+
+  const v2Cand = env.memoryRepo.createMemory({
+    key: 'service.endpoint',
+    content: 'http://v2.internal',
+    category: 'PROJECT_FACT',
+    scopeType: env.scopeAlpha.scopeType,
+    scopeId: env.scopeAlpha.scopeId,
+    status: 'PENDING_APPROVAL'
+  });
+
+  env.memoryRepo.supersedeMemory({
+    previousId: v1.id,
+    replacementId: v2Cand.id,
+    scope: env.scopeAlpha,
+    replacementStatus: 'ACTIVE'
+  });
+
+  const v3Cand = env.memoryRepo.createMemory({
+    key: 'service.endpoint',
+    content: 'http://v3.internal',
+    category: 'PROJECT_FACT',
+    scopeType: env.scopeAlpha.scopeType,
+    scopeId: env.scopeAlpha.scopeId,
+    status: 'PENDING_APPROVAL'
+  });
+
+  env.memoryRepo.supersedeMemory({
+    previousId: v2Cand.id,
+    replacementId: v3Cand.id,
+    scope: env.scopeAlpha,
+    replacementStatus: 'ACTIVE'
+  });
+
+  // Archive v3 (tip linked to predecessor v2)
+  const archivedV3 = env.memoryService.archiveMemory(env.adminAlpha, v3Cand.id);
+  assert.equal(archivedV3.status, 'ARCHIVED');
+  assert.equal(archivedV3.supersedesId, v2Cand.id);
+
+  // Directly set v1 and v2 to ARCHIVED in DB to test predecessor and intermediate records
+  env.db.prepare("UPDATE memories SET status = 'ARCHIVED' WHERE id IN (?, ?)").run(v1.id, v2Cand.id);
+
+  // Also create an ordinary unlinked archived memory
+  const unlinked = env.memoryRepo.createMemory({
+    key: 'unlinked.temp',
+    content: 'ordinary unlinked',
+    category: 'PROJECT_FACT',
+    scopeType: env.scopeAlpha.scopeType,
+    scopeId: env.scopeAlpha.scopeId,
+    status: 'ACTIVE'
+  });
+  const archivedUnlinked = env.memoryService.archiveMemory(env.adminAlpha, unlinked.id);
+  assert.equal(archivedUnlinked.status, 'ARCHIVED');
+
+  // 1. deleteArchivedMemory repository method refuses to delete linked records
+  assert.equal(env.memoryRepo.deleteArchivedMemory(v1.id, env.scopeAlpha), false, 'Refuse to delete predecessor linked record');
+  assert.equal(env.memoryRepo.deleteArchivedMemory(v2Cand.id, env.scopeAlpha), false, 'Refuse to delete intermediate linked record');
+  assert.equal(env.memoryRepo.deleteArchivedMemory(v3Cand.id, env.scopeAlpha), false, 'Refuse to delete tip linked record');
+
+  // 2. ID_LIST mode in MemoryService rejects linked records in both dry run and execution
+  // a) Linked to predecessor (v3)
+  assert.throws(
+    () => env.memoryService.purgeArchivedMemories(env.adminAlpha, { memoryIds: [v3Cand.id], dryRun: true }),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('supersession history chain')
+  );
+  assert.throws(
+    () => env.memoryService.purgeArchivedMemories(env.adminAlpha, { memoryIds: [v3Cand.id] }),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('supersession history chain')
+  );
+
+  // b) Linked to successor (v1)
+  assert.throws(
+    () => env.memoryService.purgeArchivedMemories(env.adminAlpha, { memoryIds: [v1.id] }),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('supersession history chain')
+  );
+
+  // c) Intermediate linked on both sides (v2)
+  assert.throws(
+    () => env.memoryService.purgeArchivedMemories(env.adminAlpha, { memoryIds: [v2Cand.id] }),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('supersession history chain')
+  );
+
+  // d) Complete chain [v1, v2, v3]
+  assert.throws(
+    () => env.memoryService.purgeArchivedMemories(env.adminAlpha, { memoryIds: [v1.id, v2Cand.id, v3Cand.id] }),
+    (err: unknown) => err instanceof ValidationError && err.message.includes('supersession history chain')
+  );
+
+  // 3. CUTOFF mode excludes lineage-linked records from counts and queries
+  const futureCutoff = new Date(Date.now() + 60000).toISOString();
+  const eligibleCount = env.memoryRepo.countArchivedMemoriesOlderThan(env.scopeAlpha, futureCutoff);
+  assert.equal(eligibleCount, 1, 'Only the 1 unlinked archived record should be eligible');
+
+  const olderThanRecords = env.memoryRepo.getArchivedMemoriesOlderThan(env.scopeAlpha, futureCutoff);
+  assert.equal(olderThanRecords.length, 1);
+  assert.equal(olderThanRecords[0].id, archivedUnlinked.id);
+
+  // Dry-run CUTOFF mode reports eligibleCount = 1
+  const dryRunResult = env.memoryService.purgeArchivedMemories(env.adminAlpha, { olderThan: futureCutoff, dryRun: true });
+  assert.equal(dryRunResult.eligibleCount, 1);
+  assert.equal(dryRunResult.purgedCount, 0);
+
+  // Execution CUTOFF mode purges only the 1 unlinked record
+  const purgeResult = env.memoryService.purgeArchivedMemories(env.adminAlpha, { olderThan: futureCutoff });
+  assert.equal(purgeResult.eligibleCount, 1);
+  assert.equal(purgeResult.purgedCount, 1);
+
+  // Verify unlinked memory is gone
+  assert.equal(env.memoryRepo.getMemoryById(archivedUnlinked.id, env.scopeAlpha), null);
+
+  // 4. Repeated purge passes do not damage the lineage chain
+  const repeatPurgeResult = env.memoryService.purgeArchivedMemories(env.adminAlpha, { olderThan: futureCutoff });
+  assert.equal(repeatPurgeResult.eligibleCount, 0);
+  assert.equal(repeatPurgeResult.purgedCount, 0);
+
+  // 5. Lineage integrity check: v1 -> v2 -> v3 pointers remain completely intact
+  const finalV1 = env.memoryRepo.getMemoryById(v1.id, env.scopeAlpha);
+  const finalV2 = env.memoryRepo.getMemoryById(v2Cand.id, env.scopeAlpha);
+  const finalV3 = env.memoryRepo.getMemoryById(v3Cand.id, env.scopeAlpha);
+
+  assert.ok(finalV1);
+  assert.ok(finalV2);
+  assert.ok(finalV3);
+  assert.equal(finalV1.supersededBy, finalV2.id);
+  assert.equal(finalV2.supersedesId, finalV1.id);
+  assert.equal(finalV2.supersededBy, finalV3.id);
+  assert.equal(finalV3.supersedesId, finalV2.id);
+});

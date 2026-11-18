@@ -563,6 +563,146 @@ test('importMemories - conflict strategy OVERWRITE archives existing active reco
   assert.equal('existingFieldA' in newMetadata, false, 'Old metadata fields must not be merged');
 });
 
+test('importMemories - conflict strategy OVERWRITE rejects overwriting memory belonging to a supersession chain', () => {
+  const env = setupTestEnvironment();
+
+  // Create an unlinked active memory for comparison
+  const unlinkedOriginal = env.memoryService.createMemory(env.adminAlpha, {
+    key: 'unlinked_key',
+    content: 'original unlinked content',
+    category: 'PROJECT_FACT',
+    scopeType: 'WORKSPACE',
+    scopeId: 'ws-alpha'
+  });
+
+  // Create v1 and v2 chained memories
+  const v1 = env.memoryRepo.createMemory({
+    key: 'chained_key',
+    content: 'v1 chained content',
+    category: 'PROJECT_FACT',
+    scopeType: env.scopeAlpha.scopeType,
+    scopeId: env.scopeAlpha.scopeId,
+    status: 'ACTIVE'
+  });
+
+  const v2Cand = env.memoryRepo.createMemory({
+    key: 'chained_key',
+    content: 'v2 chained content',
+    category: 'PROJECT_FACT',
+    scopeType: env.scopeAlpha.scopeType,
+    scopeId: env.scopeAlpha.scopeId,
+    status: 'PENDING_APPROVAL'
+  });
+
+  const { replacement: v2 } = env.memoryRepo.supersedeMemory({
+    previousId: v1.id,
+    replacementId: v2Cand.id,
+    scope: env.scopeAlpha,
+    replacementStatus: 'ACTIVE'
+  });
+
+  assert.equal(v2.version, 2);
+  assert.equal(v2.supersedesId, v1.id);
+
+  // 1. Overwriting unlinked active memory succeeds as before
+  const unlinkedBundle = createValidBundle([
+    {
+      key: 'unlinked_key',
+      content: 'replaced unlinked content',
+      category: 'PROJECT_FACT',
+      status: 'ACTIVE',
+      priority: 50,
+      tags: [],
+      metadata: {},
+      createdAt: '2026-10-19T00:00:00.000Z',
+      updatedAt: '2026-10-19T00:00:00.000Z'
+    }
+  ]);
+  const unlinkedResult = env.memoryService.importMemories(env.adminAlpha, unlinkedBundle, { conflictStrategy: 'OVERWRITE' });
+  assert.equal(unlinkedResult.overwrittenCount, 1);
+  const updatedUnlinked = env.memoryRepo.getMemoryByKey('unlinked_key', env.scopeAlpha, 'ACTIVE');
+  assert.equal(updatedUnlinked?.content, 'replaced unlinked content');
+
+  // 2. Overwriting a v2 active memory with a predecessor is rejected before any mutation
+  const chainedBundle = createValidBundle([
+    {
+      key: 'chained_key',
+      content: 'attempted overwrite of chained key',
+      category: 'PROJECT_FACT',
+      status: 'ACTIVE',
+      priority: 50,
+      tags: [],
+      metadata: {},
+      createdAt: '2026-10-19T00:00:00.000Z',
+      updatedAt: '2026-10-19T00:00:00.000Z'
+    }
+  ]);
+
+  assert.throws(
+    () => env.memoryService.importMemories(env.adminAlpha, chainedBundle, { conflictStrategy: 'OVERWRITE' }),
+    (err: unknown) => {
+      return (
+        err instanceof MemoryConflictError &&
+        err.key === 'chained_key' &&
+        typeof (err.details as any)?.reason === 'string' &&
+        (err.details as any).reason.includes('supersession history chain')
+      );
+    }
+  );
+
+  // Verify existing record, lineage, and counts remain completely unchanged
+  const currentActive = env.memoryRepo.getMemoryByKey('chained_key', env.scopeAlpha, 'ACTIVE');
+  assert.ok(currentActive);
+  assert.equal(currentActive.id, v2.id);
+  assert.equal(currentActive.status, 'ACTIVE');
+  assert.equal(currentActive.content, 'v2 chained content');
+  assert.equal(currentActive.version, 2);
+  assert.equal(currentActive.supersedesId, v1.id);
+
+  const history = env.memoryRepo.getMemoryHistory('chained_key', env.scopeAlpha);
+  assert.equal(history.length, 2);
+  assert.equal(history[0].id, v1.id);
+  assert.equal(history[0].status, 'SUPERSEDED');
+  assert.equal(history[1].id, v2.id);
+  assert.equal(history[1].status, 'ACTIVE');
+
+  // 3. Multi-item bundle atomicity: if an unlinked item is followed by a chained item,
+  // preflight validation rejects before any database mutation, preserving unlinked item
+  const multiItemBundle = createValidBundle([
+    {
+      key: 'unlinked_key',
+      content: 'second unlinked overwrite attempt',
+      category: 'PROJECT_FACT',
+      status: 'ACTIVE',
+      priority: 50,
+      tags: [],
+      metadata: {},
+      createdAt: '2026-10-19T00:00:00.000Z',
+      updatedAt: '2026-10-19T00:00:00.000Z'
+    },
+    {
+      key: 'chained_key',
+      content: 'second chained overwrite attempt',
+      category: 'PROJECT_FACT',
+      status: 'ACTIVE',
+      priority: 50,
+      tags: [],
+      metadata: {},
+      createdAt: '2026-10-19T00:00:00.000Z',
+      updatedAt: '2026-10-19T00:00:00.000Z'
+    }
+  ]);
+
+  assert.throws(
+    () => env.memoryService.importMemories(env.adminAlpha, multiItemBundle, { conflictStrategy: 'OVERWRITE' }),
+    (err: unknown) => err instanceof MemoryConflictError && err.key === 'chained_key'
+  );
+
+  // Verify unlinked_key was NOT modified due to pre-flight failure
+  const unlinkedAfterFailedBatch = env.memoryRepo.getMemoryByKey('unlinked_key', env.scopeAlpha, 'ACTIVE');
+  assert.equal(unlinkedAfterFailedBatch?.content, 'replaced unlinked content');
+});
+
 // ============================================================================
 // 4. Atomicity & Rollback Guarantees
 // ============================================================================

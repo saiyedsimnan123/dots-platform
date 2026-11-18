@@ -195,7 +195,8 @@ export const MEMORY_SCOPES: ReadonlySet<string> = new Set([
 export const MEMORY_STATUSES: ReadonlySet<string> = new Set([
   'ACTIVE',
   'PENDING_APPROVAL',
-  'ARCHIVED'
+  'ARCHIVED',
+  'SUPERSEDED'
 ]);
 
 export const PROPOSAL_DECISIONS: ReadonlySet<string> = new Set([
@@ -267,6 +268,7 @@ export const KNOWN_DENIAL_REASONS: ReadonlySet<string> = new Set([
   'AGENT_PURGE_DENIED',
   'CROSS_SCOPE_PURGE_ATTEMPT',
   'NON_ARCHIVED_PURGE_DENIED',
+  'LINEAGE_PURGE_DENIED',
   'CROSS_SCOPE_READ_ATTEMPT'
 ]);
 

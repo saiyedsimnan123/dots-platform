@@ -13,6 +13,7 @@ import { DatabaseError } from '../domain/errors.ts';
 export interface Migration {
   readonly version: string;
   readonly up: (db: DatabaseSync) => void;
+  readonly disableForeignKeys?: boolean;
 }
 
 export class DatabaseManager {
@@ -422,6 +423,7 @@ export class DatabaseManager {
       },
       {
         version: '008_memory_supersession',
+        disableForeignKeys: true,
         up: (db) => {
           db.exec(`
             -- Rebuild memories table to support supersession, version history, and lineage
@@ -484,21 +486,30 @@ export class DatabaseManager {
     const recordStmt = this.db.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)');
 
     try {
-      this.db.exec('PRAGMA foreign_keys = OFF;');
       for (const migration of migrations) {
         const existing = checkStmt.get(migration.version);
         if (!existing) {
-          this.transaction(() => {
-            migration.up(this.db);
-            const violations = this.db.prepare('PRAGMA foreign_key_check;').all();
-            if (violations.length > 0) {
-              throw new DatabaseError(
-                `Foreign key check failed after migration ${migration.version}: ${JSON.stringify(violations)}`,
-                { version: migration.version, violations }
-              );
+          const needsFkDisabled = Boolean(migration.disableForeignKeys);
+          if (needsFkDisabled) {
+            this.db.exec('PRAGMA foreign_keys = OFF;');
+          }
+          try {
+            this.transaction(() => {
+              migration.up(this.db);
+              const violations = this.db.prepare('PRAGMA foreign_key_check;').all();
+              if (violations.length > 0) {
+                throw new DatabaseError(
+                  `Foreign key check failed after migration ${migration.version}: ${JSON.stringify(violations)}`,
+                  { version: migration.version, violations }
+                );
+              }
+              recordStmt.run(migration.version, new Date().toISOString());
+            });
+          } finally {
+            if (needsFkDisabled) {
+              this.db.exec('PRAGMA foreign_keys = ON;');
             }
-            recordStmt.run(migration.version, new Date().toISOString());
-          });
+          }
         }
       }
     } finally {

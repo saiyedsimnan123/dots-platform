@@ -2798,6 +2798,30 @@ export class MemoryService {
       }
     }
 
+    // Pre-flight check for OVERWRITE: cannot overwrite active memories that belong to a supersession chain
+    if (conflictStrategy === 'OVERWRITE') {
+      for (const item of bundle.memories) {
+        const itemStatus = item.status ?? 'ACTIVE';
+        if (itemStatus === 'ACTIVE') {
+          const key = item.key.trim();
+          const existing = this.memoryRepo.getMemoryByKey(key, caller.scope, 'ACTIVE');
+          if (existing && (existing.supersedesId !== null || existing.supersededBy !== null || existing.version > 1)) {
+            throw new MemoryConflictError(
+              key,
+              caller.scope.scopeType,
+              caller.scope.scopeId,
+              {
+                operation: 'importMemories',
+                conflictStrategy: 'OVERWRITE',
+                memoryId: existing.id,
+                reason: `Cannot overwrite active memory '${existing.id}' with key '${key}': record belongs to a supersession history chain (version ${existing.version}). Supersession history must be updated via explicit supersession operations.`
+              }
+            );
+          }
+        }
+      }
+    }
+
     // 4. Atomic Database Mutation
     let enqueuedActiveCount = 0;
 
@@ -2829,6 +2853,20 @@ export class MemoryService {
               skippedCount++;
               continue;
             } else if (conflictStrategy === 'OVERWRITE') {
+              if (existing.supersedesId !== null || existing.supersededBy !== null || existing.version > 1) {
+                throw new MemoryConflictError(
+                  key,
+                  caller.scope.scopeType,
+                  caller.scope.scopeId,
+                  {
+                    operation: 'importMemories',
+                    conflictStrategy: 'OVERWRITE',
+                    memoryId: existing.id,
+                    reason: `Cannot overwrite active memory '${existing.id}' with key '${key}': record belongs to a supersession history chain (version ${existing.version}). Supersession history must be updated via explicit supersession operations.`
+                  }
+                );
+              }
+
               // Archive existing active record (preserves the old record with status ARCHIVED)
               this.memoryRepo.archiveMemory(existing.id, caller.scope);
 
@@ -3088,6 +3126,17 @@ export class MemoryService {
               { memoryId: id, status: memory.status }
             );
           }
+          if (memory.supersedesId !== null || memory.supersededBy !== null) {
+            this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+              reason: 'LINEAGE_PURGE_DENIED',
+              operation: 'purgeArchivedMemories',
+              memoryId: id
+            }, false);
+            throw new ValidationError(
+              `Cannot purge memory '${id}': record is part of a supersession history chain. Archival records in a lineage chain cannot be purged.`,
+              { memoryId: id }
+            );
+          }
         }
         return {
           targetScope: { scopeType: caller.scope.scopeType, scopeId: caller.scope.scopeId },
@@ -3103,6 +3152,7 @@ export class MemoryService {
       // deletions, and MEMORIES_PURGED audit event all execute within the SAME atomic database transaction.
       let lastAttemptedId: string | undefined;
       let nonArchivedStatusCaught: { id: string; status: string } | null = null;
+      let lineageMemoryCaught: { id: string } | null = null;
 
       try {
         return this.memoryRepo.transaction(() => {
@@ -3121,6 +3171,14 @@ export class MemoryService {
               throw new ValidationError(
                 `Cannot purge memory '${id}': status is '${memory.status}'. Only records with status 'ARCHIVED' can be purged.`,
                 { memoryId: id, status: memory.status }
+              );
+            }
+
+            if (memory.supersedesId !== null || memory.supersededBy !== null) {
+              lineageMemoryCaught = { id };
+              throw new ValidationError(
+                `Cannot purge memory '${id}': record is part of a supersession history chain. Archival records in a lineage chain cannot be purged.`,
+                { memoryId: id }
               );
             }
 
@@ -3175,6 +3233,13 @@ export class MemoryService {
             memoryId: lastAttemptedId,
             expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
           }, false);
+        } else if (lineageMemoryCaught) {
+          const lineage = lineageMemoryCaught as { id: string };
+          this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+            reason: 'LINEAGE_PURGE_DENIED',
+            operation: 'purgeArchivedMemories',
+            memoryId: lineage.id
+          }, false);
         } else {
           const nonArchived = nonArchivedStatusCaught as { id: string; status: string } | null;
           if (nonArchived) {
@@ -3216,6 +3281,9 @@ export class MemoryService {
 
         let deletedCount = 0;
         for (const memory of memoriesToDelete) {
+          if (memory.supersedesId !== null || memory.supersededBy !== null) {
+            continue;
+          }
           const deleted = this.memoryRepo.deleteArchivedMemory(memory.id, caller.scope);
           if (!deleted) {
             throw new ValidationError(

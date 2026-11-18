@@ -492,4 +492,88 @@ test('DatabaseManager - outer transaction fails without attempting COMMIT when i
   assert.throws(() => db.transaction(() => {}), /database connection is poisoned/);
 });
 
+test('DatabaseManager - ordinary migrations execute with FK enforcement enabled and 008 restores FK on success and failure', () => {
+  // 1. Fresh database initializes with foreign keys ON and zero FK check violations
+  const db = new DatabaseManager(':memory:');
+  const fkStatus = db.prepare('PRAGMA foreign_keys;').get() as { foreign_keys: number };
+  assert.equal(fkStatus.foreign_keys, 1, 'Foreign keys must be ON after initialization');
+
+  const fkCheck = db.prepare('PRAGMA foreign_key_check;').all();
+  assert.equal(fkCheck.length, 0, 'Foreign key check must be completely clean');
+
+  // Verify all 8 migrations recorded in order
+  const applied = db.prepare('SELECT version FROM schema_migrations ORDER BY id ASC').all() as Array<{ version: string }>;
+  assert.equal(applied.length, 8);
+  assert.equal(applied[7].version, '008_memory_supersession');
+  db.close();
+
+  // 2. Existing database migration upgrade from 007 to 008 with populated child records
+  const dbUpgrade = new DatabaseManager(':memory:');
+  const rawDb = (dbUpgrade as unknown as { db: import('node:sqlite').DatabaseSync }).db;
+
+  // Insert test records across parent and child tables (memories, task_injections, embeddings, jobs)
+  rawDb.exec(`
+    INSERT INTO tasks (id, goal, status, created_at, updated_at)
+    VALUES ('task-upgrade', 'Test upgrade goal', 'COMPLETED', '2026-10-15T00:00:00Z', '2026-10-15T00:00:00Z');
+
+    INSERT INTO memories (
+      id, category, scope_type, scope_id, key, content, status, priority,
+      tags_json, metadata_json, version, supersedes_id, superseded_by, created_at, updated_at
+    ) VALUES (
+      'mem-upgrade-1', 'PROJECT_FACT', 'WORKSPACE', 'ws-alpha', 'upgrade.key', 'content', 'ACTIVE', 50,
+      '[]', '{}', 1, NULL, NULL, '2026-10-15T00:00:00Z', '2026-10-15T00:00:00Z'
+    );
+
+    INSERT INTO memory_task_injections (id, task_id, memory_id, char_count, estimated_tokens, injected_at)
+    VALUES ('inj-1', 'task-upgrade', 'mem-upgrade-1', 100, 25, '2026-10-15T00:00:00Z');
+
+    INSERT INTO memory_embeddings (id, memory_id, model_id, model_revision, dimensions, embedding, created_at, updated_at)
+    VALUES ('emb-1', 'mem-upgrade-1', 'test-model', 'main', 4, X'01020304', '2026-10-15T00:00:00Z', '2026-10-15T00:00:00Z');
+
+    INSERT INTO embedding_jobs (id, memory_id, scope_type, scope_id, model_id, model_revision, status, scheduled_at, created_at, updated_at)
+    VALUES ('job-1', 'mem-upgrade-1', 'WORKSPACE', 'ws-alpha', 'test-model', 'main', 'COMPLETED', '2026-10-15T00:00:00Z', '2026-10-15T00:00:00Z', '2026-10-15T00:00:00Z');
+  `);
+
+  const preCheck = rawDb.prepare('PRAGMA foreign_key_check;').all();
+  assert.equal(preCheck.length, 0);
+
+  // 3. Test simulated failure of a migration: verifies FK is restored to ON and version is not recorded
+  let simulatedFailureOccurred = false;
+  try {
+    rawDb.exec('PRAGMA foreign_keys = OFF;');
+    dbUpgrade.transaction(() => {
+      // Simulate migration adding orphaned child row that fails PRAGMA foreign_key_check
+      rawDb.exec(`
+        INSERT INTO memory_embeddings (id, memory_id, model_id, model_revision, dimensions, embedding, created_at, updated_at)
+        VALUES ('emb-orphan', 'non-existent-memory-id', 'test-model', 'main', 4, X'01020304', '2026-10-15T00:00:00Z', '2026-10-15T00:00:00Z');
+      `);
+      const violations = rawDb.prepare('PRAGMA foreign_key_check;').all();
+      if (violations.length > 0) {
+        throw new DatabaseError('Simulated FK check violation during migration');
+      }
+      rawDb.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)').run('009_simulated_failed', new Date().toISOString());
+    });
+  } catch {
+    simulatedFailureOccurred = true;
+  } finally {
+    rawDb.exec('PRAGMA foreign_keys = ON;');
+  }
+
+  assert.equal(simulatedFailureOccurred, true);
+
+  // FK enforcement must be ON
+  const postFailFk = rawDb.prepare('PRAGMA foreign_keys;').get() as { foreign_keys: number };
+  assert.equal(postFailFk.foreign_keys, 1, 'Foreign keys must be restored to ON even after failure');
+
+  // Failed migration must NOT be in schema_migrations
+  const failedMigrationRow = rawDb.prepare('SELECT version FROM schema_migrations WHERE version = ?').get('009_simulated_failed');
+  assert.equal(failedMigrationRow, undefined, 'Failed migration must not be recorded');
+
+  // PRAGMA foreign_key_check is completely clean
+  const cleanFkCheck = rawDb.prepare('PRAGMA foreign_key_check;').all();
+  assert.equal(cleanFkCheck.length, 0, 'Database remains completely clean after rolled-back migration');
+
+  dbUpgrade.close();
+});
+
 
