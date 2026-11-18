@@ -844,3 +844,357 @@ test('18. End-to-end asynchronous processing creates queryable vector embeddings
   assert.equal(embedding.memoryId, memory.id);
   assert.equal(embedding.dimensions, 384);
 });
+
+// ============================================================================
+// Phase 4D.2B: Embedding Job Retention & Queue Maintenance Regression Tests
+// ============================================================================
+
+function createJobWithStatus(
+  env: ReturnType<typeof setupTestEnvironment>,
+  status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED',
+  updatedAtIso: string | null | undefined,
+  memoryKey = 'test.mem'
+) {
+  const mem = env.memoryRepo.createMemory({
+    category: 'PROJECT_FACT',
+    scopeType: env.workspaceA.scopeType,
+    scopeId: env.workspaceA.scopeId,
+    key: `${memoryKey}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`,
+    content: 'Memory content for queue maintenance testing',
+    status: 'ACTIVE'
+  });
+
+  const job = env.embeddingJobRepo.enqueueJob({
+    memoryId: mem.id,
+    scopeType: env.workspaceA.scopeType,
+    scopeId: env.workspaceA.scopeId,
+    modelId: env.mockProvider.modelId
+  });
+
+  if (status !== 'PENDING' || updatedAtIso !== undefined) {
+    env.db.prepare('UPDATE embedding_jobs SET status = ?, updated_at = ? WHERE id = ?').run(
+      status,
+      updatedAtIso ?? null,
+      job.id
+    );
+  }
+
+  return env.embeddingJobRepo.getJobById(job.id)!;
+}
+
+test('19. Old COMPLETED jobs are deleted by queue maintenance', async () => {
+  const env = setupTestEnvironment();
+  const now = Date.now();
+  const fifteenDaysAgoIso = new Date(now - 15 * 86_400_000).toISOString();
+
+  const oldCompleted = createJobWithStatus(env, 'COMPLETED', fifteenDaysAgoIso, 'old.completed');
+  assert.ok(env.embeddingJobRepo.getJobById(oldCompleted.id));
+
+  const result = env.embeddingJobRepo.pruneTerminalJobs({
+    olderThanMs: 14 * 86_400_000,
+    now
+  });
+
+  assert.deepEqual(result, { completed: 1, failed: 0, cancelled: 0, total: 1 });
+  assert.equal(env.embeddingJobRepo.getJobById(oldCompleted.id), null);
+});
+
+test('20. Old FAILED jobs are deleted by queue maintenance', async () => {
+  const env = setupTestEnvironment();
+  const now = Date.now();
+  const twentyDaysAgoIso = new Date(now - 20 * 86_400_000).toISOString();
+
+  const oldFailed = createJobWithStatus(env, 'FAILED', twentyDaysAgoIso, 'old.failed');
+  assert.ok(env.embeddingJobRepo.getJobById(oldFailed.id));
+
+  const result = env.embeddingJobRepo.pruneTerminalJobs({
+    olderThanMs: 14 * 86_400_000,
+    now
+  });
+
+  assert.deepEqual(result, { completed: 0, failed: 1, cancelled: 0, total: 1 });
+  assert.equal(env.embeddingJobRepo.getJobById(oldFailed.id), null);
+});
+
+test('21. Old CANCELLED jobs are deleted by queue maintenance', async () => {
+  const env = setupTestEnvironment();
+  const now = Date.now();
+  const sixteenDaysAgoIso = new Date(now - 16 * 86_400_000).toISOString();
+
+  const oldCancelled = createJobWithStatus(env, 'CANCELLED', sixteenDaysAgoIso, 'old.cancelled');
+  assert.ok(env.embeddingJobRepo.getJobById(oldCancelled.id));
+
+  const result = env.embeddingJobRepo.pruneTerminalJobs({
+    olderThanMs: 14 * 86_400_000,
+    now
+  });
+
+  assert.deepEqual(result, { completed: 0, failed: 0, cancelled: 1, total: 1 });
+  assert.equal(env.embeddingJobRepo.getJobById(oldCancelled.id), null);
+});
+
+test('22. Recent terminal jobs remain untouched', async () => {
+  const env = setupTestEnvironment();
+  const now = Date.now();
+  const fiveDaysAgoIso = new Date(now - 5 * 86_400_000).toISOString();
+  const oneDayAgoIso = new Date(now - 1 * 86_400_000).toISOString();
+  const twoHoursAgoIso = new Date(now - 2 * 3600_000).toISOString();
+
+  const recentCompleted = createJobWithStatus(env, 'COMPLETED', fiveDaysAgoIso, 'recent.completed');
+  const recentFailed = createJobWithStatus(env, 'FAILED', oneDayAgoIso, 'recent.failed');
+  const recentCancelled = createJobWithStatus(env, 'CANCELLED', twoHoursAgoIso, 'recent.cancelled');
+
+  const result = env.embeddingJobRepo.pruneTerminalJobs({
+    olderThanMs: 14 * 86_400_000,
+    now
+  });
+
+  assert.deepEqual(result, { completed: 0, failed: 0, cancelled: 0, total: 0 });
+  assert.ok(env.embeddingJobRepo.getJobById(recentCompleted.id));
+  assert.ok(env.embeddingJobRepo.getJobById(recentFailed.id));
+  assert.ok(env.embeddingJobRepo.getJobById(recentCancelled.id));
+});
+
+test('23. PENDING jobs remain regardless of age', async () => {
+  const env = setupTestEnvironment();
+  const now = Date.now();
+  const hundredDaysAgoIso = new Date(now - 100 * 86_400_000).toISOString();
+
+  const oldPending = createJobWithStatus(env, 'PENDING', hundredDaysAgoIso, 'old.pending');
+
+  const result = env.embeddingJobRepo.pruneTerminalJobs({
+    olderThanMs: 14 * 86_400_000,
+    now
+  });
+
+  assert.deepEqual(result, { completed: 0, failed: 0, cancelled: 0, total: 0 });
+  const retrieved = env.embeddingJobRepo.getJobById(oldPending.id);
+  assert.ok(retrieved);
+  assert.equal(retrieved.status, 'PENDING');
+});
+
+test('24. RUNNING jobs remain regardless of age', async () => {
+  const env = setupTestEnvironment();
+  const now = Date.now();
+  const sixtyDaysAgoIso = new Date(now - 60 * 86_400_000).toISOString();
+
+  const oldRunning = createJobWithStatus(env, 'RUNNING', sixtyDaysAgoIso, 'old.running');
+
+  const result = env.embeddingJobRepo.pruneTerminalJobs({
+    olderThanMs: 14 * 86_400_000,
+    now
+  });
+
+  assert.deepEqual(result, { completed: 0, failed: 0, cancelled: 0, total: 0 });
+  const retrieved = env.embeddingJobRepo.getJobById(oldRunning.id);
+  assert.ok(retrieved);
+  assert.equal(retrieved.status, 'RUNNING');
+});
+
+test('25. Missing or invalid terminal timestamps are not pruned', async () => {
+  const env = setupTestEnvironment();
+  const now = Date.now();
+
+  const emptyTimestampJob = createJobWithStatus(env, 'COMPLETED', '', 'empty.ts');
+  const whitespaceTimestampJob = createJobWithStatus(env, 'FAILED', '   ', 'whitespace.ts');
+  const invalidTimestampJob = createJobWithStatus(env, 'CANCELLED', 'not-a-valid-date', 'invalid.ts');
+
+  const result = env.embeddingJobRepo.pruneTerminalJobs({
+    olderThanMs: 14 * 86_400_000,
+    now
+  });
+
+  assert.deepEqual(result, { completed: 0, failed: 0, cancelled: 0, total: 0 });
+  assert.ok(env.embeddingJobRepo.getJobById(emptyTimestampJob.id));
+  assert.ok(env.embeddingJobRepo.getJobById(whitespaceTimestampJob.id));
+  assert.ok(env.embeddingJobRepo.getJobById(invalidTimestampJob.id));
+});
+
+test('26. Deletion limit is respected (batch size constraint)', async () => {
+  const env = setupTestEnvironment();
+  const now = Date.now();
+  const twentyDaysAgoIso = new Date(now - 20 * 86_400_000).toISOString();
+
+  const jobIds: string[] = [];
+  for (let i = 0; i < 10; i++) {
+    const job = createJobWithStatus(env, 'COMPLETED', twentyDaysAgoIso, `batch.${i}`);
+    jobIds.push(job.id);
+  }
+
+  const result = env.embeddingJobRepo.pruneTerminalJobs({
+    limit: 3,
+    olderThanMs: 14 * 86_400_000,
+    now
+  });
+
+  assert.deepEqual(result, { completed: 3, failed: 0, cancelled: 0, total: 3 });
+  const remainingCount = jobIds.filter((id) => env.embeddingJobRepo.getJobById(id) !== null).length;
+  assert.equal(remainingCount, 7);
+});
+
+test('27. Multiple maintenance passes eventually remove eligible jobs', async () => {
+  const env = setupTestEnvironment();
+  const now = Date.now();
+  const twentyDaysAgoIso = new Date(now - 20 * 86_400_000).toISOString();
+
+  const manager = new EmbeddingLifecycleManager({
+    db: env.db,
+    jobRepo: env.embeddingJobRepo,
+    memoryRepo: env.memoryRepo,
+    embeddingRepo: env.embeddingRepo,
+    provider: env.mockProvider,
+    retentionMs: 14 * 86_400_000,
+    maxPruneBatchSize: 3,
+    autoStart: false
+  });
+
+  const jobIds: string[] = [];
+  for (let i = 0; i < 7; i++) {
+    const status = i % 3 === 0 ? 'COMPLETED' : i % 3 === 1 ? 'FAILED' : 'CANCELLED';
+    const job = createJobWithStatus(env, status, twentyDaysAgoIso, `multi.${i}`);
+    jobIds.push(job.id);
+  }
+
+  // Pass 1: prunes 3
+  const pass1 = await manager.runMaintenance(now);
+  assert.ok(pass1);
+  assert.equal(pass1.total, 3);
+
+  // Pass 2: prunes 3
+  const pass2 = await manager.runMaintenance(now);
+  assert.ok(pass2);
+  assert.equal(pass2.total, 3);
+
+  // Pass 3: prunes remaining 1
+  const pass3 = await manager.runMaintenance(now);
+  assert.ok(pass3);
+  assert.equal(pass3.total, 1);
+
+  // Pass 4: no more eligible jobs
+  const pass4 = await manager.runMaintenance(now);
+  assert.ok(pass4);
+  assert.equal(pass4.total, 0);
+
+  const remaining = jobIds.filter((id) => env.embeddingJobRepo.getJobById(id) !== null);
+  assert.equal(remaining.length, 0);
+});
+
+test('28. Repeated passes are idempotent', async () => {
+  const env = setupTestEnvironment();
+  const now = Date.now();
+
+  const firstPass = await env.lifecycleManager.runMaintenance(now);
+  assert.deepEqual(firstPass, { completed: 0, failed: 0, cancelled: 0, total: 0 });
+
+  const secondPass = await env.lifecycleManager.runMaintenance(now);
+  assert.deepEqual(secondPass, { completed: 0, failed: 0, cancelled: 0, total: 0 });
+});
+
+test('29. Maintenance failure does not stop the embedding worker', async () => {
+  const env = setupTestEnvironment();
+  const loggedErrors: Array<Record<string, unknown> | undefined> = [];
+
+  const manager = new EmbeddingLifecycleManager({
+    db: env.db,
+    jobRepo: env.embeddingJobRepo,
+    memoryRepo: env.memoryRepo,
+    embeddingRepo: env.embeddingRepo,
+    provider: env.mockProvider,
+    logger: {
+      error: (_domain, _event, details) => {
+        loggedErrors.push(details);
+      }
+    },
+    autoStart: false
+  });
+
+  // Force jobRepo.pruneTerminalJobs to throw
+  const originalPrune = env.embeddingJobRepo.pruneTerminalJobs.bind(env.embeddingJobRepo);
+  (env.embeddingJobRepo as any).pruneTerminalJobs = () => {
+    throw new Error('Simulated SQLite disk error during prune');
+  };
+
+  try {
+    const result = await manager.runMaintenance();
+    assert.equal(result, null);
+    assert.equal(loggedErrors.length, 1);
+    assert.ok(String(loggedErrors[0]?.error).includes('Simulated SQLite disk error'));
+
+    // Worker remains functional: restore method and process pending job
+    (env.embeddingJobRepo as any).pruneTerminalJobs = originalPrune;
+
+    const mem = env.memoryRepo.createMemory({
+      category: 'PROJECT_FACT',
+      scopeType: env.workspaceA.scopeType,
+      scopeId: env.workspaceA.scopeId,
+      key: 'survive.failure',
+      content: 'Memory created after maintenance failure',
+      status: 'ACTIVE'
+    });
+    env.embeddingJobRepo.enqueueJob({
+      memoryId: mem.id,
+      scopeType: env.workspaceA.scopeType,
+      scopeId: env.workspaceA.scopeId,
+      modelId: env.mockProvider.modelId
+    });
+
+    const didProcess = await manager.processNextJob();
+    assert.equal(didProcess, true);
+  } finally {
+    (env.embeddingJobRepo as any).pruneTerminalJobs = originalPrune;
+  }
+});
+
+test('30. Startup and shutdown do not leak timers or race with database closure', async () => {
+  const env = setupTestEnvironment();
+
+  const manager = new EmbeddingLifecycleManager({
+    db: env.db,
+    jobRepo: env.embeddingJobRepo,
+    memoryRepo: env.memoryRepo,
+    embeddingRepo: env.embeddingRepo,
+    provider: env.mockProvider,
+    pollIntervalMs: 50,
+    maintenanceIntervalMs: 1000,
+    autoStart: false
+  });
+
+  await manager.start();
+  assert.equal(manager.active, true);
+
+  const stopped = await manager.stop(1000);
+  assert.equal(stopped, true);
+  assert.equal(manager.active, false);
+
+  // Close database cleanly
+  env.db.close();
+  assert.equal(env.db.isOpen, false);
+
+  // Wait 100ms to verify that unref'd or cleared timers do not fire or access closed database
+  await new Promise((r) => setTimeout(r, 100));
+});
+
+test('31. Maintenance does not alter retry, recovery, or job-claim behavior', async () => {
+  const env = setupTestEnvironment();
+  const now = Date.now();
+  const twentyDaysAgoIso = new Date(now - 20 * 86_400_000).toISOString();
+
+  // Create terminal jobs older than retention
+  createJobWithStatus(env, 'COMPLETED', twentyDaysAgoIso, 'old.comp');
+  createJobWithStatus(env, 'FAILED', twentyDaysAgoIso, 'old.fail');
+
+  // Create active pending job
+  const pendingJob = createJobWithStatus(env, 'PENDING', undefined, 'active.pending');
+
+  // Run maintenance pass
+  const pruneResult = await env.lifecycleManager.runMaintenance(now);
+  assert.ok(pruneResult);
+  assert.equal(pruneResult.total, 2);
+
+  // Claim next job: active pending job is claimed normally
+  const claimTime = new Date(Date.now() + 1000).toISOString();
+  const claimed = env.embeddingJobRepo.claimNextJob(claimTime, env.mockProvider.modelId);
+  assert.ok(claimed);
+  assert.equal(claimed.id, pendingJob.id);
+  assert.equal(claimed.status, 'RUNNING');
+});

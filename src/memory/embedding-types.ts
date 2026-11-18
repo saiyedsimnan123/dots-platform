@@ -297,5 +297,27 @@ export interface ListEmbeddingJobsFilter {
   readonly offset?: number;
 }
 
+/**
+ * Execution options for pruning terminal embedding jobs.
+ */
+export interface PruneTerminalJobsOptions {
+  /** Maximum number of jobs to delete per maintenance pass (default: 500) */
+  readonly limit?: number;
+  /** Retention cutoff duration in milliseconds (default: 14 days = 1,209,600,000 ms) */
+  readonly olderThanMs?: number;
+  /** Reference timestamp for calculating cutoff (defaults to Date.now()) */
+  readonly now?: number;
+}
+
+/**
+ * Result counts by terminal status from pruning embedding jobs.
+ */
+export interface PruneTerminalJobsResult {
+  readonly completed: number;
+  readonly failed: number;
+  readonly cancelled: number;
+  readonly total: number;
+}
+
 
 

@@ -22,7 +22,9 @@ import type {
   EmbeddingJob,
   EmbeddingJobStatus,
   EnqueueEmbeddingJobInput,
-  ListEmbeddingJobsFilter
+  ListEmbeddingJobsFilter,
+  PruneTerminalJobsOptions,
+  PruneTerminalJobsResult
 } from '../memory/embedding-types.ts';
 import type { MemoryScopeType } from '../domain/types.ts';
 import { ValidationError, DatabaseError } from '../domain/errors.ts';
@@ -517,6 +519,109 @@ export class EmbeddingJobRepository {
 
     const result = this.db.prepare(sql).run(...params);
     return Number(result.changes);
+  }
+
+  /**
+   * Prunes terminal embedding jobs (COMPLETED, FAILED, CANCELLED) older than the cutoff threshold,
+   * bounded by a maximum deletion limit per pass.
+   * Never deletes PENDING or RUNNING jobs, or jobs without valid terminal timestamps.
+   * Returns deleted counts by terminal status.
+   */
+  public pruneTerminalJobs(options?: PruneTerminalJobsOptions): PruneTerminalJobsResult {
+    const limit = options?.limit ?? 500;
+    const olderThanMs = options?.olderThanMs ?? (14 * 24 * 60 * 60 * 1000);
+    const now = options?.now ?? Date.now();
+
+    this.validatePruneOptions(limit, olderThanMs, now);
+
+    const cutoffDate = new Date(now - olderThanMs);
+    const cutoffIso = cutoffDate.toISOString();
+
+    const execute = (): PruneTerminalJobsResult => {
+      // 1. Select candidate terminal jobs up to the specified limit using indexed status scan
+      const selectSql = `
+        SELECT id, status, updated_at
+        FROM embedding_jobs
+        WHERE status IN ('COMPLETED', 'FAILED', 'CANCELLED')
+          AND updated_at <= ?
+        ORDER BY updated_at ASC, id ASC
+        LIMIT ?
+      `;
+
+      const candidateRows = this.db.prepare(selectSql).all(cutoffIso, limit) as unknown as Array<{
+        id: string;
+        status: string;
+        updated_at: string;
+      }>;
+
+      if (!candidateRows || candidateRows.length === 0) {
+        return { completed: 0, failed: 0, cancelled: 0, total: 0 };
+      }
+
+      // 2. Defensive verification:
+      // Filter out any row that:
+      // - Is not in terminal status ('COMPLETED', 'FAILED', 'CANCELLED')
+      // - Has missing or unparseable updated_at
+      // - Has parsed timestamp greater than cutoff
+      const validRowsToDelete: Array<{ id: string; status: string }> = [];
+      let completedCount = 0;
+      let failedCount = 0;
+      let cancelledCount = 0;
+
+      for (const row of candidateRows) {
+        if (row.status !== 'COMPLETED' && row.status !== 'FAILED' && row.status !== 'CANCELLED') {
+          continue;
+        }
+
+        if (!row.updated_at || typeof row.updated_at !== 'string' || row.updated_at.trim() === '') {
+          continue;
+        }
+
+        const parsedTime = Date.parse(row.updated_at);
+        if (!Number.isFinite(parsedTime) || parsedTime > cutoffDate.getTime()) {
+          continue;
+        }
+
+        validRowsToDelete.push(row);
+        if (row.status === 'COMPLETED') completedCount++;
+        else if (row.status === 'FAILED') failedCount++;
+        else if (row.status === 'CANCELLED') cancelledCount++;
+      }
+
+      if (validRowsToDelete.length === 0) {
+        return { completed: 0, failed: 0, cancelled: 0, total: 0 };
+      }
+
+      // 3. Perform bounded batch deletion by primary key
+      const deleteStmt = this.db.prepare('DELETE FROM embedding_jobs WHERE id = ?');
+      for (const item of validRowsToDelete) {
+        deleteStmt.run(item.id);
+      }
+
+      return {
+        completed: completedCount,
+        failed: failedCount,
+        cancelled: cancelledCount,
+        total: validRowsToDelete.length
+      };
+    };
+
+    if (this.db.currentTransactionDepth > 0) {
+      return execute();
+    }
+    return this.transaction(execute);
+  }
+
+  private validatePruneOptions(limit: number, olderThanMs: number, now: number): void {
+    if (typeof limit !== 'number' || !Number.isInteger(limit) || limit <= 0) {
+      throw new ValidationError(`Prune limit must be a positive integer, received '${String(limit)}'.`);
+    }
+    if (typeof olderThanMs !== 'number' || !Number.isFinite(olderThanMs) || olderThanMs < 0) {
+      throw new ValidationError(`olderThanMs must be a non-negative number, received '${String(olderThanMs)}'.`);
+    }
+    if (typeof now !== 'number' || !Number.isFinite(now) || now <= 0) {
+      throw new ValidationError(`now must be a valid positive timestamp, received '${String(now)}'.`);
+    }
   }
 
   private mapRow(row: EmbeddingJobDbRow): EmbeddingJob {

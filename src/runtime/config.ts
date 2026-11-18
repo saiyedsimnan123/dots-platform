@@ -56,6 +56,9 @@ export interface DotsRuntimeConfig {
   readonly embeddingDimensions: number;
   readonly embeddingLocalModelPath?: string;
   readonly embeddingMinSemanticConfidence: number;
+  readonly embeddingJobRetentionMs: number;
+  readonly embeddingJobMaintenanceIntervalMs: number;
+  readonly embeddingJobPruneBatchSize: number;
 }
 
 export interface LoadRuntimeConfigOverrides {
@@ -88,6 +91,9 @@ export interface LoadRuntimeConfigOverrides {
   readonly embeddingDimensions?: number;
   readonly embeddingLocalModelPath?: string;
   readonly embeddingMinSemanticConfidence?: number;
+  readonly embeddingJobRetentionMs?: number;
+  readonly embeddingJobMaintenanceIntervalMs?: number;
+  readonly embeddingJobPruneBatchSize?: number;
   readonly requireTokens?: boolean;
   readonly env?: Record<string, string | undefined>;
 }
@@ -350,6 +356,68 @@ export function loadRuntimeConfig(overrides: LoadRuntimeConfigOverrides = {}): D
     embeddingMinSemanticConfidence = parsed;
   }
 
+  let embeddingJobRetentionMs = 14 * 24 * 60 * 60 * 1000;
+  if (overrides.embeddingJobRetentionMs !== undefined) {
+    if (typeof overrides.embeddingJobRetentionMs !== 'number' || !Number.isFinite(overrides.embeddingJobRetentionMs) || overrides.embeddingJobRetentionMs < 0) {
+      throw new ValidationError(
+        `Configuration 'embeddingJobRetentionMs' must be a non-negative number. Received '${overrides.embeddingJobRetentionMs}'.`
+      );
+    }
+    embeddingJobRetentionMs = overrides.embeddingJobRetentionMs;
+  } else if (env.DOTS_EMBEDDING_JOB_RETENTION_MS !== undefined && env.DOTS_EMBEDDING_JOB_RETENTION_MS.trim() !== '') {
+    const parsed = Number(env.DOTS_EMBEDDING_JOB_RETENTION_MS);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      throw new ValidationError(
+        `Configuration 'DOTS_EMBEDDING_JOB_RETENTION_MS' must be a non-negative number. Received '${env.DOTS_EMBEDDING_JOB_RETENTION_MS}'.`
+      );
+    }
+    embeddingJobRetentionMs = parsed;
+  } else if (env.DOTS_EMBEDDING_JOB_RETENTION_DAYS !== undefined && env.DOTS_EMBEDDING_JOB_RETENTION_DAYS.trim() !== '') {
+    const parsedDays = Number(env.DOTS_EMBEDDING_JOB_RETENTION_DAYS);
+    if (!Number.isFinite(parsedDays) || parsedDays < 0) {
+      throw new ValidationError(
+        `Configuration 'DOTS_EMBEDDING_JOB_RETENTION_DAYS' must be a non-negative number. Received '${env.DOTS_EMBEDDING_JOB_RETENTION_DAYS}'.`
+      );
+    }
+    embeddingJobRetentionMs = Math.round(parsedDays * 24 * 60 * 60 * 1000);
+  }
+
+  let embeddingJobMaintenanceIntervalMs = 60 * 60 * 1000;
+  if (overrides.embeddingJobMaintenanceIntervalMs !== undefined) {
+    if (typeof overrides.embeddingJobMaintenanceIntervalMs !== 'number' || !Number.isInteger(overrides.embeddingJobMaintenanceIntervalMs) || overrides.embeddingJobMaintenanceIntervalMs < 1000) {
+      throw new ValidationError(
+        `Configuration 'embeddingJobMaintenanceIntervalMs' must be an integer >= 1000 ms. Received '${overrides.embeddingJobMaintenanceIntervalMs}'.`
+      );
+    }
+    embeddingJobMaintenanceIntervalMs = overrides.embeddingJobMaintenanceIntervalMs;
+  } else if (env.DOTS_EMBEDDING_JOB_MAINTENANCE_INTERVAL_MS !== undefined && env.DOTS_EMBEDDING_JOB_MAINTENANCE_INTERVAL_MS.trim() !== '') {
+    const parsed = Number(env.DOTS_EMBEDDING_JOB_MAINTENANCE_INTERVAL_MS);
+    if (!Number.isInteger(parsed) || parsed < 1000) {
+      throw new ValidationError(
+        `Configuration 'DOTS_EMBEDDING_JOB_MAINTENANCE_INTERVAL_MS' must be an integer >= 1000 ms. Received '${env.DOTS_EMBEDDING_JOB_MAINTENANCE_INTERVAL_MS}'.`
+      );
+    }
+    embeddingJobMaintenanceIntervalMs = parsed;
+  }
+
+  let embeddingJobPruneBatchSize = 500;
+  if (overrides.embeddingJobPruneBatchSize !== undefined) {
+    if (typeof overrides.embeddingJobPruneBatchSize !== 'number' || !Number.isInteger(overrides.embeddingJobPruneBatchSize) || overrides.embeddingJobPruneBatchSize <= 0) {
+      throw new ValidationError(
+        `Configuration 'embeddingJobPruneBatchSize' must be a positive integer. Received '${overrides.embeddingJobPruneBatchSize}'.`
+      );
+    }
+    embeddingJobPruneBatchSize = overrides.embeddingJobPruneBatchSize;
+  } else if (env.DOTS_EMBEDDING_JOB_PRUNE_BATCH_SIZE !== undefined && env.DOTS_EMBEDDING_JOB_PRUNE_BATCH_SIZE.trim() !== '') {
+    const parsed = Number(env.DOTS_EMBEDDING_JOB_PRUNE_BATCH_SIZE);
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+      throw new ValidationError(
+        `Configuration 'DOTS_EMBEDDING_JOB_PRUNE_BATCH_SIZE' must be a positive integer. Received '${env.DOTS_EMBEDDING_JOB_PRUNE_BATCH_SIZE}'.`
+      );
+    }
+    embeddingJobPruneBatchSize = parsed;
+  }
+
   return {
     dbPath,
     workspaceRoot,
@@ -383,6 +451,9 @@ export function loadRuntimeConfig(overrides: LoadRuntimeConfigOverrides = {}): D
     embeddingPollIntervalMs,
     embeddingDimensions,
     embeddingLocalModelPath,
-    embeddingMinSemanticConfidence
+    embeddingMinSemanticConfidence,
+    embeddingJobRetentionMs,
+    embeddingJobMaintenanceIntervalMs,
+    embeddingJobPruneBatchSize
   };
 }

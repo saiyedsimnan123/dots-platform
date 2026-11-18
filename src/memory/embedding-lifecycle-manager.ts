@@ -25,7 +25,7 @@ import type { DatabaseManager } from '../storage/db.ts';
 import type { MemoryRepository } from '../storage/memory-repository.ts';
 import type { MemoryEmbeddingRepository } from '../storage/memory-embedding-repository.ts';
 import type { EmbeddingJobRepository } from '../storage/embedding-job-repository.ts';
-import type { IEmbeddingProvider, EmbeddingJob } from './embedding-types.ts';
+import type { IEmbeddingProvider, EmbeddingJob, PruneTerminalJobsResult } from './embedding-types.ts';
 import type { AuditRepository } from '../storage/audit-repository.ts';
 import type { Memory } from '../domain/types.ts';
 import { validateVector } from './vector-utils.ts';
@@ -48,9 +48,26 @@ export interface EmbeddingLifecycleManagerOptions {
   readonly maxAttempts?: number;
   /** Automatically start the polling loop upon construction (default: false) */
   readonly autoStart?: boolean;
+  /** Terminal job retention in ms (default: 14 days = 1,209,600,000 ms) */
+  readonly retentionMs?: number;
+  /** Interval in ms between automatic queue maintenance passes (default: 1 hour = 3,600,000 ms) */
+  readonly maintenanceIntervalMs?: number;
+  /** Maximum number of terminal jobs deleted per maintenance pass (default: 500) */
+  readonly maxPruneBatchSize?: number;
+  /** Optional logger for recording operational and maintenance events */
+  readonly logger?: {
+    info?: (domain: string, event: string, details?: Record<string, unknown>) => void;
+    warn?: (domain: string, event: string, details?: Record<string, unknown>) => void;
+    error?: (domain: string, event: string, details?: Record<string, unknown>) => void;
+    debug?: (domain: string, event: string, details?: Record<string, unknown>) => void;
+  };
 }
 
 export class EmbeddingLifecycleManager {
+  public static readonly DEFAULT_RETENTION_MS = 14 * 24 * 60 * 60 * 1000; // 14 days
+  public static readonly DEFAULT_MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+  public static readonly DEFAULT_MAX_PRUNE_BATCH_SIZE = 500;
+
   public readonly db: DatabaseManager;
   public readonly jobRepo: EmbeddingJobRepository;
   public readonly memoryRepo: MemoryRepository;
@@ -62,13 +79,20 @@ export class EmbeddingLifecycleManager {
   public readonly baseRetryDelayMs: number;
   public readonly maxRetryDelayMs: number;
   public readonly maxAttempts: number;
+  public readonly retentionMs: number;
+  public readonly maintenanceIntervalMs: number;
+  public readonly maxPruneBatchSize: number;
+  public readonly logger?: EmbeddingLifecycleManagerOptions['logger'];
 
   private isRunning = false;
   private isStopping = false;
   private isStopped = false;
   private isProcessing = false;
+  private isMaintaining = false;
   private pollTimer: NodeJS.Timeout | null = null;
+  private maintenanceTimer: NodeJS.Timeout | null = null;
   private inFlightPromise: Promise<void> | null = null;
+  private maintenancePromise: Promise<PruneTerminalJobsResult | null> | null = null;
 
   constructor(options: EmbeddingLifecycleManagerOptions) {
     if (!options || typeof options !== 'object') {
@@ -79,6 +103,22 @@ export class EmbeddingLifecycleManager {
     if (!options.memoryRepo) throw new ValidationError('MemoryRepository must be provided.');
     if (!options.embeddingRepo) throw new ValidationError('MemoryEmbeddingRepository must be provided.');
     if (!options.provider) throw new ValidationError('EmbeddingProvider must be provided.');
+
+    if (options.retentionMs !== undefined) {
+      if (typeof options.retentionMs !== 'number' || !Number.isFinite(options.retentionMs) || options.retentionMs < 0) {
+        throw new ValidationError(`Configuration 'retentionMs' must be a non-negative number, received '${String(options.retentionMs)}'.`);
+      }
+    }
+    if (options.maintenanceIntervalMs !== undefined) {
+      if (typeof options.maintenanceIntervalMs !== 'number' || !Number.isFinite(options.maintenanceIntervalMs) || options.maintenanceIntervalMs < 1000) {
+        throw new ValidationError(`Configuration 'maintenanceIntervalMs' must be at least 1000 ms, received '${String(options.maintenanceIntervalMs)}'.`);
+      }
+    }
+    if (options.maxPruneBatchSize !== undefined) {
+      if (typeof options.maxPruneBatchSize !== 'number' || !Number.isInteger(options.maxPruneBatchSize) || options.maxPruneBatchSize <= 0) {
+        throw new ValidationError(`Configuration 'maxPruneBatchSize' must be a positive integer, received '${String(options.maxPruneBatchSize)}'.`);
+      }
+    }
 
     this.db = options.db;
     this.jobRepo = options.jobRepo;
@@ -91,6 +131,10 @@ export class EmbeddingLifecycleManager {
     this.baseRetryDelayMs = Math.max(options.baseRetryDelayMs ?? 1000, 1);
     this.maxRetryDelayMs = Math.max(options.maxRetryDelayMs ?? 60000, 100);
     this.maxAttempts = Math.max(options.maxAttempts ?? 5, 1);
+    this.retentionMs = options.retentionMs ?? EmbeddingLifecycleManager.DEFAULT_RETENTION_MS;
+    this.maintenanceIntervalMs = options.maintenanceIntervalMs ?? EmbeddingLifecycleManager.DEFAULT_MAINTENANCE_INTERVAL_MS;
+    this.maxPruneBatchSize = options.maxPruneBatchSize ?? EmbeddingLifecycleManager.DEFAULT_MAX_PRUNE_BATCH_SIZE;
+    this.logger = options.logger;
 
     if (options.autoStart) {
       void this.start();
@@ -106,7 +150,8 @@ export class EmbeddingLifecycleManager {
 
   /**
    * Starts the asynchronous job execution loop.
-   * Recovers any interrupted jobs left in 'RUNNING' status from previous runs.
+   * Recovers any interrupted jobs left in 'RUNNING' status from previous runs,
+   * schedules periodic queue maintenance, and performs an initial maintenance pass.
    */
   public async start(): Promise<void> {
     if (this.isRunning) {
@@ -120,22 +165,69 @@ export class EmbeddingLifecycleManager {
     // 1. Recover any jobs left in 'RUNNING' state before starting new processing
     this.jobRepo.recoverInterruptedJobs();
 
-    // 2. Start periodic polling
+    // 2. Schedule maintenance tick and run initial maintenance pass safely in background
+    this.scheduleMaintenanceTick();
+    void this.runMaintenance();
+
+    // 3. Start periodic polling
     this.schedulePollTick();
 
-    // 3. Immediately trigger first check
+    // 4. Immediately trigger first check
     this.trigger();
+  }
+
+  /**
+   * Performs an immediate maintenance pass: prunes terminal embedding jobs
+   * (COMPLETED, FAILED, CANCELLED) older than retentionMs, bounded by maxPruneBatchSize.
+   * Safe against concurrent calls (no-op if already maintaining or stopping/stopped).
+   */
+  public async runMaintenance(now = Date.now()): Promise<PruneTerminalJobsResult | null> {
+    if (!this.db.isOpen || this.isStopped || this.isStopping || this.isMaintaining) {
+      return null;
+    }
+
+    this.isMaintaining = true;
+    const maintenanceExecution = (async (): Promise<PruneTerminalJobsResult | null> => {
+      try {
+        const result = this.jobRepo.pruneTerminalJobs({
+          limit: this.maxPruneBatchSize,
+          olderThanMs: this.retentionMs,
+          now
+        });
+
+        if (result.total > 0) {
+          this.logger?.info?.('memory', 'embedding_queue_pruned', {
+            completed: result.completed,
+            failed: result.failed,
+            cancelled: result.cancelled,
+            total: result.total
+          });
+        }
+
+        return result;
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.logger?.error?.('memory', 'embedding_queue_prune_failed', { error: message });
+        return null;
+      } finally {
+        this.isMaintaining = false;
+        this.maintenancePromise = null;
+      }
+    })();
+
+    this.maintenancePromise = maintenanceExecution;
+    return maintenanceExecution;
   }
 
   /**
    * Stops the lifecycle worker gracefully:
    * 1. Stops accepting or claiming new jobs immediately.
-   * 2. Clears polling timers.
-   * 3. Awaits completion of any in-flight inference/persistence up to timeoutMs.
+   * 2. Clears polling and maintenance timers.
+   * 3. Awaits completion of any in-flight inference/persistence and maintenance up to timeoutMs.
    * Returns true if all in-flight work drained successfully; false if timed out while in-flight work is still active.
    */
   public async stop(timeoutMs = 5000): Promise<boolean> {
-    if (!this.isRunning && !this.isStopping && !this.isProcessing) {
+    if (!this.isRunning && !this.isStopping && !this.isProcessing && !this.isMaintaining) {
       return true;
     }
 
@@ -147,15 +239,24 @@ export class EmbeddingLifecycleManager {
       this.pollTimer = null;
     }
 
+    if (this.maintenanceTimer) {
+      clearTimeout(this.maintenanceTimer);
+      this.maintenanceTimer = null;
+    }
+
     let drained = true;
-    if (this.inFlightPromise) {
+    const inFlightWork: Promise<unknown>[] = [];
+    if (this.inFlightPromise) inFlightWork.push(this.inFlightPromise);
+    if (this.maintenancePromise) inFlightWork.push(this.maintenancePromise);
+
+    if (inFlightWork.length > 0) {
       let timer: NodeJS.Timeout | null = null;
       const timeoutPromise = new Promise<'timeout'>((resolve) => {
         timer = setTimeout(() => resolve('timeout'), Math.max(1, timeoutMs));
       });
 
       const outcome = await Promise.race([
-        this.inFlightPromise.then(() => 'drained' as const, () => 'drained' as const),
+        Promise.allSettled(inFlightWork).then(() => 'drained' as const),
         timeoutPromise
       ]);
 
@@ -177,13 +278,17 @@ export class EmbeddingLifecycleManager {
   }
 
   /**
-   * Unconditionally waits for any currently active in-flight embedding operation to finish.
+   * Unconditionally waits for any currently active in-flight embedding operation or maintenance to finish.
    * Guarantees that the worker has completely finished interacting with SQLite before database closure.
    */
   public async waitForInFlight(): Promise<void> {
-    if (this.inFlightPromise) {
+    const inFlightWork: Promise<unknown>[] = [];
+    if (this.inFlightPromise) inFlightWork.push(this.inFlightPromise);
+    if (this.maintenancePromise) inFlightWork.push(this.maintenancePromise);
+
+    if (inFlightWork.length > 0) {
       try {
-        await this.inFlightPromise;
+        await Promise.allSettled(inFlightWork);
       } catch {
         // Prevent unhandled rejections during shutdown
       }
@@ -193,10 +298,15 @@ export class EmbeddingLifecycleManager {
   }
 
   /**
-   * Reports whether there is currently an in-flight job being processed.
+   * Reports whether there is currently an in-flight job or maintenance task being processed.
    */
   public get hasInFlightWork(): boolean {
-    return this.isProcessing || this.inFlightPromise !== null;
+    return (
+      this.isProcessing ||
+      this.isMaintaining ||
+      this.inFlightPromise !== null ||
+      this.maintenancePromise !== null
+    );
   }
 
   /**
@@ -428,5 +538,29 @@ export class EmbeddingLifecycleManager {
         this.schedulePollTick();
       }
     }, this.pollIntervalMs);
+  }
+
+  private scheduleMaintenanceTick(): void {
+    if (!this.isRunning || this.isStopping) {
+      return;
+    }
+
+    this.maintenanceTimer = setTimeout(async () => {
+      if (!this.isRunning || this.isStopping) {
+        return;
+      }
+
+      try {
+        await this.runMaintenance();
+      } catch {
+        // Prevent unhandled rejection in background maintenance tick
+      } finally {
+        if (this.isRunning && !this.isStopping) {
+          this.scheduleMaintenanceTick();
+        }
+      }
+    }, this.maintenanceIntervalMs);
+
+    this.maintenanceTimer.unref?.();
   }
 }

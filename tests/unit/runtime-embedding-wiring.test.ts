@@ -451,3 +451,83 @@ test('12. Config: Validates and rejects invalid embeddingMinSemanticConfidence',
     /must be a number between 0\.0 and 1\.0/
   );
 });
+
+test('13. Config & Runtime: Parses, validates, and wires embedding queue maintenance settings', async () => {
+  // Defaults
+  const defaultConfig = loadRuntimeConfig({
+    requireTokens: false,
+    tokens: TEST_TOKENS,
+    env: {}
+  });
+  assert.equal(defaultConfig.embeddingJobRetentionMs, 14 * 24 * 60 * 60 * 1000); // 14 days
+  assert.equal(defaultConfig.embeddingJobMaintenanceIntervalMs, 60 * 60 * 1000); // 1 hour
+  assert.equal(defaultConfig.embeddingJobPruneBatchSize, 500);
+
+  // Custom environment variables
+  const envConfig = loadRuntimeConfig({
+    requireTokens: false,
+    tokens: TEST_TOKENS,
+    env: {
+      DOTS_EMBEDDING_JOB_RETENTION_DAYS: '7',
+      DOTS_EMBEDDING_JOB_MAINTENANCE_INTERVAL_MS: '120000',
+      DOTS_EMBEDDING_JOB_PRUNE_BATCH_SIZE: '250'
+    }
+  });
+  assert.equal(envConfig.embeddingJobRetentionMs, 7 * 24 * 60 * 60 * 1000);
+  assert.equal(envConfig.embeddingJobMaintenanceIntervalMs, 120000);
+  assert.equal(envConfig.embeddingJobPruneBatchSize, 250);
+
+  // Retention in milliseconds
+  const envConfigMs = loadRuntimeConfig({
+    requireTokens: false,
+    tokens: TEST_TOKENS,
+    env: {
+      DOTS_EMBEDDING_JOB_RETENTION_MS: '86400000'
+    }
+  });
+  assert.equal(envConfigMs.embeddingJobRetentionMs, 86400000);
+
+  // Validation: Negative retention
+  assert.throws(
+    () => loadRuntimeConfig({ requireTokens: false, env: { DOTS_EMBEDDING_JOB_RETENTION_MS: '-1' } }),
+    /must be a non-negative number/
+  );
+  assert.throws(
+    () => loadRuntimeConfig({ requireTokens: false, env: { DOTS_EMBEDDING_JOB_RETENTION_DAYS: '-5' } }),
+    /must be a non-negative number/
+  );
+
+  // Validation: Interval < 1000 ms
+  assert.throws(
+    () => loadRuntimeConfig({ requireTokens: false, env: { DOTS_EMBEDDING_JOB_MAINTENANCE_INTERVAL_MS: '500' } }),
+    /must be an integer >= 1000 ms/
+  );
+
+  // Validation: Batch size <= 0
+  assert.throws(
+    () => loadRuntimeConfig({ requireTokens: false, env: { DOTS_EMBEDDING_JOB_PRUNE_BATCH_SIZE: '0' } }),
+    /must be a positive integer/
+  );
+  assert.throws(
+    () => loadRuntimeConfig({ requireTokens: false, env: { DOTS_EMBEDDING_JOB_PRUNE_BATCH_SIZE: '-10' } }),
+    /must be a positive integer/
+  );
+
+  // Runtime wiring: lifecycleManager receives configured settings
+  const runtime = new DotsRuntime({
+    dbPath: ':memory:',
+    tokens: TEST_TOKENS,
+    embeddingProvider: 'mock',
+    embeddingJobRetentionMs: 5 * 86_400_000,
+    embeddingJobMaintenanceIntervalMs: 15_000,
+    embeddingJobPruneBatchSize: 100,
+    silentLogs: true
+  });
+
+  assert.ok(runtime.lifecycleManager);
+  assert.equal(runtime.lifecycleManager.retentionMs, 5 * 86_400_000);
+  assert.equal(runtime.lifecycleManager.maintenanceIntervalMs, 15_000);
+  assert.equal(runtime.lifecycleManager.maxPruneBatchSize, 100);
+
+  await runtime.stop();
+});

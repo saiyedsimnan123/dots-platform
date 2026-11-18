@@ -309,6 +309,10 @@ export class DotsRuntime {
         provider: this.embeddingProvider,
         auditRepo: this.auditRepo,
         pollIntervalMs: this.config.embeddingPollIntervalMs,
+        retentionMs: this.config.embeddingJobRetentionMs,
+        maintenanceIntervalMs: this.config.embeddingJobMaintenanceIntervalMs,
+        maxPruneBatchSize: this.config.embeddingJobPruneBatchSize,
+        logger: this.logger,
         autoStart: false
       });
     } else {
