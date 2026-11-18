@@ -939,8 +939,17 @@ async function executeRemoteCommand(
     if (sub === 'approve' || sub === 'reject') {
       const id = requireArg(positionals[2], 'memoryId');
       const reason = getStringFlag(flags, 'reason');
+      const supersede = flags.get('supersede') === true;
+      let decision: ProposalDecision;
+      if (sub === 'reject') {
+        decision = 'REJECT';
+      } else if (supersede) {
+        decision = 'APPROVE_AND_SUPERSEDE';
+      } else {
+        decision = 'APPROVE_NEW';
+      }
       return await callHttpApi(serverUrl, 'POST', `/api/memories/${encodeURIComponent(id)}/decide`, token, scopeSpec, {
-        decision: sub === 'approve' ? 'APPROVED' : 'REJECTED',
+        decision,
         ...(reason ? { reason } : {})
       });
     }
