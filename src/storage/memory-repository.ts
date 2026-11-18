@@ -24,7 +24,8 @@ import type {
   UpdateMemoryInput,
   ListMemoriesFilter,
   RecordMemoryInjectionInput,
-  ScopeIdentifier
+  ScopeIdentifier,
+  SupersedeMemoryParams
 } from '../domain/types.ts';
 import type {
   MissingEmbeddingMemoryRecord,
@@ -37,7 +38,7 @@ import {
   MemoryScopeViolationError
 } from '../domain/errors.ts';
 
-export type { ScopeIdentifier };
+export type { ScopeIdentifier, SupersedeMemoryParams };
 
 interface MemoryDbRow {
   id: string;
@@ -50,6 +51,9 @@ interface MemoryDbRow {
   priority: number;
   tags_json: string;
   metadata_json: string;
+  version: number;
+  supersedes_id: string | null;
+  superseded_by: string | null;
   created_at: string;
   updated_at: string;
   last_accessed_at: string | null;
@@ -78,7 +82,8 @@ const VALID_SCOPES: ReadonlySet<MemoryScopeType> = new Set(['GLOBAL', 'WORKSPACE
 const VALID_STATUSES: ReadonlySet<MemoryStatus> = new Set([
   'ACTIVE',
   'PENDING_APPROVAL',
-  'ARCHIVED'
+  'ARCHIVED',
+  'SUPERSEDED'
 ]);
 
 export class MemoryRepository {
@@ -111,6 +116,23 @@ export class MemoryRepository {
     const priority = input.priority ?? 50;
     this.validatePriority(priority);
 
+    const version = input.version ?? 1;
+    this.validateVersion(version);
+
+    const supersedesId = input.supersedesId ?? null;
+    if (supersedesId !== null) {
+      if (typeof supersedesId !== 'string' || supersedesId.trim() === '') {
+        throw new ValidationError('supersedesId must be a non-empty string or null.');
+      }
+    }
+
+    const supersededBy = input.supersededBy ?? null;
+    if (supersededBy !== null) {
+      if (typeof supersededBy !== 'string' || supersededBy.trim() === '') {
+        throw new ValidationError('supersededBy must be a non-empty string or null.');
+      }
+    }
+
     // 2. Enforce active key uniqueness within scope
     if (status === 'ACTIVE') {
       const existing = this.getActiveByKey(input.key, input.scopeType, input.scopeId);
@@ -127,9 +149,9 @@ export class MemoryRepository {
     const stmt = this.db.prepare(`
       INSERT INTO memories (
         id, category, scope_type, scope_id, key, content, status,
-        priority, tags_json, metadata_json, created_at, updated_at,
-        last_accessed_at, access_count
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0)
+        priority, tags_json, metadata_json, version, supersedes_id, superseded_by,
+        created_at, updated_at, last_accessed_at, access_count
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0)
     `);
 
     try {
@@ -144,6 +166,9 @@ export class MemoryRepository {
         priority,
         tagsJson,
         metadataJson,
+        version,
+        supersedesId !== null ? supersedesId.trim() : null,
+        supersededBy !== null ? supersededBy.trim() : null,
         now,
         now
       );
@@ -467,6 +492,28 @@ export class MemoryRepository {
       params.push(input.status);
     }
 
+    if (input.version !== undefined) {
+      this.validateVersion(input.version);
+      updates.push('version = ?');
+      params.push(input.version);
+    }
+
+    if (input.supersedesId !== undefined) {
+      if (input.supersedesId !== null && (typeof input.supersedesId !== 'string' || input.supersedesId.trim() === '')) {
+        throw new ValidationError('supersedesId must be a non-empty string or null.');
+      }
+      updates.push('supersedes_id = ?');
+      params.push(input.supersedesId !== null ? input.supersedesId.trim() : null);
+    }
+
+    if (input.supersededBy !== undefined) {
+      if (input.supersededBy !== null && (typeof input.supersededBy !== 'string' || input.supersededBy.trim() === '')) {
+        throw new ValidationError('supersededBy must be a non-empty string or null.');
+      }
+      updates.push('superseded_by = ?');
+      params.push(input.supersededBy !== null ? input.supersededBy.trim() : null);
+    }
+
     if (updates.length === 0) {
       return existing;
     }
@@ -632,6 +679,204 @@ export class MemoryRepository {
     return rows.map((r) => this.mapInjectionRow(r));
   }
 
+  /**
+   * Retrieves the version history of a memory key within a designated scope.
+   * Deterministically ordered by version ASC, created_at ASC, id ASC.
+   * Returns records across all statuses (ACTIVE, SUPERSEDED, PENDING_APPROVAL, ARCHIVED).
+   */
+  public getMemoryHistory(key: string, scope: ScopeIdentifier): Memory[] {
+    this.validateKey(key);
+    if (!scope || typeof scope !== 'object') {
+      throw new ValidationError('Scope must be provided to getMemoryHistory.');
+    }
+    this.validateScope(scope.scopeType, scope.scopeId);
+
+    const stmt = this.db.prepare(`
+      SELECT * FROM memories
+      WHERE scope_type = ? AND scope_id = ? AND key = ?
+      ORDER BY version ASC, created_at ASC, id ASC
+    `);
+    const rows = stmt.all(scope.scopeType, scope.scopeId, key.trim()) as unknown as MemoryDbRow[];
+    return rows.map((r) => this.mapMemoryRow(r));
+  }
+
+  /**
+   * Atomically supersedes an existing memory with a replacement memory.
+   *
+   * Pre-conditions & Invariants:
+   * 1. Both memories must exist within the designated scope.
+   * 2. Memory keys must match (case-insensitive trim).
+   * 3. Previous cannot be superseded by itself (self-link rejected).
+   * 4. Previous cannot already be superseded (status === 'SUPERSEDED' or supersededBy !== null).
+   * 5. Replacement cannot already supersede another memory (supersedesId !== null && supersedesId !== previous.id).
+   * 6. Lineage cycle detection: walks ancestors of previous and descendants of replacement.
+   * 7. Version ordering: replacement version must be > previous version.
+   *    If replacement.version < previous.version and newVersion is omitted, throws ValidationError.
+   *    If newVersion is explicitly passed and <= previous.version, throws ValidationError.
+   *    Target version defaults to Math.max(replacement.version, previous.version + 1).
+   * 8. Atomicity: within an immediate transaction, previous is marked SUPERSEDED with superseded_by = replacement.id,
+   *    then replacement is updated with supersedes_id = previous.id, version = targetVersion, and replacementStatus.
+   */
+  public supersedeMemory(params: SupersedeMemoryParams): { previous: Memory; replacement: Memory } {
+    if (!params || typeof params !== 'object') {
+      throw new ValidationError('Parameters must be provided to supersedeMemory.');
+    }
+    if (!params.previousId || typeof params.previousId !== 'string' || params.previousId.trim() === '') {
+      throw new ValidationError('previousId must be a non-empty string.');
+    }
+    if (!params.replacementId || typeof params.replacementId !== 'string' || params.replacementId.trim() === '') {
+      throw new ValidationError('replacementId must be a non-empty string.');
+    }
+    if (!params.scope || typeof params.scope !== 'object') {
+      throw new ValidationError('Scope must be provided to supersedeMemory.');
+    }
+    this.validateScope(params.scope.scopeType, params.scope.scopeId);
+
+    const prevId = params.previousId.trim();
+    const repId = params.replacementId.trim();
+
+    if (prevId === repId) {
+      throw new ValidationError(`Cannot supersede memory '${prevId}' with itself.`);
+    }
+
+    if (params.replacementStatus !== undefined) {
+      this.validateStatus(params.replacementStatus);
+    }
+
+    if (params.newVersion !== undefined) {
+      this.validateVersion(params.newVersion);
+    }
+
+    return this.transaction(() => {
+      const previous = this.getMemoryById(prevId, params.scope);
+      if (!previous) {
+        throw new MemoryNotFoundError(prevId);
+      }
+
+      const replacement = this.getMemoryById(repId, params.scope);
+      if (!replacement) {
+        throw new MemoryNotFoundError(repId);
+      }
+
+      // Keys must match
+      if (previous.key.trim().toLowerCase() !== replacement.key.trim().toLowerCase()) {
+        throw new ValidationError(
+          `Cannot supersede memory with mismatched keys: previous key '${previous.key}' vs replacement key '${replacement.key}'.`
+        );
+      }
+
+      // Previous must not already be superseded
+      if (previous.status === 'SUPERSEDED' || previous.supersededBy !== null) {
+        throw new ValidationError(
+          `Memory '${previous.id}' has already been superseded (status='${previous.status}', supersededBy='${previous.supersededBy}').`
+        );
+      }
+
+      // Replacement must not already supersede another record
+      if (replacement.supersedesId !== null && replacement.supersedesId !== previous.id) {
+        throw new ValidationError(
+          `Replacement memory '${replacement.id}' already supersedes '${replacement.supersedesId}'.`
+        );
+      }
+
+      // Cycle detection: walk supersedes_id chain backwards from previous
+      let ancestorId = previous.supersedesId;
+      const visitedAncestors = new Set<string>([previous.id, replacement.id]);
+      while (ancestorId) {
+        if (ancestorId === replacement.id) {
+          throw new ValidationError(
+            `Supersession cycle detected: replacement '${replacement.id}' is an ancestor of previous '${previous.id}'.`
+          );
+        }
+        if (visitedAncestors.has(ancestorId)) {
+          break;
+        }
+        visitedAncestors.add(ancestorId);
+        const ancestor = this.getMemoryById(ancestorId, params.scope);
+        ancestorId = ancestor?.supersedesId ?? null;
+      }
+
+      // Cycle detection: walk superseded_by chain forwards from replacement
+      let descendantId = replacement.supersededBy;
+      const visitedDescendants = new Set<string>([previous.id, replacement.id]);
+      while (descendantId) {
+        if (descendantId === previous.id) {
+          throw new ValidationError(
+            `Supersession cycle detected: previous '${previous.id}' is a descendant of replacement '${replacement.id}'.`
+          );
+        }
+        if (visitedDescendants.has(descendantId)) {
+          break;
+        }
+        visitedDescendants.add(descendantId);
+        const descendant = this.getMemoryById(descendantId, params.scope);
+        descendantId = descendant?.supersededBy ?? null;
+      }
+
+      // Determine target version
+      let targetVersion: number;
+      if (params.newVersion !== undefined) {
+        if (params.newVersion <= previous.version) {
+          throw new ValidationError(
+            `Replacement version (${params.newVersion}) must be strictly greater than previous version (${previous.version}).`
+          );
+        }
+        targetVersion = params.newVersion;
+      } else {
+        if (replacement.version < previous.version) {
+          throw new ValidationError(
+            `Replacement version (${replacement.version}) is lower than previous version (${previous.version}). Explicit newVersion required.`
+          );
+        }
+        targetVersion = Math.max(replacement.version, previous.version + 1);
+      }
+
+      const now = new Date().toISOString();
+
+      // 1. Mark previous memory as SUPERSEDED and link forward
+      this.db.prepare(`
+        UPDATE memories
+        SET status = 'SUPERSEDED', superseded_by = ?, updated_at = ?
+        WHERE id = ? AND scope_type = ? AND scope_id = ?
+      `).run(replacement.id, now, previous.id, params.scope.scopeType, params.scope.scopeId);
+
+      // 2. Link replacement backward, update version, and optionally status
+      const finalStatus = params.replacementStatus ?? replacement.status;
+      try {
+        this.db.prepare(`
+          UPDATE memories
+          SET supersedes_id = ?, version = ?, status = ?, updated_at = ?
+          WHERE id = ? AND scope_type = ? AND scope_id = ?
+        `).run(
+          previous.id,
+          targetVersion,
+          finalStatus,
+          now,
+          replacement.id,
+          params.scope.scopeType,
+          params.scope.scopeId
+        );
+      } catch (err) {
+        if (err instanceof Error && /UNIQUE constraint failed/i.test(err.message)) {
+          throw new MemoryConflictError(replacement.key, params.scope.scopeType, params.scope.scopeId);
+        }
+        throw err;
+      }
+
+      const updatedPrevious = this.getMemoryById(previous.id, params.scope);
+      const updatedReplacement = this.getMemoryById(replacement.id, params.scope);
+
+      if (!updatedPrevious || !updatedReplacement) {
+        throw new ValidationError('Failed to retrieve updated memories after supersession.');
+      }
+
+      return {
+        previous: updatedPrevious,
+        replacement: updatedReplacement
+      };
+    });
+  }
+
   // --- Private Helpers ---
 
   private getMemoryRowById(id: string): MemoryDbRow | undefined {
@@ -721,6 +966,12 @@ export class MemoryRepository {
     }
   }
 
+  private validateVersion(version: unknown): void {
+    if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) {
+      throw new ValidationError(`Memory version must be an integer >= 1, received '${String(version)}'.`);
+    }
+  }
+
   private mapMemoryRow(row: MemoryDbRow): Memory {
     return {
       id: row.id,
@@ -733,6 +984,9 @@ export class MemoryRepository {
       priority: row.priority,
       tagsJson: row.tags_json,
       metadataJson: row.metadata_json,
+      version: row.version,
+      supersedesId: row.supersedes_id,
+      supersededBy: row.superseded_by,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       lastAccessedAt: row.last_accessed_at,

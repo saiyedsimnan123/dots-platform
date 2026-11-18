@@ -419,20 +419,90 @@ export class DatabaseManager {
               WHERE status IN ('COMPLETED', 'FAILED', 'CANCELLED');
           `);
         }
+      },
+      {
+        version: '008_memory_supersession',
+        up: (db) => {
+          db.exec(`
+            -- Rebuild memories table to support supersession, version history, and lineage
+            DROP TABLE IF EXISTS new_memories;
+
+            CREATE TABLE new_memories (
+              id TEXT PRIMARY KEY,
+              category TEXT NOT NULL CHECK (
+                category IN ('USER_PREFERENCE', 'PROJECT_FACT', 'LEARNED_PROCEDURE')
+              ),
+              scope_type TEXT NOT NULL CHECK (
+                scope_type IN ('GLOBAL', 'WORKSPACE')
+              ),
+              scope_id TEXT NOT NULL,
+              key TEXT NOT NULL,
+              content TEXT NOT NULL,
+              status TEXT NOT NULL CHECK (
+                status IN ('ACTIVE', 'PENDING_APPROVAL', 'ARCHIVED', 'SUPERSEDED')
+              ),
+              priority INTEGER NOT NULL DEFAULT 50 CHECK (priority >= 0 AND priority <= 100),
+              tags_json TEXT NOT NULL DEFAULT '[]',
+              metadata_json TEXT NOT NULL DEFAULT '{}',
+              version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+              supersedes_id TEXT REFERENCES memories(id) ON DELETE SET NULL,
+              superseded_by TEXT REFERENCES memories(id) ON DELETE SET NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              last_accessed_at TEXT,
+              access_count INTEGER NOT NULL DEFAULT 0
+            );
+
+            INSERT INTO new_memories (
+              id, category, scope_type, scope_id, key, content, status,
+              priority, tags_json, metadata_json, version, supersedes_id, superseded_by,
+              created_at, updated_at, last_accessed_at, access_count
+            )
+            SELECT
+              id, category, scope_type, scope_id, key, content, status,
+              priority, tags_json, metadata_json, 1, NULL, NULL,
+              created_at, updated_at, last_accessed_at, access_count
+            FROM memories;
+
+            DROP TABLE memories;
+            ALTER TABLE new_memories RENAME TO memories;
+
+            CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope_type, scope_id, status);
+            CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category, status);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_unique_active_key
+              ON memories(scope_type, scope_id, key)
+              WHERE status = 'ACTIVE';
+            CREATE INDEX IF NOT EXISTS idx_memories_supersedes_id ON memories(supersedes_id);
+            CREATE INDEX IF NOT EXISTS idx_memories_superseded_by ON memories(superseded_by);
+            CREATE INDEX IF NOT EXISTS idx_memories_history ON memories(scope_type, scope_id, key, version ASC);
+          `);
+        }
       }
     ];
 
     const checkStmt = this.db.prepare('SELECT version FROM schema_migrations WHERE version = ?');
     const recordStmt = this.db.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)');
 
-    for (const migration of migrations) {
-      const existing = checkStmt.get(migration.version);
-      if (!existing) {
-        this.transaction(() => {
-          migration.up(this.db);
-          recordStmt.run(migration.version, new Date().toISOString());
-        });
+    try {
+      this.db.exec('PRAGMA foreign_keys = OFF;');
+      for (const migration of migrations) {
+        const existing = checkStmt.get(migration.version);
+        if (!existing) {
+          this.transaction(() => {
+            migration.up(this.db);
+            const violations = this.db.prepare('PRAGMA foreign_key_check;').all();
+            if (violations.length > 0) {
+              throw new DatabaseError(
+                `Foreign key check failed after migration ${migration.version}: ${JSON.stringify(violations)}`,
+                { version: migration.version, violations }
+              );
+            }
+            recordStmt.run(migration.version, new Date().toISOString());
+          });
+        }
       }
+    } finally {
+      this.db.exec('PRAGMA foreign_keys = ON;');
     }
   }
 

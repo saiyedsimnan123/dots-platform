@@ -25,6 +25,10 @@ test('DatabaseManager - initializes schema migrations in memory', () => {
   assert.ok(migrationRow7);
   assert.equal(migrationRow7.version, '007_embedding_jobs_retention_index');
 
+  const migrationRow8 = db.prepare('SELECT version FROM schema_migrations WHERE version = ?').get('008_memory_supersession') as { version: string };
+  assert.ok(migrationRow8);
+  assert.equal(migrationRow8.version, '008_memory_supersession');
+
   // Verify all core tables exist
   const tables = db.prepare(`
     SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'

@@ -277,7 +277,7 @@ export interface AppendAuditEventInput {
 
 export type MemoryCategory = 'USER_PREFERENCE' | 'PROJECT_FACT' | 'LEARNED_PROCEDURE';
 export type MemoryScopeType = 'GLOBAL' | 'WORKSPACE';
-export type MemoryStatus = 'ACTIVE' | 'PENDING_APPROVAL' | 'ARCHIVED';
+export type MemoryStatus = 'ACTIVE' | 'PENDING_APPROVAL' | 'ARCHIVED' | 'SUPERSEDED';
 
 export interface Memory {
   readonly id: string;
@@ -290,6 +290,9 @@ export interface Memory {
   readonly priority: number;
   readonly tagsJson: string;
   readonly metadataJson: string;
+  readonly version: number;
+  readonly supersedesId: string | null;
+  readonly supersededBy: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly lastAccessedAt: string | null;
@@ -316,6 +319,9 @@ export interface CreateMemoryInput {
   readonly priority?: number;
   readonly tags?: readonly string[];
   readonly metadata?: Record<string, unknown>;
+  readonly version?: number;
+  readonly supersedesId?: string | null;
+  readonly supersededBy?: string | null;
 }
 
 export interface UpdateMemoryInput {
@@ -325,6 +331,17 @@ export interface UpdateMemoryInput {
   readonly tags?: readonly string[];
   readonly metadata?: Record<string, unknown>;
   readonly status?: MemoryStatus;
+  readonly version?: number;
+  readonly supersedesId?: string | null;
+  readonly supersededBy?: string | null;
+}
+
+export interface SupersedeMemoryParams {
+  readonly previousId: string;
+  readonly replacementId: string;
+  readonly scope: ScopeIdentifier;
+  readonly newVersion?: number;
+  readonly replacementStatus?: MemoryStatus;
 }
 
 export interface ListMemoriesFilter {
