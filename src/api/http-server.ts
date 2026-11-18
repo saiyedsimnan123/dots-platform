@@ -21,7 +21,8 @@ import type {
   ScheduleStatus,
   ScopeIdentifier,
   TaskStatus,
-  UpdateMemoryInput
+  UpdateMemoryInput,
+  WritableMemoryStatus
 } from '../domain/types.ts';
 import {
   AgentCapabilityError,
@@ -524,6 +525,12 @@ export class DotsHttpServer {
 
     if (method === 'POST' && pathname === '/api/memories') {
       const body = await this.readJsonObject(req);
+      if (body.status === 'SUPERSEDED') {
+        throw new ValidationError("Direct creation of 'SUPERSEDED' memories is not permitted.");
+      }
+      if ('version' in body || 'supersedesId' in body || 'supersededBy' in body) {
+        throw new ValidationError("Direct specification of lineage metadata ('version', 'supersedesId', 'supersededBy') is not permitted.");
+      }
       const input: CreateMemoryInput = {
         category: body.category as MemoryCategory,
         key: body.key as string,
@@ -532,7 +539,8 @@ export class DotsHttpServer {
         priority: body.priority as number | undefined,
         metadata: body.metadata as Record<string, unknown> | undefined,
         scopeType: caller.scope.scopeType,
-        scopeId: caller.scope.scopeId
+        scopeId: caller.scope.scopeId,
+        ...(body.status !== undefined ? { status: body.status as WritableMemoryStatus } : {})
       };
       const memory = this.runtime.memoryService.createMemory(caller, input);
       this.sendJson(res, 201, { memory });
@@ -553,7 +561,21 @@ export class DotsHttpServer {
     if (match && method === 'PATCH') {
       const id = decodeURIComponent(match[1]!);
       const body = await this.readJsonObject(req);
-      const memory = this.runtime.memoryService.updateMemory(caller, id, body as UpdateMemoryInput);
+      if (body.status === 'SUPERSEDED') {
+        throw new ValidationError("Direct status transition to 'SUPERSEDED' is not permitted via update.");
+      }
+      if ('version' in body || 'supersedesId' in body || 'supersededBy' in body) {
+        throw new ValidationError("Direct modification of lineage metadata ('version', 'supersedesId', 'supersededBy') is not permitted.");
+      }
+      const input: UpdateMemoryInput = {
+        ...(body.content !== undefined ? { content: body.content as string } : {}),
+        ...(body.category !== undefined ? { category: body.category as MemoryCategory } : {}),
+        ...(body.priority !== undefined ? { priority: body.priority as number } : {}),
+        ...(body.tags !== undefined ? { tags: body.tags as string[] } : {}),
+        ...(body.metadata !== undefined ? { metadata: body.metadata as Record<string, unknown> } : {}),
+        ...(body.status !== undefined ? { status: body.status as WritableMemoryStatus } : {})
+      };
+      const memory = this.runtime.memoryService.updateMemory(caller, id, input);
       this.sendJson(res, 200, { memory });
       return;
     }

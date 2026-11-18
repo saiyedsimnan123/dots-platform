@@ -1,7 +1,7 @@
 /**
  * Next-Generation Dots AI Platform - Memory Supersession & Version History Unit Tests
  * 
- * Verifies Phase 4D.3B:
+ * Verifies Phase 4D.3B & 4D.3B.2:
  * 1. Migration 008_memory_supersession from existing DB with ACTIVE, PENDING_APPROVAL, and ARCHIVED memories.
  * 2. Backfill assigns version = 1, supersedes_id = null, superseded_by = null to existing records.
  * 3. Memory IDs, content, timestamps, and statuses remain completely intact after migration.
@@ -11,9 +11,15 @@
  * 7. getMemoryHistory returns records in deterministic order (version ASC, created_at ASC, id ASC).
  * 8. getMemoryHistory strictly enforces scope isolation (no leakage across workspaces or global scope).
  * 9. supersedeMemory validates preconditions, links previous and replacement, advances version, and updates status.
- * 10. supersedeMemory rejects invalid states: self-links, mismatched keys, mismatched scopes, already superseded,
- *     replacement already superseding, lineage cycles, and version regressions.
- * 11. Transaction atomicity: rollback on failure preserves original state.
+ * 10. Multi-step supersession chain evolution (v1 -> v2 -> v3 -> v4) without explicit newVersion.
+ * 11. supersedeMemory respects explicitly passed newVersion (> previous.version).
+ * 12. supersedeMemory rejects invalid states: self-links, mismatched keys, case-mismatched keys, mismatched scopes,
+ *     non-ACTIVE previous, already superseded previous/replacement, replacement already superseding, replacement status = SUPERSEDED,
+ *     and version regressions (newVersion <= previous.version).
+ * 13. supersedeMemory detects and rejects lineage cycles.
+ * 14. Transaction atomicity: rollback on failure preserves original state.
+ * 15. Lineage metadata CRUD protection: createMemory and updateMemory reject status 'SUPERSEDED' and protect lineage columns.
+ * 16. Guarded deletion and archival: reject deleting or archiving records in a supersession history chain.
  */
 
 import test from 'node:test';
@@ -27,6 +33,7 @@ import {
   MemoryConflictError,
   MemoryScopeViolationError
 } from '../../src/domain/errors.ts';
+import type { UpdateMemoryInput, WritableMemoryStatus } from '../../src/domain/types.ts';
 
 const workspaceA = { scopeType: 'WORKSPACE' as const, scopeId: 'ws-alpha' };
 const workspaceB = { scopeType: 'WORKSPACE' as const, scopeId: 'ws-beta' };
@@ -54,13 +61,16 @@ test('1. Migration from existing DB preserves ACTIVE, PENDING_APPROVAL, and ARCH
     assert.ok(colNames.includes('version'), 'memories must contain version column');
     assert.ok(colNames.includes('supersedes_id'), 'memories must contain supersedes_id column');
     assert.ok(colNames.includes('superseded_by'), 'memories must contain superseded_by column');
+
+    // Foreign key check
+    const fkCheck = db.prepare('PRAGMA foreign_key_check;').all();
+    assert.equal(fkCheck.length, 0, 'Foreign key check must have zero violations');
   } finally {
     db.close();
   }
 });
 
 test('2. Existing records receive version = 1, supersedesId = null, supersededBy = null, and intact data', () => {
-  // Simulate an existing database that was on 007 before 008 ran
   const db = new DatabaseManager(':memory:');
   const memoryRepo = new MemoryRepository(db);
 
@@ -114,7 +124,7 @@ test('2. Existing records receive version = 1, supersedesId = null, supersededBy
   }
 });
 
-test('3. Migration preserves child rows in memory_embeddings, embedding_jobs, and memory_task_injections', () => {
+test('3. Child rows in memory_embeddings, embedding_jobs, and memory_task_injections are preserved', () => {
   const db = new DatabaseManager(':memory:');
   const memoryRepo = new MemoryRepository(db);
   const taskRepo = new TaskRepository(db);
@@ -141,19 +151,19 @@ test('3. Migration preserves child rows in memory_embeddings, embedding_jobs, an
     // Insert dummy embedding and job
     db.prepare(`
       INSERT INTO memory_embeddings (id, memory_id, model_id, model_revision, dimensions, embedding, created_at, updated_at)
-      VALUES ('emb-1', ?, 'test-model', 'main', 4, X'01020304', '2026-10-15T00:00:00Z', '2026-10-15T00:00:00Z')
+      VALUES('emb-1', ?, 'test-model', 'main', 4, X'01020304', '2026-10-15T00:00:00Z', '2026-10-15T00:00:00Z')
     `).run(memory.id);
 
     db.prepare(`
       INSERT INTO embedding_jobs (id, memory_id, scope_type, scope_id, model_id, model_revision, status, scheduled_at, created_at, updated_at)
-      VALUES ('job-1', ?, 'WORKSPACE', 'ws-alpha', 'test-model', 'main', 'COMPLETED', '2026-10-15T00:00:00Z', '2026-10-15T00:00:00Z', '2026-10-15T00:00:00Z')
+      VALUES('job-1', ?, 'WORKSPACE', 'ws-alpha', 'test-model', 'main', 'COMPLETED', '2026-10-15T00:00:00Z', '2026-10-15T00:00:00Z', '2026-10-15T00:00:00Z')
     `).run(memory.id);
 
     // Verify foreign key integrity
     const fkCheck = db.prepare('PRAGMA foreign_key_check;').all();
     assert.equal(fkCheck.length, 0, 'Foreign key check must have zero violations');
 
-    // Deleting the memory cascades to embeddings and jobs, and nulls injection
+    // Deleting an unlinked memory cascades to embeddings and jobs, and nulls injection
     memoryRepo.deleteMemory(memory.id, workspaceA);
 
     const embCount = db.prepare('SELECT count(*) as count FROM memory_embeddings WHERE memory_id = ?').get(memory.id) as { count: number };
@@ -180,38 +190,53 @@ test('4. Multiple SUPERSEDED records with same key are allowed in the same scope
       category: 'PROJECT_FACT',
       scopeType: 'WORKSPACE',
       scopeId: 'ws-alpha',
-      status: 'SUPERSEDED',
-      version: 1
+      status: 'ACTIVE'
     });
 
-    const v2 = memoryRepo.createMemory({
+    const v2Candidate = memoryRepo.createMemory({
       key: 'service.port',
       content: 'Port 8080',
       category: 'PROJECT_FACT',
       scopeType: 'WORKSPACE',
       scopeId: 'ws-alpha',
-      status: 'SUPERSEDED',
-      version: 2,
-      supersedesId: v1.id
+      status: 'PENDING_APPROVAL'
     });
 
-    const v3 = memoryRepo.createMemory({
+    const step1 = memoryRepo.supersedeMemory({
+      previousId: v1.id,
+      replacementId: v2Candidate.id,
+      scope: workspaceA,
+      replacementStatus: 'ACTIVE'
+    });
+
+    const v3Candidate = memoryRepo.createMemory({
       key: 'service.port',
       content: 'Port 8443',
       category: 'PROJECT_FACT',
       scopeType: 'WORKSPACE',
       scopeId: 'ws-alpha',
-      status: 'ACTIVE',
-      version: 3,
-      supersedesId: v2.id
+      status: 'PENDING_APPROVAL'
     });
 
-    assert.equal(v1.status, 'SUPERSEDED');
-    assert.equal(v2.status, 'SUPERSEDED');
-    assert.equal(v3.status, 'ACTIVE');
+    const step2 = memoryRepo.supersedeMemory({
+      previousId: step1.replacement.id,
+      replacementId: v3Candidate.id,
+      scope: workspaceA,
+      replacementStatus: 'ACTIVE'
+    });
+
+    assert.equal(step1.previous.status, 'SUPERSEDED');
+    assert.equal(step2.previous.status, 'SUPERSEDED');
+    assert.equal(step2.replacement.status, 'ACTIVE');
 
     const history = memoryRepo.getMemoryHistory('service.port', workspaceA);
     assert.equal(history.length, 3);
+    assert.equal(history[0].version, 1);
+    assert.equal(history[0].status, 'SUPERSEDED');
+    assert.equal(history[1].version, 2);
+    assert.equal(history[1].status, 'SUPERSEDED');
+    assert.equal(history[2].version, 3);
+    assert.equal(history[2].status, 'ACTIVE');
   } finally {
     db.close();
   }
@@ -264,44 +289,22 @@ test('6. getMemoryHistory returns records in deterministic order (version ASC, c
   const { db, memoryRepo } = setupTest();
 
   try {
-    // Insert with out-of-order creation
-    const v3 = memoryRepo.createMemory({
-      key: 'app.timeout',
-      content: 'Timeout 60s',
-      category: 'PROJECT_FACT',
-      scopeType: 'WORKSPACE',
-      scopeId: 'ws-alpha',
-      status: 'ACTIVE',
-      version: 3
-    });
-
-    const v1 = memoryRepo.createMemory({
-      key: 'app.timeout',
-      content: 'Timeout 10s',
-      category: 'PROJECT_FACT',
-      scopeType: 'WORKSPACE',
-      scopeId: 'ws-alpha',
-      status: 'SUPERSEDED',
-      version: 1
-    });
-
-    const v2 = memoryRepo.createMemory({
-      key: 'app.timeout',
-      content: 'Timeout 30s',
-      category: 'PROJECT_FACT',
-      scopeType: 'WORKSPACE',
-      scopeId: 'ws-alpha',
-      status: 'SUPERSEDED',
-      version: 2
-    });
+    // Insert with out-of-order creation timestamps directly to test sorting logic
+    db.prepare(`
+      INSERT INTO memories (id, scope_type, scope_id, key, content, category, status, version, supersedes_id, superseded_by, created_at, updated_at)
+      VALUES
+        ('id-3', 'WORKSPACE', 'ws-alpha', 'app.timeout', 'Timeout 60s', 'PROJECT_FACT', 'ACTIVE', 3, 'id-2', NULL, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'),
+        ('id-1', 'WORKSPACE', 'ws-alpha', 'app.timeout', 'Timeout 10s', 'PROJECT_FACT', 'SUPERSEDED', 1, NULL, 'id-2', '2026-01-03T00:00:00.000Z', '2026-01-03T00:00:00.000Z'),
+        ('id-2', 'WORKSPACE', 'ws-alpha', 'app.timeout', 'Timeout 30s', 'PROJECT_FACT', 'SUPERSEDED', 2, 'id-1', 'id-3', '2026-01-02T00:00:00.000Z', '2026-01-02T00:00:00.000Z')
+    `).run();
 
     const history = memoryRepo.getMemoryHistory('app.timeout', workspaceA);
     assert.equal(history.length, 3);
-    assert.equal(history[0].id, v1.id);
+    assert.equal(history[0].id, 'id-1');
     assert.equal(history[0].version, 1);
-    assert.equal(history[1].id, v2.id);
+    assert.equal(history[1].id, 'id-2');
     assert.equal(history[1].version, 2);
-    assert.equal(history[2].id, v3.id);
+    assert.equal(history[2].id, 'id-3');
     assert.equal(history[2].version, 3);
   } finally {
     db.close();
@@ -365,8 +368,7 @@ test('8. supersedeMemory successfully transitions previous to SUPERSEDED and rep
       category: 'USER_PREFERENCE',
       scopeType: 'WORKSPACE',
       scopeId: 'ws-alpha',
-      status: 'ACTIVE',
-      version: 1
+      status: 'ACTIVE'
     });
 
     const replacement = memoryRepo.createMemory({
@@ -375,8 +377,7 @@ test('8. supersedeMemory successfully transitions previous to SUPERSEDED and rep
       category: 'USER_PREFERENCE',
       scopeType: 'WORKSPACE',
       scopeId: 'ws-alpha',
-      status: 'PENDING_APPROVAL',
-      version: 1
+      status: 'PENDING_APPROVAL'
     });
 
     const result = memoryRepo.supersedeMemory({
@@ -410,7 +411,85 @@ test('8. supersedeMemory successfully transitions previous to SUPERSEDED and rep
   }
 });
 
-test('9. supersedeMemory respects explicitly passed newVersion', () => {
+test('9. Multi-version chain evolution (v1 -> v2 -> v3 -> v4) without explicit newVersion', () => {
+  const { db, memoryRepo } = setupTest();
+
+  try {
+    const v1 = memoryRepo.createMemory({
+      key: 'system.node_version',
+      content: '18.0.0',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'ws-alpha',
+      status: 'ACTIVE'
+    });
+    assert.equal(v1.version, 1);
+
+    const cand2 = memoryRepo.createMemory({
+      key: 'system.node_version',
+      content: '20.0.0',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'ws-alpha',
+      status: 'PENDING_APPROVAL'
+    });
+    const step1 = memoryRepo.supersedeMemory({
+      previousId: v1.id,
+      replacementId: cand2.id,
+      scope: workspaceA,
+      replacementStatus: 'ACTIVE'
+    });
+    assert.equal(step1.replacement.version, 2);
+
+    const cand3 = memoryRepo.createMemory({
+      key: 'system.node_version',
+      content: '22.0.0',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'ws-alpha',
+      status: 'PENDING_APPROVAL'
+    });
+    const step2 = memoryRepo.supersedeMemory({
+      previousId: step1.replacement.id,
+      replacementId: cand3.id,
+      scope: workspaceA,
+      replacementStatus: 'ACTIVE'
+    });
+    assert.equal(step2.replacement.version, 3);
+
+    const cand4 = memoryRepo.createMemory({
+      key: 'system.node_version',
+      content: '24.0.0',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'ws-alpha',
+      status: 'PENDING_APPROVAL'
+    });
+    const step3 = memoryRepo.supersedeMemory({
+      previousId: step2.replacement.id,
+      replacementId: cand4.id,
+      scope: workspaceA,
+      replacementStatus: 'ACTIVE'
+    });
+    assert.equal(step3.replacement.version, 4);
+
+    const history = memoryRepo.getMemoryHistory('system.node_version', workspaceA);
+    assert.equal(history.length, 4);
+    assert.deepEqual(
+      history.map((m) => ({ version: m.version, status: m.status, content: m.content })),
+      [
+        { version: 1, status: 'SUPERSEDED', content: '18.0.0' },
+        { version: 2, status: 'SUPERSEDED', content: '20.0.0' },
+        { version: 3, status: 'SUPERSEDED', content: '22.0.0' },
+        { version: 4, status: 'ACTIVE', content: '24.0.0' }
+      ]
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test('10. supersedeMemory respects explicitly passed newVersion', () => {
   const { db, memoryRepo } = setupTest();
 
   try {
@@ -420,8 +499,7 @@ test('9. supersedeMemory respects explicitly passed newVersion', () => {
       category: 'PROJECT_FACT',
       scopeType: 'WORKSPACE',
       scopeId: 'ws-alpha',
-      status: 'ACTIVE',
-      version: 1
+      status: 'ACTIVE'
     });
 
     const replacement = memoryRepo.createMemory({
@@ -430,8 +508,7 @@ test('9. supersedeMemory respects explicitly passed newVersion', () => {
       category: 'PROJECT_FACT',
       scopeType: 'WORKSPACE',
       scopeId: 'ws-alpha',
-      status: 'PENDING_APPROVAL',
-      version: 1
+      status: 'PENDING_APPROVAL'
     });
 
     const result = memoryRepo.supersedeMemory({
@@ -448,7 +525,7 @@ test('9. supersedeMemory respects explicitly passed newVersion', () => {
   }
 });
 
-test('10. supersedeMemory validation checks reject invalid states', () => {
+test('11. supersedeMemory validation checks reject invalid states', () => {
   const { db, memoryRepo } = setupTest();
 
   try {
@@ -458,13 +535,21 @@ test('10. supersedeMemory validation checks reject invalid states', () => {
       category: 'PROJECT_FACT',
       scopeType: 'WORKSPACE',
       scopeId: 'ws-alpha',
-      status: 'ACTIVE',
-      version: 2
+      status: 'ACTIVE'
     });
 
     const memMismatchKey = memoryRepo.createMemory({
       key: 'different.key',
       content: 'Mismatch',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'ws-alpha',
+      status: 'PENDING_APPROVAL'
+    });
+
+    const memCasedKey = memoryRepo.createMemory({
+      key: 'Validation.Key',
+      content: 'Different casing',
       category: 'PROJECT_FACT',
       scopeType: 'WORKSPACE',
       scopeId: 'ws-alpha',
@@ -504,7 +589,19 @@ test('10. supersedeMemory validation checks reject invalid states', () => {
       (err) => err instanceof ValidationError && /mismatched keys/i.test(err.message)
     );
 
-    // 3. Mismatched scope rejection
+    // 3. Exact binary key equality (casing mismatch rejection)
+    assert.throws(
+      () => {
+        memoryRepo.supersedeMemory({
+          previousId: mem1.id,
+          replacementId: memCasedKey.id,
+          scope: workspaceA
+        });
+      },
+      (err) => err instanceof ValidationError && /mismatched keys/i.test(err.message)
+    );
+
+    // 4. Mismatched scope rejection
     assert.throws(
       () => {
         memoryRepo.supersedeMemory({
@@ -516,15 +613,14 @@ test('10. supersedeMemory validation checks reject invalid states', () => {
       (err) => err instanceof MemoryScopeViolationError
     );
 
-    // 4. Invalid newVersion <= previous.version rejection
+    // 5. Invalid newVersion <= previous.version rejection
     const validCandidate = memoryRepo.createMemory({
       key: 'validation.key',
       content: 'Candidate',
       category: 'PROJECT_FACT',
       scopeType: 'WORKSPACE',
       scopeId: 'ws-alpha',
-      status: 'PENDING_APPROVAL',
-      version: 2
+      status: 'PENDING_APPROVAL'
     });
 
     assert.throws(
@@ -533,21 +629,62 @@ test('10. supersedeMemory validation checks reject invalid states', () => {
           previousId: mem1.id,
           replacementId: validCandidate.id,
           scope: workspaceA,
-          newVersion: 2 // mem1 is version 2, so 2 is <= 2
+          newVersion: 1 // mem1 is version 1, so 1 is <= 1
         });
       },
       (err) => err instanceof ValidationError && /must be strictly greater/i.test(err.message)
     );
 
-    // 5. Already superseded rejection
+    // 6. Replacement status cannot be SUPERSEDED
+    assert.throws(
+      () => {
+        memoryRepo.supersedeMemory({
+          previousId: mem1.id,
+          replacementId: validCandidate.id,
+          scope: workspaceA,
+          replacementStatus: 'SUPERSEDED'
+        });
+      },
+      (err) => err instanceof ValidationError && /cannot be 'SUPERSEDED'/i.test(err.message)
+    );
+
+    // 7. Previous memory not ACTIVE rejection
+    const pendingOriginal = memoryRepo.createMemory({
+      key: 'validation.pending',
+      content: 'Pending',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'ws-alpha',
+      status: 'PENDING_APPROVAL'
+    });
+    const pendingReplacer = memoryRepo.createMemory({
+      key: 'validation.pending',
+      content: 'Pending Replacer',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'ws-alpha',
+      status: 'PENDING_APPROVAL'
+    });
+
+    assert.throws(
+      () => {
+        memoryRepo.supersedeMemory({
+          previousId: pendingOriginal.id,
+          replacementId: pendingReplacer.id,
+          scope: workspaceA
+        });
+      },
+      (err) => err instanceof ValidationError && /Only records with status 'ACTIVE' can be superseded/i.test(err.message)
+    );
+
+    // 8. Already superseded rejection
     const rep1 = memoryRepo.createMemory({
       key: 'validation.key',
       content: 'Replacer 1',
       category: 'PROJECT_FACT',
       scopeType: 'WORKSPACE',
       scopeId: 'ws-alpha',
-      status: 'PENDING_APPROVAL',
-      version: 3
+      status: 'PENDING_APPROVAL'
     });
 
     memoryRepo.supersedeMemory({
@@ -564,8 +701,7 @@ test('10. supersedeMemory validation checks reject invalid states', () => {
       category: 'PROJECT_FACT',
       scopeType: 'WORKSPACE',
       scopeId: 'ws-alpha',
-      status: 'PENDING_APPROVAL',
-      version: 4
+      status: 'PENDING_APPROVAL'
     });
 
     assert.throws(
@@ -576,15 +712,25 @@ test('10. supersedeMemory validation checks reject invalid states', () => {
           scope: workspaceA
         });
       },
-      (err) => err instanceof ValidationError && /already been superseded/i.test(err.message)
+      (err) => err instanceof ValidationError && /(already been superseded|status is 'SUPERSEDED')/i.test(err.message)
     );
 
-    // 6. Replacement already superseding another memory rejection
+    // 9. Replacement already superseding another memory rejection
+    const alreadySupersedingCandidate = memoryRepo.createMemory({
+      key: 'validation.key',
+      content: 'Already superseding',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'ws-alpha',
+      status: 'PENDING_APPROVAL'
+    });
+    db.prepare('UPDATE memories SET supersedes_id = ? WHERE id = ?').run(mem1.id, alreadySupersedingCandidate.id);
+
     assert.throws(
       () => {
         memoryRepo.supersedeMemory({
-          previousId: rep2.id,
-          replacementId: rep1.id, // rep1 already supersedes mem1!
+          previousId: rep1.id,
+          replacementId: alreadySupersedingCandidate.id,
           scope: workspaceA
         });
       },
@@ -595,19 +741,17 @@ test('10. supersedeMemory validation checks reject invalid states', () => {
   }
 });
 
-test('11. supersedeMemory detects and rejects lineage cycles', () => {
+test('12. supersedeMemory detects and rejects lineage cycles', () => {
   const { db, memoryRepo } = setupTest();
 
   try {
-    // Chain: m1 <- m2 <- m3
     const m1 = memoryRepo.createMemory({
       key: 'chain.key',
       content: 'Chain 1',
       category: 'PROJECT_FACT',
       scopeType: 'WORKSPACE',
       scopeId: 'ws-alpha',
-      status: 'SUPERSEDED',
-      version: 1
+      status: 'ACTIVE'
     });
 
     const m2 = memoryRepo.createMemory({
@@ -616,9 +760,14 @@ test('11. supersedeMemory detects and rejects lineage cycles', () => {
       category: 'PROJECT_FACT',
       scopeType: 'WORKSPACE',
       scopeId: 'ws-alpha',
-      status: 'SUPERSEDED',
-      version: 2,
-      supersedesId: m1.id
+      status: 'PENDING_APPROVAL'
+    });
+
+    memoryRepo.supersedeMemory({
+      previousId: m1.id,
+      replacementId: m2.id,
+      scope: workspaceA,
+      replacementStatus: 'ACTIVE'
     });
 
     const m3 = memoryRepo.createMemory({
@@ -627,32 +776,38 @@ test('11. supersedeMemory detects and rejects lineage cycles', () => {
       category: 'PROJECT_FACT',
       scopeType: 'WORKSPACE',
       scopeId: 'ws-alpha',
-      status: 'ACTIVE',
-      version: 3,
-      supersedesId: m2.id
+      status: 'PENDING_APPROVAL'
     });
 
-    // Link forward
-    memoryRepo.updateMemory(m1.id, workspaceA, { supersededBy: m2.id });
-    memoryRepo.updateMemory(m2.id, workspaceA, { supersededBy: m3.id });
+    // Manually set m3's ancestor in DB to simulate an ancestor relationship pointing to a candidate
+    const candidate = memoryRepo.createMemory({
+      key: 'chain.key',
+      content: 'Candidate',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'ws-alpha',
+      status: 'PENDING_APPROVAL'
+    });
 
-    // Try superseding m3 with m1 (cycle: m1 is ancestor of m3!)
+    db.prepare('UPDATE memories SET supersedes_id = ? WHERE id = ?').run(candidate.id, m2.id);
+
+    // Now candidate is an ancestor of m2.
     assert.throws(
       () => {
         memoryRepo.supersedeMemory({
-          previousId: m3.id,
-          replacementId: m1.id,
+          previousId: m2.id,
+          replacementId: candidate.id,
           scope: workspaceA
         });
       },
-      (err) => err instanceof ValidationError
+      (err) => err instanceof ValidationError && /cycle detected/i.test(err.message)
     );
   } finally {
     db.close();
   }
 });
 
-test('12. supersedeMemory transaction rollback on error leaves database unchanged', () => {
+test('13. supersedeMemory transaction rollback on error leaves database unchanged', () => {
   const { db, memoryRepo } = setupTest();
 
   try {
@@ -709,6 +864,139 @@ test('12. supersedeMemory transaction rollback on error leaves database unchange
 
     const p1 = memoryRepo.getMemoryById(pending1.id, workspaceA);
     assert.equal(p1?.status, 'ACTIVE');
+  } finally {
+    db.close();
+  }
+});
+
+test('14. Lineage metadata CRUD protection: createMemory and updateMemory reject status SUPERSEDED and protect lineage columns', () => {
+  const { db, memoryRepo } = setupTest();
+
+  try {
+    // 1. createMemory rejects status = 'SUPERSEDED'
+    assert.throws(
+      () => {
+        memoryRepo.createMemory({
+          key: 'test.crud.protection',
+          content: 'Test content',
+          category: 'PROJECT_FACT',
+          scopeType: 'WORKSPACE',
+          scopeId: 'ws-alpha',
+          status: 'SUPERSEDED' as unknown as WritableMemoryStatus
+        });
+      },
+      (err) => err instanceof ValidationError && /Direct creation of memories with status 'SUPERSEDED'/i.test(err.message)
+    );
+
+    // 2. createMemory always initializes version = 1, supersedesId = null, supersededBy = null
+    // even if caller passes lineage fields
+    const created = memoryRepo.createMemory({
+      key: 'test.crud.protection',
+      content: 'Test content',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'ws-alpha',
+      status: 'ACTIVE'
+    });
+    assert.equal(created.version, 1);
+    assert.equal(created.supersedesId, null);
+    assert.equal(created.supersededBy, null);
+
+    // 3. updateMemory rejects status = 'SUPERSEDED'
+    assert.throws(
+      () => {
+        memoryRepo.updateMemory(created.id, workspaceA, {
+          status: 'SUPERSEDED' as unknown as WritableMemoryStatus
+        });
+      },
+      (err) => err instanceof ValidationError && /Cannot directly transition a memory to status 'SUPERSEDED'/i.test(err.message)
+    );
+
+    // 4. updateMemory does not modify lineage columns even if passed by untyped caller
+    const untypedInput = {
+      content: 'Updated content',
+      version: 99,
+      supersedesId: 'fake-id',
+      supersededBy: 'fake-id'
+    } as unknown as UpdateMemoryInput;
+    const updated = memoryRepo.updateMemory(created.id, workspaceA, untypedInput);
+    assert.equal(updated.content, 'Updated content');
+    assert.equal(updated.version, 1);
+    assert.equal(updated.supersedesId, null);
+    assert.equal(updated.supersededBy, null);
+  } finally {
+    db.close();
+  }
+});
+
+test('15. Guarded deletion and archival: reject deleting or archiving records in a supersession history chain', () => {
+  const { db, memoryRepo } = setupTest();
+
+  try {
+    const v1 = memoryRepo.createMemory({
+      key: 'guarded.chain',
+      content: 'Version 1',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'ws-alpha',
+      status: 'ACTIVE'
+    });
+
+    const v2Candidate = memoryRepo.createMemory({
+      key: 'guarded.chain',
+      content: 'Version 2',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'ws-alpha',
+      status: 'PENDING_APPROVAL'
+    });
+
+    const result = memoryRepo.supersedeMemory({
+      previousId: v1.id,
+      replacementId: v2Candidate.id,
+      scope: workspaceA,
+      replacementStatus: 'ACTIVE'
+    });
+
+    // 1. archiveMemory on SUPERSEDED record is rejected
+    assert.throws(
+      () => {
+        memoryRepo.archiveMemory(result.previous.id, workspaceA);
+      },
+      (err) => err instanceof ValidationError && /Cannot archive memory.*record is superseded/i.test(err.message)
+    );
+
+    // 2. deleteMemory on SUPERSEDED record is rejected
+    assert.throws(
+      () => {
+        memoryRepo.deleteMemory(result.previous.id, workspaceA);
+      },
+      (err) => err instanceof ValidationError && /part of a supersession history chain/i.test(err.message)
+    );
+
+    // 3. deleteMemory on ACTIVE record that supersedes an ancestor is rejected
+    assert.throws(
+      () => {
+        memoryRepo.deleteMemory(result.replacement.id, workspaceA);
+      },
+      (err) => err instanceof ValidationError && /part of a supersession history chain/i.test(err.message)
+    );
+
+    // 4. Normal unlinked ACTIVE memory CAN be archived and then deleted
+    const unlinked = memoryRepo.createMemory({
+      key: 'unlinked.memory',
+      content: 'Unlinked content',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'ws-alpha',
+      status: 'ACTIVE'
+    });
+    const archived = memoryRepo.archiveMemory(unlinked.id, workspaceA);
+    assert.equal(archived.status, 'ARCHIVED');
+
+    const deleted = memoryRepo.deleteMemory(unlinked.id, workspaceA);
+    assert.equal(deleted, true);
+    assert.equal(memoryRepo.getMemoryById(unlinked.id, workspaceA), null);
   } finally {
     db.close();
   }

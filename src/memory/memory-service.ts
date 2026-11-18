@@ -43,6 +43,7 @@ import type {
   BuildTaskMemoryContextOptions,
   BuiltMemoryContext,
   CreateMemoryInput,
+  WritableMemoryStatus,
   UpdateMemoryInput,
   ListMemoriesFilter,
   RecordMemoryInjectionInput,
@@ -430,7 +431,7 @@ export class MemoryService {
     // Reject explicit scope spoofing in input
     this.assertCallerScopeMatch(caller, input.scopeType, input.scopeId, 'createMemory');
 
-    let status: MemoryStatus;
+    let status = (input.status ?? 'ACTIVE') as MemoryStatus;
     if (caller.actor === 'AGENT') {
       // Agents must never directly persist ACTIVE memories
       if (input.status === 'ACTIVE') {
@@ -446,8 +447,10 @@ export class MemoryService {
         );
       }
       status = 'PENDING_APPROVAL';
-    } else {
-      status = input.status ?? 'ACTIVE';
+    }
+
+    if ((status as string) === 'SUPERSEDED') {
+      throw new ValidationError("Direct creation of memories with status 'SUPERSEDED' is not permitted.");
     }
 
     const metadataWithOwnership = {
@@ -459,11 +462,16 @@ export class MemoryService {
 
     const createdMemory = this.memoryRepo.transaction(() => {
       const memory = this.memoryRepo.createMemory({
-        ...input,
+        id: input.id,
+        key: input.key,
+        content: input.content,
+        category: input.category,
         scopeType: caller.scope.scopeType,
         scopeId: caller.scope.scopeId,
         metadata: metadataWithOwnership,
-        status
+        status: status as WritableMemoryStatus,
+        priority: input.priority,
+        tags: input.tags
       });
 
       // Mandatory audit write for state creation
@@ -641,7 +649,16 @@ export class MemoryService {
         };
       }
 
-      const updated = this.memoryRepo.updateMemory(id, caller.scope, input);
+      const sanitizedInput: UpdateMemoryInput = {
+        ...(input.content !== undefined ? { content: input.content } : {}),
+        ...(input.category !== undefined ? { category: input.category } : {}),
+        ...(input.priority !== undefined ? { priority: input.priority } : {}),
+        ...(input.tags !== undefined ? { tags: input.tags } : {}),
+        ...(input.metadata !== undefined ? { metadata: input.metadata } : {}),
+        ...(input.status !== undefined ? { status: input.status } : {})
+      };
+
+      const updated = this.memoryRepo.updateMemory(id, caller.scope, sanitizedInput);
 
       // Invalidate existing embeddings if embedding-relevant content changes.
       // Priority, tag, category, and metadata updates do not trigger embedding invalidation.
@@ -762,6 +779,16 @@ export class MemoryService {
         };
       }
 
+      // INVALID STATUS TRANSITION: cannot archive a superseded record
+      if (existing.status === 'SUPERSEDED') {
+        return {
+          ok: false,
+          error: new ValidationError(
+            `Cannot archive memory '${id}': record is superseded. Superseded memories are immutable historical records.`
+          )
+        };
+      }
+
       const archived = this.memoryRepo.archiveMemory(id, caller.scope);
 
       // Phase 4C.6C Archive Lifecycle Cleanup:
@@ -852,6 +879,16 @@ export class MemoryService {
             'Cannot delete a pending proposal via deleteMemory. Only the trusted decideProposal path with APPROVE permission may decide proposals.',
             'UNAUTHORIZED_APPROVAL',
             { memoryId: id }
+          )
+        };
+      }
+
+      // HISTORICAL LINEAGE GUARD: cannot delete a memory in a supersession chain
+      if (existing.status === 'SUPERSEDED' || existing.supersedesId !== null || existing.supersededBy !== null) {
+        return {
+          ok: false,
+          error: new ValidationError(
+            `Cannot delete memory '${id}': record is part of a supersession history chain.`
           )
         };
       }
@@ -2773,7 +2810,7 @@ export class MemoryService {
       const modelRevision = (this.embeddingProvider as any)?.modelRevision ?? (this.lifecycleManager?.provider as any)?.modelRevision ?? 'main';
 
       for (const item of bundle.memories) {
-        const status: MemoryStatus = item.status ?? 'ACTIVE';
+        const status: 'ACTIVE' | 'ARCHIVED' = (item.status ?? 'ACTIVE') as 'ACTIVE' | 'ARCHIVED';
         const key = item.key.trim();
 
         if (status === 'ACTIVE') {

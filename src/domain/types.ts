@@ -308,6 +308,8 @@ export interface MemoryTaskInjection {
   readonly injectedAt: string;
 }
 
+export type WritableMemoryStatus = Exclude<MemoryStatus, 'SUPERSEDED'>;
+
 export interface CreateMemoryInput {
   readonly id?: string;
   readonly category: MemoryCategory;
@@ -315,13 +317,10 @@ export interface CreateMemoryInput {
   readonly scopeId: string;
   readonly key: string;
   readonly content: string;
-  readonly status?: MemoryStatus;
+  readonly status?: WritableMemoryStatus;
   readonly priority?: number;
   readonly tags?: readonly string[];
   readonly metadata?: Record<string, unknown>;
-  readonly version?: number;
-  readonly supersedesId?: string | null;
-  readonly supersededBy?: string | null;
 }
 
 export interface UpdateMemoryInput {
@@ -330,10 +329,7 @@ export interface UpdateMemoryInput {
   readonly priority?: number;
   readonly tags?: readonly string[];
   readonly metadata?: Record<string, unknown>;
-  readonly status?: MemoryStatus;
-  readonly version?: number;
-  readonly supersedesId?: string | null;
-  readonly supersededBy?: string | null;
+  readonly status?: WritableMemoryStatus;
 }
 
 export interface SupersedeMemoryParams {

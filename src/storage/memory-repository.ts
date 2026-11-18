@@ -110,28 +110,14 @@ export class MemoryRepository {
     this.validateCategory(input.category);
     this.validateScope(input.scopeType, input.scopeId);
 
-    const status: MemoryStatus = input.status ?? 'ACTIVE';
+    const status = (input.status ?? 'ACTIVE') as MemoryStatus;
     this.validateStatus(status);
+    if ((status as string) === 'SUPERSEDED') {
+      throw new ValidationError("Direct creation of memories with status 'SUPERSEDED' is not permitted. Use supersedeMemory instead.");
+    }
 
     const priority = input.priority ?? 50;
     this.validatePriority(priority);
-
-    const version = input.version ?? 1;
-    this.validateVersion(version);
-
-    const supersedesId = input.supersedesId ?? null;
-    if (supersedesId !== null) {
-      if (typeof supersedesId !== 'string' || supersedesId.trim() === '') {
-        throw new ValidationError('supersedesId must be a non-empty string or null.');
-      }
-    }
-
-    const supersededBy = input.supersededBy ?? null;
-    if (supersededBy !== null) {
-      if (typeof supersededBy !== 'string' || supersededBy.trim() === '') {
-        throw new ValidationError('supersededBy must be a non-empty string or null.');
-      }
-    }
 
     // 2. Enforce active key uniqueness within scope
     if (status === 'ACTIVE') {
@@ -151,7 +137,7 @@ export class MemoryRepository {
         id, category, scope_type, scope_id, key, content, status,
         priority, tags_json, metadata_json, version, supersedes_id, superseded_by,
         created_at, updated_at, last_accessed_at, access_count
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, NULL, ?, ?, NULL, 0)
     `);
 
     try {
@@ -166,9 +152,6 @@ export class MemoryRepository {
         priority,
         tagsJson,
         metadataJson,
-        version,
-        supersedesId !== null ? supersedesId.trim() : null,
-        supersededBy !== null ? supersededBy.trim() : null,
         now,
         now
       );
@@ -479,6 +462,9 @@ export class MemoryRepository {
 
     if (input.status !== undefined) {
       this.validateStatus(input.status);
+      if ((input.status as string) === 'SUPERSEDED') {
+        throw new ValidationError("Cannot directly transition a memory to status 'SUPERSEDED'. Use supersedeMemory instead.");
+      }
 
       // If status is transitioning to ACTIVE, enforce key uniqueness
       if (input.status === 'ACTIVE' && existing.status !== 'ACTIVE') {
@@ -490,28 +476,6 @@ export class MemoryRepository {
 
       updates.push('status = ?');
       params.push(input.status);
-    }
-
-    if (input.version !== undefined) {
-      this.validateVersion(input.version);
-      updates.push('version = ?');
-      params.push(input.version);
-    }
-
-    if (input.supersedesId !== undefined) {
-      if (input.supersedesId !== null && (typeof input.supersedesId !== 'string' || input.supersedesId.trim() === '')) {
-        throw new ValidationError('supersedesId must be a non-empty string or null.');
-      }
-      updates.push('supersedes_id = ?');
-      params.push(input.supersedesId !== null ? input.supersedesId.trim() : null);
-    }
-
-    if (input.supersededBy !== undefined) {
-      if (input.supersededBy !== null && (typeof input.supersededBy !== 'string' || input.supersededBy.trim() === '')) {
-        throw new ValidationError('supersededBy must be a non-empty string or null.');
-      }
-      updates.push('superseded_by = ?');
-      params.push(input.supersededBy !== null ? input.supersededBy.trim() : null);
     }
 
     if (updates.length === 0) {
@@ -552,6 +516,13 @@ export class MemoryRepository {
    * Sets status to 'ARCHIVED' without deleting the record.
    */
   public archiveMemory(id: string, scope: ScopeIdentifier): Memory {
+    const existing = this.getMemoryById(id, scope);
+    if (!existing) {
+      throw new MemoryNotFoundError(id);
+    }
+    if (existing.status === 'SUPERSEDED') {
+      throw new ValidationError(`Cannot archive memory '${id}': record is superseded. Superseded memories are immutable historical records.`);
+    }
     return this.updateMemory(id, scope, { status: 'ARCHIVED' });
   }
 
@@ -563,6 +534,11 @@ export class MemoryRepository {
     const existing = this.getMemoryById(id, scope);
     if (!existing) {
       throw new MemoryNotFoundError(id);
+    }
+    if (existing.status === 'SUPERSEDED' || existing.supersedesId !== null || existing.supersededBy !== null) {
+      throw new ValidationError(
+        `Cannot delete memory '${id}': record is part of a supersession history chain. Archival should be used instead of hard deletion.`
+      );
     }
 
     const stmt = this.db.prepare('DELETE FROM memories WHERE id = ? AND scope_type = ? AND scope_id = ?');
@@ -741,6 +717,9 @@ export class MemoryRepository {
 
     if (params.replacementStatus !== undefined) {
       this.validateStatus(params.replacementStatus);
+      if (params.replacementStatus === 'SUPERSEDED') {
+        throw new ValidationError("Replacement memory status cannot be 'SUPERSEDED'.");
+      }
     }
 
     if (params.newVersion !== undefined) {
@@ -758,17 +737,31 @@ export class MemoryRepository {
         throw new MemoryNotFoundError(repId);
       }
 
-      // Keys must match
-      if (previous.key.trim().toLowerCase() !== replacement.key.trim().toLowerCase()) {
+      // Keys must match exactly (binary equality)
+      if (previous.key.trim() !== replacement.key.trim()) {
         throw new ValidationError(
           `Cannot supersede memory with mismatched keys: previous key '${previous.key}' vs replacement key '${replacement.key}'.`
         );
       }
 
-      // Previous must not already be superseded
-      if (previous.status === 'SUPERSEDED' || previous.supersededBy !== null) {
+      // Previous must be ACTIVE
+      if (previous.status !== 'ACTIVE') {
         throw new ValidationError(
-          `Memory '${previous.id}' has already been superseded (status='${previous.status}', supersededBy='${previous.supersededBy}').`
+          `Cannot supersede memory '${previous.id}': status is '${previous.status}'. Only records with status 'ACTIVE' can be superseded.`
+        );
+      }
+
+      // Previous must not already be superseded
+      if (previous.supersededBy !== null) {
+        throw new ValidationError(
+          `Memory '${previous.id}' has already been superseded by '${previous.supersededBy}'.`
+        );
+      }
+
+      // Replacement must not already be superseded
+      if (replacement.status === 'SUPERSEDED' || replacement.supersededBy !== null) {
+        throw new ValidationError(
+          `Replacement memory '${replacement.id}' has already been superseded.`
         );
       }
 
@@ -797,7 +790,7 @@ export class MemoryRepository {
       }
 
       // Cycle detection: walk superseded_by chain forwards from replacement
-      let descendantId = replacement.supersededBy;
+      let descendantId: string | null = replacement.supersededBy;
       const visitedDescendants = new Set<string>([previous.id, replacement.id]);
       while (descendantId) {
         if (descendantId === previous.id) {
@@ -813,7 +806,9 @@ export class MemoryRepository {
         descendantId = descendant?.supersededBy ?? null;
       }
 
-      // Determine target version
+      // Determine target version:
+      // If newVersion is omitted, always previous.version + 1.
+      // If newVersion is supplied, must be strictly greater than previous.version.
       let targetVersion: number;
       if (params.newVersion !== undefined) {
         if (params.newVersion <= previous.version) {
@@ -823,12 +818,7 @@ export class MemoryRepository {
         }
         targetVersion = params.newVersion;
       } else {
-        if (replacement.version < previous.version) {
-          throw new ValidationError(
-            `Replacement version (${replacement.version}) is lower than previous version (${previous.version}). Explicit newVersion required.`
-          );
-        }
-        targetVersion = Math.max(replacement.version, previous.version + 1);
+        targetVersion = previous.version + 1;
       }
 
       const now = new Date().toISOString();
