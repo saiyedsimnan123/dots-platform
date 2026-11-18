@@ -39,6 +39,7 @@ import type {
   MemoryStatus,
   MemoryPermission,
   CallerContext,
+  ProposalDecision,
   ProposalDecisionInput,
   BuildTaskMemoryContextOptions,
   BuiltMemoryContext,
@@ -918,13 +919,21 @@ export class MemoryService {
   }
 
   /**
-   * Submits a human decision (APPROVED or REJECTED) on a pending memory proposal.
-   * 
+   * Submits a human decision on a pending memory proposal.
+   *
+   * Supported strategies:
+   * - REJECT / REJECTED: rejects the pending proposal (transitions to ARCHIVED).
+   * - APPROVE_NEW / APPROVED: approves the proposal only if no active memory exists with the same key.
+   *   If an active memory with the same key exists, throws MemoryConflictError.
+   * - APPROVE_AND_SUPERSEDE: explicitly supersedes the existing active memory with the approved proposal.
+   *   The active memory becomes SUPERSEDED, and the proposal becomes ACTIVE with incremented version and lineage link.
+   *   If no active memory exists with that key, throws ValidationError.
+   *
    * Strict Security Gates:
    * 1. Requires verified human USER actor.
    * 2. Requires explicit APPROVE permission.
    * 3. Target memory must be in status 'PENDING_APPROVAL'.
-   * 4. State mutation audit logging is mandatory (fail-closed).
+   * 4. State mutation and audit logging are executed atomically inside one SQLite transaction (fail-closed).
    */
   public decideProposal(caller: CallerContext, input: ProposalDecisionInput): Memory {
     if (!input || typeof input !== 'object') {
@@ -933,9 +942,16 @@ export class MemoryService {
     if (!input.memoryId || typeof input.memoryId !== 'string' || input.memoryId.trim() === '') {
       throw new ValidationError('Memory ID must be a non-empty string.');
     }
-    if (input.decision !== 'APPROVED' && input.decision !== 'REJECTED') {
+    const VALID_DECISIONS: ReadonlySet<ProposalDecision> = new Set([
+      'APPROVE_NEW',
+      'APPROVE_AND_SUPERSEDE',
+      'REJECT',
+      'APPROVED',
+      'REJECTED'
+    ]);
+    if (!VALID_DECISIONS.has(input.decision)) {
       throw new ValidationError(
-        `Invalid proposal decision '${String(input.decision)}'. Must be 'APPROVED' or 'REJECTED'.`
+        `Invalid proposal decision '${String(input.decision)}'. Must be 'APPROVE_NEW', 'APPROVE_AND_SUPERSEDE', 'REJECT', 'APPROVED', or 'REJECTED'.`
       );
     }
 
@@ -1005,11 +1021,121 @@ export class MemoryService {
         };
       }
 
-      const newStatus: MemoryStatus = input.decision === 'APPROVED' ? 'ACTIVE' : 'ARCHIVED';
-      const updated = this.memoryRepo.updateMemory(input.memoryId, caller.scope, { status: newStatus });
+      // Check if active memory already exists with the exact same key in caller's scope
+      const activeExisting = this.memoryRepo.getMemoryByKey(existing.key, caller.scope, 'ACTIVE');
+
+      // Strategy 1: REJECT or REJECTED
+      if (input.decision === 'REJECT' || input.decision === 'REJECTED') {
+        const updated = this.memoryRepo.updateMemory(input.memoryId, caller.scope, { status: 'ARCHIVED' });
+
+        if (this.embeddingRepo) {
+          this.embeddingRepo.deleteEmbeddingsByMemoryId(updated.id);
+        }
+        if (this.embeddingJobRepo) {
+          this.embeddingJobRepo.cancelPendingJobsByMemoryId(updated.id);
+        }
+
+        this.audit(caller, 'MEMORY_PROPOSAL_DECIDED', {
+          memoryId: updated.id,
+          category: updated.category,
+          decision: input.decision,
+          decidedBy: caller.actor,
+          scopeType: updated.scopeType,
+          scopeId: updated.scopeId,
+          previousStatus: 'PENDING_APPROVAL',
+          newStatus: 'ARCHIVED'
+        }, true);
+
+        if (this._testPostAuditHook) {
+          this._testPostAuditHook();
+        }
+
+        return { ok: true, memory: updated };
+      }
+
+      // Strategy 2: APPROVE_AND_SUPERSEDE
+      if (input.decision === 'APPROVE_AND_SUPERSEDE') {
+        if (!activeExisting) {
+          return {
+            ok: false,
+            error: new ValidationError(
+              `Cannot approve and supersede: no active memory exists with key '${existing.key}' in scope '${caller.scope.scopeType}:${caller.scope.scopeId}'. Use APPROVE_NEW instead.`
+            )
+          };
+        }
+
+        // Execute atomic supersession transition
+        const superseded = this.memoryRepo.supersedeMemory({
+          previousId: activeExisting.id,
+          replacementId: existing.id,
+          scope: caller.scope,
+          replacementStatus: 'ACTIVE'
+        });
+
+        // Clean up embeddings and pending jobs for superseded memory
+        if (this.embeddingRepo) {
+          this.embeddingRepo.deleteEmbeddingsByMemoryId(superseded.previous.id);
+        }
+        if (this.embeddingJobRepo) {
+          this.embeddingJobRepo.cancelPendingJobsByMemoryId(superseded.previous.id);
+        }
+
+        // Enqueue durable embedding job for newly active replacement memory
+        if (this.embeddingJobRepo) {
+          const modelId = this.embeddingProvider?.modelId ?? this.lifecycleManager?.provider.modelId ?? 'default';
+          const modelRevision = (this.embeddingProvider as any)?.modelRevision ?? (this.lifecycleManager?.provider as any)?.modelRevision ?? 'main';
+          this.embeddingJobRepo.enqueueJob({
+            memoryId: superseded.replacement.id,
+            scopeType: superseded.replacement.scopeType,
+            scopeId: superseded.replacement.scopeId,
+            modelId,
+            modelRevision
+          });
+        }
+
+        // Mandatory audit write with supersession lineage reference
+        this.audit(caller, 'MEMORY_PROPOSAL_DECIDED', {
+          memoryId: superseded.replacement.id,
+          category: superseded.replacement.category,
+          decision: input.decision,
+          decidedBy: caller.actor,
+          scopeType: superseded.replacement.scopeType,
+          scopeId: superseded.replacement.scopeId,
+          previousStatus: 'PENDING_APPROVAL',
+          newStatus: 'ACTIVE',
+          supersededMemoryId: superseded.previous.id
+        }, true);
+
+        if (this._testPostAuditHook) {
+          this._testPostAuditHook();
+        }
+
+        return { ok: true, memory: superseded.replacement };
+      }
+
+      // Strategy 3: APPROVE_NEW or APPROVED (legacy)
+      // Must NOT supersede an active memory; reject with MemoryConflictError if active conflict exists
+      if (activeExisting) {
+        return {
+          ok: false,
+          error: new MemoryConflictError(
+            existing.key,
+            caller.scope.scopeType,
+            caller.scope.scopeId,
+            {
+              operation: 'decideProposal',
+              reason: 'Active memory already exists with key. Use APPROVE_AND_SUPERSEDE to supersede existing memory.',
+              existingActiveId: activeExisting.id,
+              proposalId: existing.id
+            }
+          )
+        };
+      }
+
+      const updated = this.memoryRepo.updateMemory(input.memoryId, caller.scope, { status: 'ACTIVE' });
 
       // Durable Embedding Automation: Enqueue job when proposal is approved (transitions to ACTIVE)
-      if (newStatus === 'ACTIVE' && this.embeddingJobRepo) {
+      if (this.embeddingJobRepo) {
         const modelId = this.embeddingProvider?.modelId ?? this.lifecycleManager?.provider.modelId ?? 'default';
         const modelRevision = (this.embeddingProvider as any)?.modelRevision ?? (this.lifecycleManager?.provider as any)?.modelRevision ?? 'main';
         this.embeddingJobRepo.enqueueJob({
@@ -1021,15 +1147,6 @@ export class MemoryService {
         });
       }
 
-      if (newStatus === 'ARCHIVED') {
-        if (this.embeddingRepo) {
-          this.embeddingRepo.deleteEmbeddingsByMemoryId(updated.id);
-        }
-        if (this.embeddingJobRepo) {
-          this.embeddingJobRepo.cancelPendingJobsByMemoryId(updated.id);
-        }
-      }
-
       // Mandatory audit write for proposal decision
       this.audit(caller, 'MEMORY_PROPOSAL_DECIDED', {
         memoryId: updated.id,
@@ -1039,7 +1156,7 @@ export class MemoryService {
         scopeType: updated.scopeType,
         scopeId: updated.scopeId,
         previousStatus: 'PENDING_APPROVAL',
-        newStatus
+        newStatus: 'ACTIVE'
       }, true);
 
       if (this._testPostAuditHook) {

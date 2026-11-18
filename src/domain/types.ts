@@ -453,7 +453,12 @@ export interface CallerContext {
   };
 }
 
-export type ProposalDecision = 'APPROVED' | 'REJECTED';
+export type ProposalDecision =
+  | 'APPROVE_NEW'
+  | 'APPROVE_AND_SUPERSEDE'
+  | 'REJECT'
+  | 'APPROVED'
+  | 'REJECTED';
 
 export interface ProposalDecisionInput {
   readonly memoryId: string;

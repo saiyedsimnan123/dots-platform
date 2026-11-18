@@ -20,6 +20,7 @@ import type {
   MemoryExportBundle,
   MemoryStatus,
   MissedRunPolicy,
+  ProposalDecision,
   ScheduleStatus,
   ScopeIdentifier,
   TaskStatus
@@ -542,10 +543,19 @@ async function executeLocalCommand(
     if (sub === 'approve' || sub === 'reject') {
       const id = requireArg(positionals[2], 'memoryId');
       const reason = getStringFlag(flags, 'reason');
+      const supersede = flags.get('supersede') === true;
+      let decision: ProposalDecision;
+      if (sub === 'reject') {
+        decision = 'REJECT';
+      } else if (supersede) {
+        decision = 'APPROVE_AND_SUPERSEDE';
+      } else {
+        decision = 'APPROVE_NEW';
+      }
       return {
         memory: runtime.memoryService.decideProposal(caller, {
           memoryId: id,
-          decision: sub === 'approve' ? 'APPROVED' : 'REJECTED',
+          decision,
           reason
         })
       };

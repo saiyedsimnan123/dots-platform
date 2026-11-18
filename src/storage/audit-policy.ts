@@ -97,7 +97,8 @@ export const MEMORY_AUDIT_ALLOWLIST: Record<MemoryAuditEventType, readonly strin
     'scopeType',
     'scopeId',
     'previousStatus',
-    'newStatus'
+    'newStatus',
+    'supersededMemoryId'
   ],
   MEMORY_EXPORTED: [
     'scopeType',
@@ -201,7 +202,10 @@ export const MEMORY_STATUSES: ReadonlySet<string> = new Set([
 
 export const PROPOSAL_DECISIONS: ReadonlySet<string> = new Set([
   'APPROVED',
-  'REJECTED'
+  'REJECTED',
+  'APPROVE_NEW',
+  'APPROVE_AND_SUPERSEDE',
+  'REJECT'
 ]);
 
 export const MEMORY_ACTORS: ReadonlySet<string> = new Set([
@@ -362,7 +366,13 @@ export function validateMemoryAuditFieldValue(
   }
 
   // Identifiers: adheres to repository contracts (UUIDs, slug strings, prefixed IDs)
-  if (key === 'memoryId' || key === 'taskId' || key === 'scopeId' || key === 'targetScopeId') {
+  if (
+    key === 'memoryId' ||
+    key === 'taskId' ||
+    key === 'scopeId' ||
+    key === 'targetScopeId' ||
+    key === 'supersededMemoryId'
+  ) {
     return typeof value === 'string' && ID_PATTERN.test(value) ? value : undefined;
   }
 

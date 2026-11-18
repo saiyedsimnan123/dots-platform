@@ -18,6 +18,7 @@ import type {
   MemoryCategory,
   MemoryExportBundle,
   MemoryStatus,
+  ProposalDecision,
   ScheduleStatus,
   ScopeIdentifier,
   TaskStatus,
@@ -602,7 +603,7 @@ export class DotsHttpServer {
       const body = await this.readJsonObject(req);
       const memory = this.runtime.memoryService.decideProposal(caller, {
         memoryId: id,
-        decision: body.decision as 'APPROVED' | 'REJECTED',
+        decision: body.decision as ProposalDecision,
         reason: typeof body.reason === 'string' ? body.reason : undefined
       });
       this.sendJson(res, 200, { memory });
