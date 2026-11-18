@@ -1198,3 +1198,263 @@ test('31. Maintenance does not alter retry, recovery, or job-claim behavior', as
   assert.equal(claimed.id, pendingJob.id);
   assert.equal(claimed.status, 'RUNNING');
 });
+
+// ============================================================================
+// Phase 4D.2B.1: Indexing, Malformed Timestamps & In-Flight Tracking Tests
+// ============================================================================
+
+test('32. EXPLAIN QUERY PLAN confirms pruning query uses idx_embedding_jobs_retention without temporary sort', () => {
+  const env = setupTestEnvironment();
+  const cutoffIso = new Date().toISOString();
+
+  const plan = env.db.prepare(`
+    EXPLAIN QUERY PLAN
+    SELECT id, status, updated_at
+    FROM embedding_jobs INDEXED BY idx_embedding_jobs_retention
+    WHERE status IN ('COMPLETED', 'FAILED', 'CANCELLED')
+      AND updated_at <= ?
+      AND datetime(updated_at) IS NOT NULL
+    ORDER BY updated_at ASC, id ASC
+    LIMIT ?
+  `).all(cutoffIso, 500) as Array<{ id: number; parent: number; notused: number; detail: string }>;
+
+  const planDetails = plan.map((p) => p.detail);
+
+  // 1. Must use the partial retention index
+  const usesRetentionIndex = planDetails.some((d) => d.includes('USING INDEX idx_embedding_jobs_retention'));
+  assert.equal(usesRetentionIndex, true, `Expected plan to use idx_embedding_jobs_retention, got: ${JSON.stringify(planDetails)}`);
+
+  // 2. Must NOT use temporary sort b-tree
+  const usesTempBTree = planDetails.some((d) => d.includes('USE TEMP B-TREE'));
+  assert.equal(usesTempBTree, false, `Expected zero temp B-tree sorting, got: ${JSON.stringify(planDetails)}`);
+
+  // 3. Must NOT use the job-claim index for pruning
+  const usesClaimIndex = planDetails.some((d) => d.includes('idx_embedding_jobs_claim'));
+  assert.equal(usesClaimIndex, false, `Expected not to use idx_embedding_jobs_claim, got: ${JSON.stringify(planDetails)}`);
+});
+
+test('33. Migration 007 applies successfully and creates idx_embedding_jobs_retention', () => {
+  const env = setupTestEnvironment();
+
+  // Verify migration record exists in schema_migrations
+  const row = env.db.prepare('SELECT version FROM schema_migrations WHERE version = ?').get(
+    '007_embedding_jobs_retention_index'
+  ) as { version: string } | undefined;
+  assert.ok(row, 'Migration 007_embedding_jobs_retention_index must be applied');
+  assert.equal(row.version, '007_embedding_jobs_retention_index');
+
+  // Verify index in sqlite_master
+  const indexRow = env.db.prepare(`
+    SELECT name, tbl_name, sql 
+    FROM sqlite_master 
+    WHERE type = 'index' AND name = 'idx_embedding_jobs_retention'
+  `).get() as { name: string; tbl_name: string; sql: string } | undefined;
+
+  assert.ok(indexRow, 'Index idx_embedding_jobs_retention must exist in sqlite_master');
+  assert.equal(indexRow.tbl_name, 'embedding_jobs');
+  assert.match(indexRow.sql, /idx_embedding_jobs_retention/);
+  assert.match(indexRow.sql, /updated_at/);
+  assert.match(indexRow.sql, /WHERE status IN \('COMPLETED', 'FAILED', 'CANCELLED'\)/);
+});
+
+test('34. Large set of terminal jobs can be pruned in bounded batches', async () => {
+  const env = setupTestEnvironment();
+  const now = Date.now();
+  const thirtyDaysAgoIso = new Date(now - 30 * 86_400_000).toISOString();
+
+  const totalJobs = 50;
+  const batchLimit = 15;
+  const jobIds: string[] = [];
+
+  for (let i = 0; i < totalJobs; i++) {
+    const status = i % 3 === 0 ? 'COMPLETED' : i % 3 === 1 ? 'FAILED' : 'CANCELLED';
+    const job = createJobWithStatus(env, status, thirtyDaysAgoIso, `large.batch.${i}`);
+    jobIds.push(job.id);
+  }
+
+  assert.equal(jobIds.length, totalJobs);
+
+  let totalPruned = 0;
+  let passCount = 0;
+  while (totalPruned < totalJobs) {
+    passCount++;
+    const result = env.embeddingJobRepo.pruneTerminalJobs({
+      limit: batchLimit,
+      olderThanMs: 14 * 86_400_000,
+      now
+    });
+    if (result.total === 0) break;
+    assert.ok(result.total <= batchLimit, `Batch deletion exceeded limit: ${result.total} > ${batchLimit}`);
+    totalPruned += result.total;
+  }
+
+  assert.equal(totalPruned, totalJobs);
+  assert.equal(passCount, Math.ceil(totalJobs / batchLimit));
+
+  // Verify all 50 jobs are gone
+  for (const id of jobIds) {
+    assert.equal(env.embeddingJobRepo.getJobById(id), null);
+  }
+});
+
+test('35. Malformed timestamps (including lexicographically smaller strings) do not block valid eligible jobs from being pruned', async () => {
+  const env = setupTestEnvironment();
+  const now = Date.now();
+  const twentyDaysAgoIso = new Date(now - 20 * 86_400_000).toISOString();
+
+  // 1. Create malformed jobs that sort lexicographically BEFORE '2026-...'
+  const malformedAlpha = createJobWithStatus(env, 'COMPLETED', '00-malformed-timestamp', 'malformed.alpha');
+  const emptyStringJob = createJobWithStatus(env, 'FAILED', '', 'malformed.empty');
+  const invalidDateJob = createJobWithStatus(env, 'CANCELLED', '0000-00-00', 'malformed.zeros');
+
+  // Verify they sort before the 2026 cutoff ISO string
+  assert.ok('00-malformed-timestamp' < twentyDaysAgoIso);
+  assert.ok('' < twentyDaysAgoIso);
+  assert.ok('0000-00-00' < twentyDaysAgoIso);
+
+  // 2. Create valid old jobs
+  const validOldJob1 = createJobWithStatus(env, 'COMPLETED', twentyDaysAgoIso, 'valid.job.1');
+  const validOldJob2 = createJobWithStatus(env, 'COMPLETED', twentyDaysAgoIso, 'valid.job.2');
+
+  // 3. Prune with limit = 1: Must NOT get stuck behind malformed rows!
+  const pass1 = env.embeddingJobRepo.pruneTerminalJobs({
+    limit: 1,
+    olderThanMs: 14 * 86_400_000,
+    now
+  });
+
+  assert.equal(pass1.total, 1, 'Pass 1 must prune one valid job despite malformed rows sorting earlier');
+  assert.equal(pass1.completed, 1);
+
+  // 4. Prune pass 2 with limit = 1: Must prune the second valid job
+  const pass2 = env.embeddingJobRepo.pruneTerminalJobs({
+    limit: 1,
+    olderThanMs: 14 * 86_400_000,
+    now
+  });
+
+  assert.equal(pass2.total, 1, 'Pass 2 must prune the second valid job');
+
+  // 5. Pass 3: All valid jobs pruned, malformed jobs remain untouched and unpruned
+  const pass3 = env.embeddingJobRepo.pruneTerminalJobs({
+    limit: 1,
+    olderThanMs: 14 * 86_400_000,
+    now
+  });
+  assert.equal(pass3.total, 0);
+
+  // Verify both valid jobs were pruned
+  assert.equal(env.embeddingJobRepo.getJobById(validOldJob1.id), null);
+  assert.equal(env.embeddingJobRepo.getJobById(validOldJob2.id), null);
+
+  // Verify all malformed jobs were NEVER deleted (retention safety invariant preserved)
+  assert.ok(env.embeddingJobRepo.getJobById(malformedAlpha.id));
+  assert.ok(env.embeddingJobRepo.getJobById(emptyStringJob.id));
+  assert.ok(env.embeddingJobRepo.getJobById(invalidDateJob.id));
+});
+
+test('36. hasInFlightWork is false and maintenancePromise is cleared after successful maintenance pass', async () => {
+  const env = setupTestEnvironment();
+  const manager = env.lifecycleManager;
+
+  // Initially idle
+  assert.equal(manager.hasInFlightWork, false);
+
+  const promise = manager.runMaintenance();
+
+  // Immediately after synchronous call, in-flight state is true and promise is assigned
+  assert.equal(manager.hasInFlightWork, true);
+
+  const result = await promise;
+  assert.ok(result);
+
+  // Immediately after await resolves, in-flight state is false and maintenancePromise is null
+  assert.equal(manager.hasInFlightWork, false);
+});
+
+test('37. maintenancePromise is cleared and hasInFlightWork is false after maintenance failure', async () => {
+  const env = setupTestEnvironment();
+  const manager = env.lifecycleManager;
+
+  const originalPrune = env.embeddingJobRepo.pruneTerminalJobs.bind(env.embeddingJobRepo);
+  (env.embeddingJobRepo as any).pruneTerminalJobs = () => {
+    throw new Error('Simulated repository failure in test 37');
+  };
+
+  try {
+    assert.equal(manager.hasInFlightWork, false);
+
+    const promise = manager.runMaintenance();
+    assert.equal(manager.hasInFlightWork, true);
+
+    const result = await promise;
+    assert.equal(result, null, 'Maintenance failure must return null without rethrowing');
+
+    // After failure completion, in-flight state is cleared
+    assert.equal(manager.hasInFlightWork, false);
+  } finally {
+    (env.embeddingJobRepo as any).pruneTerminalJobs = originalPrune;
+  }
+});
+
+test('38. Concurrent maintenance calls do not overlap', async () => {
+  const env = setupTestEnvironment();
+  const manager = env.lifecycleManager;
+
+  const p1 = manager.runMaintenance();
+  const p2 = manager.runMaintenance();
+  const p3 = manager.runMaintenance();
+
+  const [res1, res2, res3] = await Promise.all([p1, p2, p3]);
+
+  // First call runs, subsequent concurrent calls return null immediately
+  assert.ok(res1 !== null);
+  assert.equal(res2, null);
+  assert.equal(res3, null);
+
+  assert.equal(manager.hasInFlightWork, false);
+});
+
+test('39. Shutdown waits for genuinely in-flight maintenance before SQLite database closes', async () => {
+  const env = setupTestEnvironment();
+  const manager = env.lifecycleManager;
+
+  let dbWasOpenDuringMaintenance = false;
+  let finishMaintenance!: () => void;
+  const maintenanceHoldPromise = new Promise<void>((resolve) => {
+    finishMaintenance = resolve;
+  });
+
+  const originalPrune = env.embeddingJobRepo.pruneTerminalJobs.bind(env.embeddingJobRepo);
+  (env.embeddingJobRepo as any).pruneTerminalJobs = () => {
+    // Delay maintenance until hold promise resolves
+    return originalPrune();
+  };
+
+  await manager.start();
+
+  // Run async maintenance and hold it
+  let maintenanceCompleted = false;
+  const maintenancePromise = (async () => {
+    const res = await manager.runMaintenance();
+    await maintenanceHoldPromise;
+    dbWasOpenDuringMaintenance = env.db.isOpen;
+    maintenanceCompleted = true;
+    return res;
+  })();
+
+  // Trigger stop while maintenance is active
+  const stopPromise = manager.stop(2000);
+
+  // Complete maintenance
+  finishMaintenance();
+  await maintenancePromise;
+  const drained = await stopPromise;
+
+  assert.equal(drained, true);
+  assert.equal(maintenanceCompleted, true);
+  assert.equal(dbWasOpenDuringMaintenance, true, 'Database must be open while maintenance runs');
+
+  env.db.close();
+  assert.equal(env.db.isOpen, false);
+});

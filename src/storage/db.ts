@@ -408,6 +408,17 @@ export class DatabaseManager {
               WHERE status = 'PENDING';
           `);
         }
+      },
+      {
+        version: '007_embedding_jobs_retention_index',
+        up: (db) => {
+          db.exec(`
+            -- Retention maintenance index: partial index for fast, bounded terminal job pruning
+            CREATE INDEX IF NOT EXISTS idx_embedding_jobs_retention 
+              ON embedding_jobs (updated_at ASC, id ASC) 
+              WHERE status IN ('COMPLETED', 'FAILED', 'CANCELLED');
+          `);
+        }
       }
     ];
 

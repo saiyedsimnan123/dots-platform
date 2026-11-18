@@ -538,12 +538,13 @@ export class EmbeddingJobRepository {
     const cutoffIso = cutoffDate.toISOString();
 
     const execute = (): PruneTerminalJobsResult => {
-      // 1. Select candidate terminal jobs up to the specified limit using indexed status scan
+      // 1. Select candidate terminal jobs up to the specified limit using the partial retention index
       const selectSql = `
         SELECT id, status, updated_at
-        FROM embedding_jobs
+        FROM embedding_jobs INDEXED BY idx_embedding_jobs_retention
         WHERE status IN ('COMPLETED', 'FAILED', 'CANCELLED')
           AND updated_at <= ?
+          AND datetime(updated_at) IS NOT NULL
         ORDER BY updated_at ASC, id ASC
         LIMIT ?
       `;

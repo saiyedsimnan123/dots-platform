@@ -187,7 +187,11 @@ export class EmbeddingLifecycleManager {
     }
 
     this.isMaintaining = true;
-    const maintenanceExecution = (async (): Promise<PruneTerminalJobsResult | null> => {
+
+    const executeMaintenance = async (): Promise<PruneTerminalJobsResult | null> => {
+      // Yield to ensure maintenancePromise is assigned synchronously before execution begins
+      await Promise.resolve();
+
       try {
         const result = this.jobRepo.pruneTerminalJobs({
           limit: this.maxPruneBatchSize,
@@ -213,10 +217,11 @@ export class EmbeddingLifecycleManager {
         this.isMaintaining = false;
         this.maintenancePromise = null;
       }
-    })();
+    };
 
-    this.maintenancePromise = maintenanceExecution;
-    return maintenanceExecution;
+    const promise = executeMaintenance();
+    this.maintenancePromise = promise;
+    return promise;
   }
 
   /**
