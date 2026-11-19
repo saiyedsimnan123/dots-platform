@@ -397,6 +397,14 @@ export class MemoryService {
   }
 
   /**
+   * Retrieves all pending proposals for a given key within the caller's scope.
+   */
+  public getPendingProposalsByKey(caller: CallerContext, key: string): Memory[] {
+    this.validateCaller(caller, 'READ');
+    return this.memoryRepo.getPendingProposalsByKey(key, caller.scope);
+  }
+
+  /**
    * Lists memories within the caller's scope, with optional category and status filters.
    */
   public listMemories(
@@ -1064,6 +1072,44 @@ export class MemoryService {
           };
         }
 
+        // Stale target and stale version validation for UPDATE proposals
+        let proposalMeta: Record<string, unknown> | undefined;
+        if (existing.metadataJson) {
+          try {
+            proposalMeta = JSON.parse(existing.metadataJson);
+          } catch {
+            // malformed metadata handled as non-update
+          }
+        }
+
+        if (proposalMeta && proposalMeta.proposalType === 'UPDATE') {
+          // Stale target validation: verify targetMemoryId matches current active memory
+          if (
+            typeof proposalMeta.targetMemoryId === 'string' &&
+            proposalMeta.targetMemoryId !== activeExisting.id
+          ) {
+            return {
+              ok: false,
+              error: new ValidationError(
+                `Cannot approve update proposal: target memory '${proposalMeta.targetMemoryId}' does not match current active memory '${activeExisting.id}'.`
+              )
+            };
+          }
+
+          // Stale version validation: verify targetVersion matches current active version
+          if (
+            typeof proposalMeta.targetVersion === 'number' &&
+            proposalMeta.targetVersion !== activeExisting.version
+          ) {
+            return {
+              ok: false,
+              error: new ValidationError(
+                `Cannot approve update proposal: target memory version ${proposalMeta.targetVersion} is stale (current active memory version is ${activeExisting.version}).`
+              )
+            };
+          }
+        }
+
         // Execute atomic supersession transition
         const superseded = this.memoryRepo.supersedeMemory({
           previousId: activeExisting.id,
@@ -1128,6 +1174,25 @@ export class MemoryService {
               existingActiveId: activeExisting.id,
               proposalId: existing.id
             }
+          )
+        };
+      }
+
+      // If proposal was generated as an UPDATE proposal, reject APPROVE_NEW / APPROVED
+      let proposalMeta: Record<string, unknown> | undefined;
+      if (existing.metadataJson) {
+        try {
+          proposalMeta = JSON.parse(existing.metadataJson);
+        } catch {
+          // ignore
+        }
+      }
+
+      if (proposalMeta && proposalMeta.proposalType === 'UPDATE') {
+        return {
+          ok: false,
+          error: new ValidationError(
+            `Cannot approve update proposal with '${input.decision}': target memory '${String(proposalMeta.targetMemoryId)}' is no longer active. Update proposals require APPROVE_AND_SUPERSEDE and an active target memory.`
           )
         };
       }

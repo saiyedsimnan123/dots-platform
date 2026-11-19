@@ -217,6 +217,26 @@ export class MemoryRepository {
   }
 
   /**
+   * Retrieves all pending proposals for an exact key within a scope.
+   * Deterministically ordered by created_at ASC, id ASC.
+   */
+  public getPendingProposalsByKey(key: string, scope: ScopeIdentifier): Memory[] {
+    this.validateKey(key);
+    if (!scope || typeof scope !== 'object') {
+      throw new ValidationError('Scope must be provided to getPendingProposalsByKey.');
+    }
+    this.validateScope(scope.scopeType, scope.scopeId);
+
+    const stmt = this.db.prepare(`
+      SELECT * FROM memories
+      WHERE scope_type = ? AND scope_id = ? AND key = ? AND status = 'PENDING_APPROVAL'
+      ORDER BY created_at ASC, id ASC
+    `);
+    const rows = stmt.all(scope.scopeType, scope.scopeId, key.trim()) as unknown as MemoryDbRow[];
+    return rows.map((r) => this.mapMemoryRow(r));
+  }
+
+  /**
    * Lists memories within an explicit scope, with optional status and category filters.
    */
   public listMemories(filter: ListMemoriesFilter): Memory[] {

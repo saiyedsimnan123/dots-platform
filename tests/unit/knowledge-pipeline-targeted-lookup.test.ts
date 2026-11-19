@@ -258,26 +258,26 @@ test('Phase 4D.3D.2 - 2: A key with only a SUPERSEDED record can be proposed aga
 });
 
 // ============================================================================
-// 3. Suppression: Key with an existing ACTIVE record remains suppressed
+// 3. Suppression: Key with an existing ACTIVE record having identical content remains suppressed
 // ============================================================================
-test('Phase 4D.3D.2 - 3: A key with an existing ACTIVE record remains suppressed in Phase 4D.3D.2', async () => {
+test('Phase 4D.3D.2 - 3: A key with an existing ACTIVE record having identical content remains suppressed', async () => {
   const env = setupTargetedLookupEnv();
 
   const question = 'Redis cache aside design';
   const expectedKey = `research.finding.${slugify(question, 45)}`;
 
-  // Seed an ACTIVE memory
+  const output = makeResearchOutput(question, 'Redis cache-aside is standard.');
+  const expectedContent = `Research Topic: ${question}\n\nKey Verified Findings:\n1. Redis cache-aside is standard.\n\nSources Cited:\n- Performance Guide: https://example.com/doc`;
+
+  // Seed an ACTIVE memory with identical content
   env.memoryRepo.createMemory({
     category: 'PROJECT_FACT',
     scopeType: env.scopeAlpha.scopeType,
     scopeId: env.scopeAlpha.scopeId,
     key: expectedKey,
-    content: 'Existing active fact about Redis',
+    content: expectedContent,
     status: 'ACTIVE'
   });
-
-  // Output proposing different content for the existing active key
-  const output = makeResearchOutput(question, 'Redis cache-aside is standard.');
 
   const proposals = await env.pipeline.processCompletedTask({
     task: env.taskAlpha,
@@ -406,14 +406,15 @@ test('Phase 4D.3D.2 - 7: Global and workspace scope behavior remains consistent 
   const expectedKey = `research.finding.${slugify(question, 45)}`;
   const findingText = 'Global standard protocol requires TLS 1.3 encryption.';
   const output = makeResearchOutput(question, findingText);
+  const expectedContent = `Research Topic: ${question}\n\nKey Verified Findings:\n1. ${findingText}\n\nSources Cited:\n- Performance Guide: https://example.com/doc`;
 
-  // 7a: Create an ACTIVE global memory
+  // 7a: Create an ACTIVE global memory with identical content
   const globalMem = env.memoryRepo.createMemory({
     category: 'PROJECT_FACT',
     scopeType: 'GLOBAL',
     scopeId: 'default',
     key: expectedKey,
-    content: 'Global standard protocol requires TLS 1.3 encryption.',
+    content: expectedContent,
     status: 'ACTIVE'
   });
   assert.equal(globalMem.status, 'ACTIVE');
@@ -531,12 +532,17 @@ test('Phase 4D.3D.2 - 9: Candidate evaluation uses targeted lookups on 500+ hist
   const totalBefore = (env.db.prepare("SELECT COUNT(*) as c FROM memories WHERE scope_id = 'ws-alpha'").get() as { c: number }).c;
   assert.equal(totalBefore, 500, 'Pre-condition: exactly 500 historical rows seeded');
 
-  // Spy on getMemoryByKey to observe bounded lookups
-  let getMemoryByKeyCalls = 0;
+  // Spy on targeted lookups (getMemoryByKey and getPendingProposalsByKey) to observe bounded lookups
+  let targetedLookupCalls = 0;
   const originalGetByKey = env.memoryService.getMemoryByKey.bind(env.memoryService);
   env.memoryService.getMemoryByKey = (...args: Parameters<typeof originalGetByKey>) => {
-    getMemoryByKeyCalls++;
+    targetedLookupCalls++;
     return originalGetByKey(...args);
+  };
+  const originalGetPending = env.memoryService.getPendingProposalsByKey.bind(env.memoryService);
+  env.memoryService.getPendingProposalsByKey = (...args: Parameters<typeof originalGetPending>) => {
+    targetedLookupCalls++;
+    return originalGetPending(...args);
   };
 
   const output = makeResearchOutput(question, 'Target unpoisoned key in large dataset.');
@@ -554,8 +560,8 @@ test('Phase 4D.3D.2 - 9: Candidate evaluation uses targeted lookups on 500+ hist
   assert.equal(proposals[0].status, 'PENDING_APPROVAL');
   assert.equal(proposals[0].version, 1, 'Initialized to fresh version 1');
 
-  // Verify bounded lookups: exactly 2 targeted lookups (ACTIVE and PENDING_APPROVAL) were executed for the candidate
-  assert.equal(getMemoryByKeyCalls, 2, 'Candidate evaluation must make exactly targeted lookups (ACTIVE + PENDING_APPROVAL)');
+  // Verify bounded lookups: exactly 2 targeted lookups (ACTIVE + PENDING_APPROVAL) were executed for the candidate
+  assert.equal(targetedLookupCalls, 2, 'Candidate evaluation must make exactly targeted lookups (ACTIVE + PENDING_APPROVAL)');
 
   // Verify database count increased by exactly 1
   const totalAfter = (env.db.prepare("SELECT COUNT(*) as c FROM memories WHERE scope_id = 'ws-alpha'").get() as { c: number }).c;

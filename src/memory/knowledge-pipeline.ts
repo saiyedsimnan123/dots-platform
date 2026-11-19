@@ -592,23 +592,72 @@ export class KnowledgeProposalPipeline {
         continue;
       }
 
-      // 2. Targeted lookup: suppress if an ACTIVE memory already exists for this key in scope
-      // (Phase 4D.3D.2 preserves active-key suppression; update proposals are deferred to Phase 4D.3D.3)
+      // 2. Targeted lookup: check if an ACTIVE memory exists for this key in scope
+      let activeExisting: Memory | null = null;
       try {
-        const activeExisting = memoryService.getMemoryByKey(caller, scrubbedKey, 'ACTIVE');
-        if (activeExisting) {
-          continue;
-        }
+        activeExisting = memoryService.getMemoryByKey(caller, scrubbedKey, 'ACTIVE');
       } catch {
         // Authorization or lookup failure fail-safes without aborting the loop
       }
 
-      // 3. Targeted lookup: suppress if an identical PENDING_APPROVAL proposal already exists for this key
+      let isUpdateProposal = false;
+
+      if (activeExisting) {
+        // If the active memory is inherited from another scope (e.g. GLOBAL memory inherited into WORKSPACE):
+        // Workspace callers cannot modify or supersede global memories.
+        // The inherited active memory satisfies and suppresses this key for the workspace.
+        if (
+          activeExisting.scopeType !== caller.scope.scopeType ||
+          activeExisting.scopeId !== caller.scope.scopeId
+        ) {
+          continue;
+        }
+
+        // Active memory is in caller's own scope. Check if candidate content is identical
+        const isIdenticalToActive =
+          activeExisting.content.trim().toLowerCase() === boundedContent.toLowerCase();
+        if (isIdenticalToActive) {
+          // Suppress duplicate: active memory already contains this exact knowledge
+          continue;
+        }
+
+        // Active memory in caller's scope has differing content -> candidate is an UPDATE proposal
+        isUpdateProposal = true;
+      }
+
+      // 3. Targeted lookup: check matching PENDING_APPROVAL proposals for this key
       try {
-        const pendingExisting = memoryService.getMemoryByKey(caller, scrubbedKey, 'PENDING_APPROVAL');
-        if (pendingExisting) {
-          const isIdentical = pendingExisting.content.trim().toLowerCase() === boundedContent.toLowerCase();
-          if (isIdentical) {
+        const pendingProposals = memoryService.getPendingProposalsByKey(caller, scrubbedKey);
+        if (isUpdateProposal && activeExisting) {
+          // For update proposals: suppress duplicate pending updates targeting the same memory with identical content
+          let isDuplicatePendingUpdate = false;
+          for (const pending of pendingProposals) {
+            let pendingMeta: Record<string, unknown> | undefined;
+            if (pending.metadataJson) {
+              try {
+                pendingMeta = JSON.parse(pending.metadataJson);
+              } catch {
+                // ignore
+              }
+            }
+            if (
+              pendingMeta?.proposalType === 'UPDATE' &&
+              pendingMeta?.targetMemoryId === activeExisting.id &&
+              pending.content.trim().toLowerCase() === boundedContent.toLowerCase()
+            ) {
+              isDuplicatePendingUpdate = true;
+              break;
+            }
+          }
+          if (isDuplicatePendingUpdate) {
+            continue;
+          }
+        } else {
+          // For ordinary new proposals: suppress if an identical pending proposal exists
+          const isDuplicatePending = pendingProposals.some(
+            (p) => p.content.trim().toLowerCase() === boundedContent.toLowerCase()
+          );
+          if (isDuplicatePending) {
             continue;
           }
         }
@@ -623,13 +672,20 @@ export class KnowledgeProposalPipeline {
         .slice(0, 50);
 
       // Metadata
-      const metadata = {
-        ...(sanitizeProposalMetadata(candidate.metadata) ?? {}),
+      const sanitizedMeta = sanitizeProposalMetadata(candidate.metadata) ?? {};
+      const metadata: Record<string, unknown> = {
+        ...sanitizedMeta,
         source: 'automatic_knowledge_proposal',
         taskId: task.id,
         agentId,
         proposedAt: new Date().toISOString()
       };
+
+      if (isUpdateProposal && activeExisting) {
+        metadata.proposalType = 'UPDATE';
+        metadata.targetMemoryId = activeExisting.id;
+        metadata.targetVersion = activeExisting.version;
+      }
 
       try {
         const memory = memoryService.createMemory(caller, {

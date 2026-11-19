@@ -120,14 +120,24 @@ function sanitizeValue(val: unknown): unknown {
   return val;
 }
 
+export const RESERVED_PROPOSAL_METADATA_KEYS: ReadonlySet<string> = new Set([
+  'proposalType',
+  'targetMemoryId',
+  'targetVersion'
+]);
+
+export function isReservedProposalMetadataKey(key: string): boolean {
+  return RESERVED_PROPOSAL_METADATA_KEYS.has(key);
+}
+
 export function sanitizeProposalMetadata(metadata?: Record<string, unknown>): Record<string, unknown> | undefined {
   if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
     return undefined;
   }
   const sanitized: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(metadata)) {
-    if (isSensitiveKey(key)) {
-      continue; // Exclude credentials and sensitive tokens from metadata
+    if (isSensitiveKey(key) || isReservedProposalMetadataKey(key)) {
+      continue; // Exclude credentials, sensitive tokens, and reserved lineage keys from untrusted metadata
     }
     sanitized[key] = sanitizeValue(val);
   }
