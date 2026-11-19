@@ -44,6 +44,7 @@ import {
 import { CircuitBreakerError } from '../domain/errors.ts';
 import { BudgetExceededError } from '../model/budget-tracker.ts';
 import { defaultSecretScrubber } from '../model/secret-scrubber.ts';
+import { sanitizeProposalMetadata } from '../tools/memory-tools.ts';
 import type { RuntimeEvent } from '../runtime/event-bus.ts';
 import { parseScopeSpec } from '../runtime/config.ts';
 import {
@@ -532,13 +533,20 @@ export class DotsHttpServer {
       if ('version' in body || 'supersedesId' in body || 'supersededBy' in body) {
         throw new ValidationError("Direct specification of lineage metadata ('version', 'supersedesId', 'supersededBy') is not permitted.");
       }
+      let sanitizedMetadata: Record<string, unknown> | undefined;
+      if (body.metadata !== undefined) {
+        if (typeof body.metadata !== 'object' || body.metadata === null || Array.isArray(body.metadata)) {
+          throw new ValidationError('Memory metadata must be an object.');
+        }
+        sanitizedMetadata = sanitizeProposalMetadata(body.metadata as Record<string, unknown>);
+      }
       const input: CreateMemoryInput = {
         category: body.category as MemoryCategory,
         key: body.key as string,
         content: body.content as string,
         tags: body.tags as string[] | undefined,
         priority: body.priority as number | undefined,
-        metadata: body.metadata as Record<string, unknown> | undefined,
+        metadata: sanitizedMetadata,
         scopeType: caller.scope.scopeType,
         scopeId: caller.scope.scopeId,
         ...(body.status !== undefined ? { status: body.status as WritableMemoryStatus } : {})
@@ -568,12 +576,19 @@ export class DotsHttpServer {
       if ('version' in body || 'supersedesId' in body || 'supersededBy' in body) {
         throw new ValidationError("Direct modification of lineage metadata ('version', 'supersedesId', 'supersededBy') is not permitted.");
       }
+      let sanitizedPatchMetadata: Record<string, unknown> | undefined;
+      if (body.metadata !== undefined) {
+        if (typeof body.metadata !== 'object' || body.metadata === null || Array.isArray(body.metadata)) {
+          throw new ValidationError('Memory metadata must be an object.');
+        }
+        sanitizedPatchMetadata = sanitizeProposalMetadata(body.metadata as Record<string, unknown>);
+      }
       const input: UpdateMemoryInput = {
         ...(body.content !== undefined ? { content: body.content as string } : {}),
         ...(body.category !== undefined ? { category: body.category as MemoryCategory } : {}),
         ...(body.priority !== undefined ? { priority: body.priority as number } : {}),
         ...(body.tags !== undefined ? { tags: body.tags as string[] } : {}),
-        ...(body.metadata !== undefined ? { metadata: body.metadata as Record<string, unknown> } : {}),
+        ...(body.metadata !== undefined ? { metadata: sanitizedPatchMetadata } : {}),
         ...(body.status !== undefined ? { status: body.status as WritableMemoryStatus } : {})
       };
       const memory = this.runtime.memoryService.updateMemory(caller, id, input);

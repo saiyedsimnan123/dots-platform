@@ -1029,6 +1029,49 @@ export class MemoryService {
         };
       }
 
+      // Parse proposal metadata and fail closed on invalid JSON
+      let proposalMeta: Record<string, unknown> | undefined;
+      if (
+        existing.metadataJson !== null &&
+        existing.metadataJson !== undefined &&
+        existing.metadataJson.trim() !== ''
+      ) {
+        try {
+          proposalMeta = JSON.parse(existing.metadataJson);
+        } catch {
+          return {
+            ok: false,
+            error: new ValidationError(
+              `Cannot decide memory proposal '${input.memoryId}': proposal metadata contains invalid JSON.`
+            )
+          };
+        }
+        if (typeof proposalMeta !== 'object' || proposalMeta === null || Array.isArray(proposalMeta)) {
+          return {
+            ok: false,
+            error: new ValidationError(
+              `Cannot decide memory proposal '${input.memoryId}': proposal metadata must be a JSON object.`
+            )
+          };
+        }
+      }
+
+      const isUpdateProposal = Boolean(
+        proposalMeta &&
+        (proposalMeta.proposalType === 'UPDATE' ||
+          'targetMemoryId' in proposalMeta ||
+          'targetVersion' in proposalMeta)
+      );
+
+      if (proposalMeta && 'proposalType' in proposalMeta && proposalMeta.proposalType !== 'UPDATE') {
+        return {
+          ok: false,
+          error: new ValidationError(
+            `Cannot decide memory proposal: invalid proposalType '${String(proposalMeta.proposalType)}'.`
+          )
+        };
+      }
+
       // Check if active memory already exists with the exact same key in caller's scope
       const activeExisting = this.memoryRepo.getMemoryByKey(existing.key, caller.scope, 'ACTIVE');
 
@@ -1073,21 +1116,45 @@ export class MemoryService {
         }
 
         // Stale target and stale version validation for UPDATE proposals
-        let proposalMeta: Record<string, unknown> | undefined;
-        if (existing.metadataJson) {
-          try {
-            proposalMeta = JSON.parse(existing.metadataJson);
-          } catch {
-            // malformed metadata handled as non-update
+        if (isUpdateProposal) {
+          if (!proposalMeta || proposalMeta.proposalType !== 'UPDATE') {
+            return {
+              ok: false,
+              error: new ValidationError(
+                `Cannot approve update proposal: proposalType must be 'UPDATE', received '${String(proposalMeta?.proposalType)}'.`
+              )
+            };
           }
-        }
 
-        if (proposalMeta && proposalMeta.proposalType === 'UPDATE') {
-          // Stale target validation: verify targetMemoryId matches current active memory
+          // Strict targetMemoryId validation: must be a non-empty string
           if (
-            typeof proposalMeta.targetMemoryId === 'string' &&
-            proposalMeta.targetMemoryId !== activeExisting.id
+            typeof proposalMeta.targetMemoryId !== 'string' ||
+            proposalMeta.targetMemoryId.trim() === ''
           ) {
+            return {
+              ok: false,
+              error: new ValidationError(
+                `Cannot approve update proposal: targetMemoryId must be a non-empty string, received '${String(proposalMeta.targetMemoryId)}'.`
+              )
+            };
+          }
+
+          // Strict targetVersion validation: must be a positive integer
+          if (
+            typeof proposalMeta.targetVersion !== 'number' ||
+            !Number.isInteger(proposalMeta.targetVersion) ||
+            proposalMeta.targetVersion <= 0
+          ) {
+            return {
+              ok: false,
+              error: new ValidationError(
+                `Cannot approve update proposal: targetVersion must be a positive integer, received '${String(proposalMeta.targetVersion)}'.`
+              )
+            };
+          }
+
+          // Stale target validation: verify targetMemoryId matches current active memory
+          if (proposalMeta.targetMemoryId.trim() !== activeExisting.id) {
             return {
               ok: false,
               error: new ValidationError(
@@ -1097,10 +1164,7 @@ export class MemoryService {
           }
 
           // Stale version validation: verify targetVersion matches current active version
-          if (
-            typeof proposalMeta.targetVersion === 'number' &&
-            proposalMeta.targetVersion !== activeExisting.version
-          ) {
+          if (proposalMeta.targetVersion !== activeExisting.version) {
             return {
               ok: false,
               error: new ValidationError(
@@ -1179,20 +1243,11 @@ export class MemoryService {
       }
 
       // If proposal was generated as an UPDATE proposal, reject APPROVE_NEW / APPROVED
-      let proposalMeta: Record<string, unknown> | undefined;
-      if (existing.metadataJson) {
-        try {
-          proposalMeta = JSON.parse(existing.metadataJson);
-        } catch {
-          // ignore
-        }
-      }
-
-      if (proposalMeta && proposalMeta.proposalType === 'UPDATE') {
+      if (isUpdateProposal) {
         return {
           ok: false,
           error: new ValidationError(
-            `Cannot approve update proposal with '${input.decision}': target memory '${String(proposalMeta.targetMemoryId)}' is no longer active. Update proposals require APPROVE_AND_SUPERSEDE and an active target memory.`
+            `Cannot approve update proposal with '${input.decision}': target memory '${String(proposalMeta?.targetMemoryId)}' is no longer active. Update proposals require APPROVE_AND_SUPERSEDE and an active target memory.`
           )
         };
       }
