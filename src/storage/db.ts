@@ -479,6 +479,37 @@ export class DatabaseManager {
             CREATE INDEX IF NOT EXISTS idx_memories_history ON memories(scope_type, scope_id, key, version ASC);
           `);
         }
+      },
+      {
+        version: '009_memory_evidence',
+        up: (db) => {
+          db.exec(`
+            CREATE TABLE IF NOT EXISTS memory_evidence (
+              id TEXT PRIMARY KEY,
+              memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+              source_type TEXT NOT NULL CHECK (
+                source_type IN ('WEB_RESEARCH', 'CODE_VERIFICATION', 'TOOL_EXECUTION', 'DOCUMENTATION', 'USER_ASSERTION')
+              ),
+              source_url TEXT,
+              source_domain TEXT,
+              source_title TEXT,
+              snippet TEXT,
+              snippet_hash TEXT NOT NULL,
+              relationship TEXT NOT NULL CHECK (
+                relationship IN ('SUPPORTS', 'CONTRADICTS', 'LIMITATION')
+              ),
+              task_id TEXT NOT NULL,
+              agent_id TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_evidence_memory_id ON memory_evidence(memory_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_evidence_domain ON memory_evidence(source_domain);
+            CREATE INDEX IF NOT EXISTS idx_memory_evidence_hash ON memory_evidence(snippet_hash);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_evidence_dedup
+              ON memory_evidence(memory_id, snippet_hash, relationship);
+          `);
+        }
       }
     ];
 

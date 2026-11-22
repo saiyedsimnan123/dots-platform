@@ -62,7 +62,9 @@ import type {
   MemoryPurgeMode,
   PurgeArchivedMemoriesOptions,
   MemoryPurgeResult,
-  ScoredMemory
+  ScoredMemory,
+  MemoryEvidence,
+  CandidateEvidence
 } from '../domain/types.ts';
 import {
   ValidationError,
@@ -482,6 +484,29 @@ export class MemoryService {
         priority: input.priority,
         tags: input.tags
       });
+
+      // Persist structured evidence atomically if provided
+      if (input.evidence && input.evidence.length > 0) {
+        const trustedTaskId = caller.taskId ?? (caller.actor === 'SYSTEM' ? ((input.metadata?.taskId as string) ?? 'system-task') : 'task-unspecified');
+        const trustedAgentId = caller.actor === 'AGENT'
+          ? (caller.principalId ?? 'agent-unspecified')
+          : (caller.principalId ?? caller.actor.toLowerCase());
+
+        for (const ev of input.evidence) {
+          this.memoryRepo.addEvidence({
+            memoryId: memory.id,
+            sourceType: ev.sourceType,
+            sourceUrl: ev.sourceUrl,
+            sourceDomain: ev.sourceDomain,
+            sourceTitle: ev.sourceTitle,
+            snippet: ev.snippet,
+            snippetHash: ev.snippetHash,
+            relationship: ev.relationship,
+            taskId: trustedTaskId,
+            agentId: trustedAgentId
+          });
+        }
+      }
 
       // Mandatory audit write for state creation
       if (status === 'ACTIVE') {
@@ -2761,6 +2786,51 @@ export class MemoryService {
       totalEstimatedTokens,
       injections
     };
+  }
+
+  /**
+   * Retrieves structured evidence associated with a memory or proposal within caller scope.
+   * Enforces caller verification and READ permissions.
+   * Throws MemoryScopeViolationError if the memory exists in a different scope.
+   * Throws MemoryNotFoundError if the memory does not exist.
+   */
+  public getEvidenceByMemoryId(caller: CallerContext, memoryId: string): MemoryEvidence[] {
+    this.validateCaller(caller, 'READ');
+    if (!memoryId || typeof memoryId !== 'string' || memoryId.trim() === '') {
+      throw new ValidationError('Memory ID must be a non-empty string.');
+    }
+
+    let memory: Memory | null;
+    try {
+      memory = this.memoryRepo.getMemoryById(memoryId, caller.scope);
+    } catch (err) {
+      if (err instanceof MemoryScopeViolationError) {
+        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+          reason: 'CROSS_SCOPE_READ_ATTEMPT',
+          operation: 'getEvidenceByMemoryId',
+          memoryId,
+          expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+        }, false);
+      }
+      throw err;
+    }
+
+    if (!memory) {
+      throw new MemoryNotFoundError(memoryId);
+    }
+
+    const evidence = this.memoryRepo.getEvidenceByMemoryId(memoryId, caller.scope);
+
+    this.audit(caller, 'MEMORY_RETRIEVED', {
+      memoryId: memory.id,
+      category: memory.category,
+      scopeType: memory.scopeType,
+      scopeId: memory.scopeId,
+      operation: 'getEvidenceByMemoryId',
+      evidenceCount: evidence.length
+    }, false);
+
+    return evidence;
   }
 
   /**

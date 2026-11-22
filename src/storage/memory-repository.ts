@@ -12,7 +12,7 @@
  * 5. Access counts and access timestamps are only updated through explicit repository operations.
  */
 
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import type { DatabaseManager } from './db.ts';
 import type {
   Memory,
@@ -25,7 +25,11 @@ import type {
   ListMemoriesFilter,
   RecordMemoryInjectionInput,
   ScopeIdentifier,
-  SupersedeMemoryParams
+  SupersedeMemoryParams,
+  EvidenceSourceType,
+  EvidenceRelationship,
+  MemoryEvidence,
+  CreateEvidenceInput
 } from '../domain/types.ts';
 import type {
   MissingEmbeddingMemoryRecord,
@@ -38,7 +42,16 @@ import {
   MemoryScopeViolationError
 } from '../domain/errors.ts';
 
-export type { ScopeIdentifier, SupersedeMemoryParams };
+export type { ScopeIdentifier, SupersedeMemoryParams, MemoryEvidence, CreateEvidenceInput, EvidenceSourceType, EvidenceRelationship };
+
+export function computeSnippetHash(snippet?: string | null, fallback: string = ''): string {
+  const content = (snippet && snippet.trim().length > 0) ? snippet.trim() : fallback.trim();
+  return createHash('sha256').update(content, 'utf8').digest('hex');
+}
+
+export function computeEvidenceId(memoryId: string, snippetHash: string, relationship: string): string {
+  return createHash('sha256').update(`${memoryId}:${snippetHash}:${relationship}`, 'utf8').digest('hex');
+}
 
 interface MemoryDbRow {
   id: string;
@@ -69,6 +82,21 @@ interface InjectionDbRow {
   injected_at: string;
 }
 
+interface EvidenceDbRow {
+  id: string;
+  memory_id: string;
+  source_type: string;
+  source_url: string | null;
+  source_domain: string | null;
+  source_title: string | null;
+  snippet: string | null;
+  snippet_hash: string;
+  relationship: string;
+  task_id: string;
+  agent_id: string;
+  created_at: string;
+}
+
 type SqlParam = null | number | bigint | string | Uint8Array;
 
 const VALID_CATEGORIES: ReadonlySet<MemoryCategory> = new Set([
@@ -84,6 +112,20 @@ const VALID_STATUSES: ReadonlySet<MemoryStatus> = new Set([
   'PENDING_APPROVAL',
   'ARCHIVED',
   'SUPERSEDED'
+]);
+
+const VALID_EVIDENCE_SOURCE_TYPES: ReadonlySet<EvidenceSourceType> = new Set([
+  'WEB_RESEARCH',
+  'CODE_VERIFICATION',
+  'TOOL_EXECUTION',
+  'DOCUMENTATION',
+  'USER_ASSERTION'
+]);
+
+const VALID_EVIDENCE_RELATIONSHIPS: ReadonlySet<EvidenceRelationship> = new Set([
+  'SUPPORTS',
+  'CONTRADICTS',
+  'LIMITATION'
 ]);
 
 export class MemoryRepository {
@@ -679,6 +721,142 @@ export class MemoryRepository {
   }
 
   /**
+   * Computes deterministic evidence ID.
+   */
+  public computeEvidenceId(memoryId: string, snippetHash: string, relationship: string): string {
+    return computeEvidenceId(memoryId, snippetHash, relationship);
+  }
+
+  /**
+   * Persists a structured evidence record associated with a memory or proposal.
+   * Deduplicates using deterministic identity and unique constraint checks.
+   */
+  public addEvidence(input: CreateEvidenceInput): MemoryEvidence {
+    this.validateEvidenceInput(input);
+
+    const snippetHash = input.snippetHash && input.snippetHash.trim().length > 0
+      ? input.snippetHash.trim()
+      : computeSnippetHash(input.snippet, input.sourceUrl ?? input.sourceTitle ?? '');
+
+    const id = input.id && input.id.trim().length > 0
+      ? input.id.trim()
+      : computeEvidenceId(input.memoryId, snippetHash, input.relationship);
+
+    // Check if identical evidence already exists by id
+    const existingById = this.getEvidenceById(id);
+    if (existingById) {
+      return existingById;
+    }
+
+    // Check if identical evidence already exists by (memory_id, snippet_hash, relationship)
+    const existingRow = this.db.prepare(`
+      SELECT * FROM memory_evidence
+      WHERE memory_id = ? AND snippet_hash = ? AND relationship = ?
+    `).get(input.memoryId, snippetHash, input.relationship) as unknown as EvidenceDbRow | undefined;
+
+    if (existingRow) {
+      return this.mapEvidenceRow(existingRow);
+    }
+
+    const now = input.createdAt ?? new Date().toISOString();
+
+    const stmt = this.db.prepare(`
+      INSERT INTO memory_evidence (
+        id, memory_id, source_type, source_url, source_domain, source_title,
+        snippet, snippet_hash, relationship, task_id, agent_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    try {
+      stmt.run(
+        id,
+        input.memoryId,
+        input.sourceType,
+        input.sourceUrl ?? null,
+        input.sourceDomain ?? null,
+        input.sourceTitle ?? null,
+        input.snippet ?? null,
+        snippetHash,
+        input.relationship,
+        input.taskId,
+        input.agentId,
+        now
+      );
+    } catch (err: any) {
+      if (String(err?.message).includes('UNIQUE constraint failed')) {
+        const raceRow = this.db.prepare(`
+          SELECT * FROM memory_evidence
+          WHERE memory_id = ? AND snippet_hash = ? AND relationship = ?
+        `).get(input.memoryId, snippetHash, input.relationship) as unknown as EvidenceDbRow | undefined;
+        if (raceRow) {
+          return this.mapEvidenceRow(raceRow);
+        }
+      }
+      throw err;
+    }
+
+    return {
+      id,
+      memoryId: input.memoryId,
+      sourceType: input.sourceType,
+      sourceUrl: input.sourceUrl ?? null,
+      sourceDomain: input.sourceDomain ?? null,
+      sourceTitle: input.sourceTitle ?? null,
+      snippet: input.snippet ?? null,
+      snippetHash,
+      relationship: input.relationship,
+      taskId: input.taskId,
+      agentId: input.agentId,
+      createdAt: now
+    };
+  }
+
+  /**
+   * Retrieves an evidence record by ID.
+   */
+  public getEvidenceById(id: string): MemoryEvidence | null {
+    if (!id || typeof id !== 'string' || id.trim() === '') {
+      throw new ValidationError('Evidence ID must be a non-empty string.');
+    }
+    const row = this.db.prepare('SELECT * FROM memory_evidence WHERE id = ?').get(id.trim()) as unknown as EvidenceDbRow | undefined;
+    return row ? this.mapEvidenceRow(row) : null;
+  }
+
+  /**
+   * Retrieves structured evidence associated with a memory or proposal.
+   * If scope is provided, enforces that the memory belongs to the designated scope.
+   */
+  public getEvidenceByMemoryId(memoryId: string, scope?: ScopeIdentifier): MemoryEvidence[] {
+    if (!memoryId || typeof memoryId !== 'string' || memoryId.trim() === '') {
+      throw new ValidationError('Memory ID must be a non-empty string.');
+    }
+
+    if (scope) {
+      this.validateScope(scope.scopeType, scope.scopeId);
+      const rows = this.db.prepare(`
+        SELECT e.*
+        FROM memory_evidence e
+        INNER JOIN memories m ON e.memory_id = m.id
+        WHERE e.memory_id = ?
+          AND m.scope_type = ?
+          AND m.scope_id = ?
+        ORDER BY e.created_at ASC, e.id ASC
+      `).all(memoryId.trim(), scope.scopeType, scope.scopeId) as unknown as EvidenceDbRow[];
+
+      return rows.map((r) => this.mapEvidenceRow(r));
+    }
+
+    const rows = this.db.prepare(`
+      SELECT *
+      FROM memory_evidence
+      WHERE memory_id = ?
+      ORDER BY created_at ASC, id ASC
+    `).all(memoryId.trim()) as unknown as EvidenceDbRow[];
+
+    return rows.map((r) => this.mapEvidenceRow(r));
+  }
+
+  /**
    * Retrieves the version history of a memory key within a designated scope.
    * Deterministically ordered by version ASC, created_at ASC, id ASC.
    * Returns records across all statuses (ACTIVE, SUPERSEDED, PENDING_APPROVAL, ARCHIVED).
@@ -1016,5 +1194,47 @@ export class MemoryRepository {
       estimatedTokens: row.estimated_tokens,
       injectedAt: row.injected_at
     };
+  }
+
+  private mapEvidenceRow(row: EvidenceDbRow): MemoryEvidence {
+    return {
+      id: row.id,
+      memoryId: row.memory_id,
+      sourceType: row.source_type as EvidenceSourceType,
+      sourceUrl: row.source_url,
+      sourceDomain: row.source_domain,
+      sourceTitle: row.source_title,
+      snippet: row.snippet,
+      snippetHash: row.snippet_hash,
+      relationship: row.relationship as EvidenceRelationship,
+      taskId: row.task_id,
+      agentId: row.agent_id,
+      createdAt: row.created_at
+    };
+  }
+
+  private validateEvidenceInput(input: CreateEvidenceInput): void {
+    if (!input || typeof input !== 'object') {
+      throw new ValidationError('CreateEvidenceInput must be provided.');
+    }
+    if (!input.memoryId || typeof input.memoryId !== 'string' || input.memoryId.trim() === '') {
+      throw new ValidationError('Evidence memoryId must be a non-empty string.');
+    }
+    if (!input.sourceType || !VALID_EVIDENCE_SOURCE_TYPES.has(input.sourceType)) {
+      throw new ValidationError(
+        `Invalid evidence sourceType '${String(input.sourceType)}'. Must be one of: ${Array.from(VALID_EVIDENCE_SOURCE_TYPES).join(', ')}.`
+      );
+    }
+    if (!input.relationship || !VALID_EVIDENCE_RELATIONSHIPS.has(input.relationship)) {
+      throw new ValidationError(
+        `Invalid evidence relationship '${String(input.relationship)}'. Must be one of: ${Array.from(VALID_EVIDENCE_RELATIONSHIPS).join(', ')}.`
+      );
+    }
+    if (!input.taskId || typeof input.taskId !== 'string' || input.taskId.trim() === '') {
+      throw new ValidationError('Evidence taskId must be a non-empty string.');
+    }
+    if (!input.agentId || typeof input.agentId !== 'string' || input.agentId.trim() === '') {
+      throw new ValidationError('Evidence agentId must be a non-empty string.');
+    }
   }
 }

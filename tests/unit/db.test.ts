@@ -501,10 +501,11 @@ test('DatabaseManager - ordinary migrations execute with FK enforcement enabled 
   const fkCheck = db.prepare('PRAGMA foreign_key_check;').all();
   assert.equal(fkCheck.length, 0, 'Foreign key check must be completely clean');
 
-  // Verify all 8 migrations recorded in order
+  // Verify all migrations recorded in order
   const applied = db.prepare('SELECT version FROM schema_migrations ORDER BY id ASC').all() as Array<{ version: string }>;
-  assert.equal(applied.length, 8);
+  assert.equal(applied.length, 9);
   assert.equal(applied[7].version, '008_memory_supersession');
+  assert.equal(applied[8].version, '009_memory_evidence');
   db.close();
 
   // 2. Existing database migration upgrade from 007 to 008 with populated child records

@@ -22,11 +22,15 @@
  * 6. Graceful Fault Tolerance: Extraction or submission errors never fail or rollback a completed task.
  */
 
+import { createHash } from 'node:crypto';
 import type {
   Memory,
   MemoryCategory,
   CallerContext,
-  Task
+  Task,
+  CandidateEvidence,
+  EvidenceSourceType,
+  EvidenceRelationship
 } from '../domain/types.ts';
 import type { AgentOutput } from '../agents/types.ts';
 import type { MemoryService } from './memory-service.ts';
@@ -41,6 +45,7 @@ export interface CandidateMemoryProposal {
   readonly tags?: readonly string[];
   readonly priority?: number;
   readonly metadata?: Record<string, unknown>;
+  readonly evidence?: readonly CandidateEvidence[];
 }
 
 export interface ProcessCompletedTaskOptions {
@@ -63,6 +68,39 @@ export function slugify(text: string, maxLen = 40): string {
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
   return cleaned.slice(0, maxLen) || 'item';
+}
+
+/**
+ * Normalizes a domain name, stripping protocols, ports, and trailing paths.
+ */
+export function normalizeDomain(domain: string | null | undefined): string | undefined {
+  if (!domain || typeof domain !== 'string') return undefined;
+  const trimmed = domain.trim().toLowerCase();
+  if (!trimmed) return undefined;
+  try {
+    if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+      return new URL(trimmed).hostname.toLowerCase();
+    }
+  } catch {
+    // continue
+  }
+  const clean = trimmed.replace(/^https?:\/\//i, '').split('/')[0].split(':')[0];
+  return clean || undefined;
+}
+
+/**
+ * Extracts a normalized domain from a URL string.
+ */
+export function extractDomainFromUrl(url: string | null | undefined): string | undefined {
+  if (!url || typeof url !== 'string') return undefined;
+  const trimmed = url.trim();
+  if (!trimmed) return undefined;
+  try {
+    const parsed = new URL(trimmed.includes('://') ? trimmed : `https://${trimmed}`);
+    return parsed.hostname.toLowerCase();
+  } catch {
+    return normalizeDomain(trimmed);
+  }
 }
 
 /**
@@ -140,6 +178,59 @@ export function extractResearchProposals(
       (conflicting.length > 0 ? `Differing Perspectives / Conflicting Evidence:\n${conflicting.map((c) => `- ${c}`).join('\n')}\n\n` : '') +
       `Sources Cited:\n- ${sourceSummary}`;
 
+    const evidenceList: CandidateEvidence[] = [];
+    for (const s of sources) {
+      if (!s || typeof s !== 'object') continue;
+      const rawUrl = typeof s.url === 'string' && s.url.trim() ? s.url.trim() : undefined;
+      const rawDomain = normalizeDomain(s.domain) ?? extractDomainFromUrl(rawUrl);
+      const rawTitle = typeof s.title === 'string' && s.title.trim() ? s.title.trim() : undefined;
+
+      const snippets: string[] = [];
+      if (Array.isArray(s.relevantEvidence)) {
+        for (const item of s.relevantEvidence) {
+          if (typeof item === 'string' && item.trim()) {
+            snippets.push(item.trim());
+          }
+        }
+      }
+      if (typeof s.snippet === 'string' && s.snippet.trim()) {
+        snippets.push(s.snippet.trim());
+      }
+      if (snippets.length === 0 && typeof s.summary === 'string' && s.summary.trim()) {
+        snippets.push(s.summary.trim());
+      }
+
+      const relationship: EvidenceRelationship =
+        s.relationship === 'CONTRADICTS' || s.relationship === 'LIMITATION' || s.relationship === 'SUPPORTS'
+          ? s.relationship
+          : 'SUPPORTS';
+
+      if (snippets.length > 0) {
+        for (const snippet of snippets) {
+          evidenceList.push({
+            sourceType: 'WEB_RESEARCH',
+            sourceUrl: rawUrl,
+            sourceDomain: rawDomain,
+            sourceTitle: rawTitle,
+            snippet,
+            snippetHash: createHash('sha256').update(snippet, 'utf8').digest('hex'),
+            relationship
+          });
+        }
+      } else if (rawUrl || rawDomain || rawTitle) {
+        const fallback = rawUrl ?? rawDomain ?? rawTitle ?? '';
+        evidenceList.push({
+          sourceType: 'WEB_RESEARCH',
+          sourceUrl: rawUrl,
+          sourceDomain: rawDomain,
+          sourceTitle: rawTitle,
+          snippet: undefined,
+          snippetHash: createHash('sha256').update(fallback, 'utf8').digest('hex'),
+          relationship
+        });
+      }
+    }
+
     proposals.push({
       key: `research.finding.${questionSlug}`,
       content: findingsContent,
@@ -152,7 +243,8 @@ export function extractResearchProposals(
         question,
         findingsCount: findings.length,
         sourcesCount: sources.length
-      }
+      },
+      evidence: evidenceList.length > 0 ? evidenceList : undefined
     });
   }
 
@@ -357,6 +449,7 @@ export function extractDeveloperProposals(
     const bugs: string[] = Array.isArray(report.bugsOrRisksIdentified) ? report.bugsOrRisksIdentified : [];
     const findings: any[] = Array.isArray(report.findings) ? report.findings : [];
     const changes: any[] = Array.isArray(report.suggestedChanges) ? report.suggestedChanges : [];
+    const verifications: any[] = Array.isArray(report.verificationResults) ? report.verificationResults : [];
 
     let debugContent = `Confirmed Debugging Solution for: ${objective}\n\n`;
     if (typeof report.summary === 'string' && report.summary.trim()) {
@@ -372,6 +465,37 @@ export function extractDeveloperProposals(
       debugContent += `Applied / Verified Fixes:\n${changes.map((c) => `- ${c.filePath ?? 'File'}: ${c.description ?? 'Code change'}`).join('\n')}`;
     }
 
+    const evidenceList: CandidateEvidence[] = [];
+    for (const v of verifications) {
+      if (!v || typeof v !== 'object') continue;
+      const title = (typeof v.target === 'string' && v.target.trim())
+        ? v.target.trim()
+        : ((typeof v.name === 'string' && v.name.trim())
+          ? v.name.trim()
+          : ((typeof v.description === 'string' && v.description.trim()) ? v.description.trim() : undefined));
+
+      const snippet = (typeof v.evidence === 'string' && v.evidence.trim())
+        ? v.evidence.trim()
+        : ((typeof v.details === 'string' && v.details.trim())
+          ? v.details.trim()
+          : ((typeof v.description === 'string' && v.description.trim()) ? v.description.trim() : undefined));
+
+      const passed = v.status === 'PASSED' || v.passed === true;
+      const failed = v.status === 'FAILED' || v.passed === false;
+      const relationship: EvidenceRelationship = passed ? 'SUPPORTS' : (failed ? 'CONTRADICTS' : 'LIMITATION');
+
+      if (title || snippet) {
+        const hashContent = snippet ?? title ?? '';
+        evidenceList.push({
+          sourceType: 'CODE_VERIFICATION',
+          sourceTitle: title,
+          snippet,
+          snippetHash: createHash('sha256').update(hashContent, 'utf8').digest('hex'),
+          relationship
+        });
+      }
+    }
+
     proposals.push({
       key: `developer.debug.${objectiveSlug}`,
       content: debugContent.trim(),
@@ -383,7 +507,8 @@ export function extractDeveloperProposals(
         agentType: 'developer',
         operation: 'DEBUG',
         objective
-      }
+      },
+      evidence: evidenceList.length > 0 ? evidenceList : undefined
     });
   }
 
@@ -438,6 +563,54 @@ export function extractDeveloperProposals(
       testContent += `Test Commands Executed:\n${commands.map((c) => `- \`${c.command}\` (exit code: ${c.exitCode})`).join('\n')}`;
     }
 
+    const evidenceList: CandidateEvidence[] = [];
+    for (const v of verifications) {
+      if (!v || typeof v !== 'object') continue;
+      const title = (typeof v.target === 'string' && v.target.trim())
+        ? v.target.trim()
+        : ((typeof v.name === 'string' && v.name.trim())
+          ? v.name.trim()
+          : ((typeof v.description === 'string' && v.description.trim()) ? v.description.trim() : undefined));
+
+      const snippet = (typeof v.evidence === 'string' && v.evidence.trim())
+        ? v.evidence.trim()
+        : ((typeof v.details === 'string' && v.details.trim())
+          ? v.details.trim()
+          : ((typeof v.description === 'string' && v.description.trim()) ? v.description.trim() : undefined));
+
+      const passed = v.status === 'PASSED' || v.passed === true;
+      const failed = v.status === 'FAILED' || v.passed === false;
+      const relationship: EvidenceRelationship = passed ? 'SUPPORTS' : (failed ? 'CONTRADICTS' : 'LIMITATION');
+
+      if (title || snippet) {
+        const hashContent = snippet ?? title ?? '';
+        evidenceList.push({
+          sourceType: 'CODE_VERIFICATION',
+          sourceTitle: title,
+          snippet,
+          snippetHash: createHash('sha256').update(hashContent, 'utf8').digest('hex'),
+          relationship
+        });
+      }
+    }
+
+    for (const c of commands) {
+      if (!c || typeof c !== 'object') continue;
+      if (typeof c.command === 'string' && c.command.trim()) {
+        const cmd = c.command.trim();
+        const exitCode = typeof c.exitCode === 'number' ? c.exitCode : 0;
+        const snippetText = `Command: ${cmd}\nExit Code: ${exitCode}` +
+          (typeof c.stdout === 'string' && c.stdout.trim() ? `\nStdout: ${c.stdout.trim()}` : '');
+        evidenceList.push({
+          sourceType: 'TOOL_EXECUTION',
+          sourceTitle: cmd,
+          snippet: snippetText,
+          snippetHash: createHash('sha256').update(snippetText, 'utf8').digest('hex'),
+          relationship: exitCode === 0 ? 'SUPPORTS' : 'CONTRADICTS'
+        });
+      }
+    }
+
     proposals.push({
       key: `developer.test-procedure.${objectiveSlug}`,
       content: testContent.trim(),
@@ -449,14 +622,15 @@ export function extractDeveloperProposals(
         agentType: 'developer',
         operation: 'TEST',
         objective
-      }
+      },
+      evidence: evidenceList.length > 0 ? evidenceList : undefined
     });
   }
 
   // 4. GENERATE: strictly reject unverified generated code as a proven solution
   if (operation === 'GENERATE') {
     const verifications: any[] = Array.isArray(report.verificationResults) ? report.verificationResults : [];
-    const allPassed = verifications.length > 0 && verifications.every((v) => v.passed === true);
+    const allPassed = verifications.length > 0 && verifications.every((v) => v.passed === true || v.status === 'PASSED');
     if (allPassed) {
       let codeContent = `Verified Implementation Solution for: ${objective}\n\n`;
       if (typeof report.summary === 'string' && report.summary.trim()) {
@@ -465,6 +639,33 @@ export function extractDeveloperProposals(
       codeContent += `Verification: All ${verifications.length} independent assertions passed.\n`;
       if (typeof report.generatedCode === 'string' && report.generatedCode.trim()) {
         codeContent += `Verified Implementation:\n\`\`\`\n${report.generatedCode.trim()}\n\`\`\``;
+      }
+
+      const evidenceList: CandidateEvidence[] = [];
+      for (const v of verifications) {
+        if (!v || typeof v !== 'object') continue;
+        const title = (typeof v.target === 'string' && v.target.trim())
+          ? v.target.trim()
+          : ((typeof v.name === 'string' && v.name.trim())
+            ? v.name.trim()
+            : ((typeof v.description === 'string' && v.description.trim()) ? v.description.trim() : undefined));
+
+        const snippet = (typeof v.evidence === 'string' && v.evidence.trim())
+          ? v.evidence.trim()
+          : ((typeof v.details === 'string' && v.details.trim())
+            ? v.details.trim()
+            : ((typeof v.description === 'string' && v.description.trim()) ? v.description.trim() : undefined));
+
+        if (title || snippet) {
+          const hashContent = snippet ?? title ?? '';
+          evidenceList.push({
+            sourceType: 'CODE_VERIFICATION',
+            sourceTitle: title,
+            snippet,
+            snippetHash: createHash('sha256').update(hashContent, 'utf8').digest('hex'),
+            relationship: 'SUPPORTS'
+          });
+        }
       }
 
       proposals.push({
@@ -478,7 +679,8 @@ export function extractDeveloperProposals(
           agentType: 'developer',
           operation: 'GENERATE',
           objective
-        }
+        },
+        evidence: evidenceList.length > 0 ? evidenceList : undefined
       });
     }
   }
@@ -697,7 +899,8 @@ export class KnowledgeProposalPipeline {
           status: 'PENDING_APPROVAL',
           priority: candidate.priority ?? 50,
           tags,
-          metadata
+          metadata,
+          evidence: candidate.evidence
         });
 
         submitted.push(memory);

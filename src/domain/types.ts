@@ -308,6 +308,59 @@ export interface MemoryTaskInjection {
   readonly injectedAt: string;
 }
 
+/**
+ * Phase 4D.3D.4B - Structured Evidence Types
+ */
+
+export type EvidenceSourceType =
+  | 'WEB_RESEARCH'
+  | 'CODE_VERIFICATION'
+  | 'TOOL_EXECUTION'
+  | 'DOCUMENTATION'
+  | 'USER_ASSERTION';
+
+export type EvidenceRelationship = 'SUPPORTS' | 'CONTRADICTS' | 'LIMITATION';
+
+export interface CandidateEvidence {
+  readonly sourceType: EvidenceSourceType;
+  readonly sourceUrl?: string;
+  readonly sourceDomain?: string;
+  readonly sourceTitle?: string;
+  readonly snippet?: string;
+  readonly snippetHash?: string;
+  readonly relationship: EvidenceRelationship;
+}
+
+export interface MemoryEvidence {
+  readonly id: string;
+  readonly memoryId: string;
+  readonly sourceType: EvidenceSourceType;
+  readonly sourceUrl: string | null;
+  readonly sourceDomain: string | null;
+  readonly sourceTitle: string | null;
+  readonly snippet: string | null;
+  readonly snippetHash: string;
+  readonly relationship: EvidenceRelationship;
+  readonly taskId: string;
+  readonly agentId: string;
+  readonly createdAt: string;
+}
+
+export interface CreateEvidenceInput {
+  readonly id?: string;
+  readonly memoryId: string;
+  readonly sourceType: EvidenceSourceType;
+  readonly sourceUrl?: string | null;
+  readonly sourceDomain?: string | null;
+  readonly sourceTitle?: string | null;
+  readonly snippet?: string | null;
+  readonly snippetHash?: string;
+  readonly relationship: EvidenceRelationship;
+  readonly taskId: string;
+  readonly agentId: string;
+  readonly createdAt?: string;
+}
+
 export type WritableMemoryStatus = Exclude<MemoryStatus, 'SUPERSEDED'>;
 
 export interface CreateMemoryInput {
@@ -321,6 +374,7 @@ export interface CreateMemoryInput {
   readonly priority?: number;
   readonly tags?: readonly string[];
   readonly metadata?: Record<string, unknown>;
+  readonly evidence?: readonly CandidateEvidence[];
 }
 
 export interface UpdateMemoryInput {
