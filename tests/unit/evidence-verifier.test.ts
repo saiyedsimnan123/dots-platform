@@ -1082,7 +1082,8 @@ test('14. High-confidence SUPPORTS or CONTRADICTS never auto-approves, activates
         sourceType: 'DOCUMENTATION',
         sourceUrl: 'https://docs.example.org/timeouts',
         snippet: 'Default timeout was increased to 30 seconds in v2.',
-        relationship: 'SUPPORTS'
+        relationship: 'SUPPORTS',
+        targetClaimIndices: [0]
       }
     ]
   });

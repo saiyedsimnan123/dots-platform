@@ -330,6 +330,8 @@ export interface CandidateEvidence {
   readonly snippet?: string;
   readonly snippetHash?: string;
   readonly relationship: EvidenceRelationship;
+  readonly targetClaimIndices?: readonly number[];
+  readonly targetClaimIds?: readonly string[];
 }
 
 export interface MemoryEvidence {
@@ -408,6 +410,28 @@ export interface ListClaimsFilter {
   readonly memoryId?: string;
   readonly limit?: number;
   readonly offset?: number;
+}
+
+export interface ClaimEvidenceAssociation {
+  readonly id: string;
+  readonly claimId: string;
+  readonly evidenceId: string;
+  readonly memoryId: string;
+  readonly scopeType: MemoryScopeType;
+  readonly scopeId: string;
+  readonly relationship: EvidenceRelationship;
+  readonly createdAt: string;
+}
+
+export interface CreateClaimEvidenceAssociationInput {
+  readonly id?: string;
+  readonly claimId: string;
+  readonly evidenceId: string;
+  readonly memoryId: string;
+  readonly scopeType: MemoryScopeType;
+  readonly scopeId: string;
+  readonly relationship?: EvidenceRelationship;
+  readonly createdAt?: string;
 }
 
 /**

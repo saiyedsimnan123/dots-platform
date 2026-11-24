@@ -70,7 +70,8 @@ import type {
   ListClaimsFilter,
   CandidateClaim,
   ClaimEvidenceVerification,
-  ListClaimVerificationsFilter
+  ListClaimVerificationsFilter,
+  ClaimEvidenceAssociation
 } from '../domain/types.ts';
 import {
   ValidationError,
@@ -491,10 +492,29 @@ export class MemoryService {
         tags: input.tags
       });
 
-      // Persist structured evidence atomically if provided
-      if (input.evidence && input.evidence.length > 0) {
-        const trustedTaskId = caller.taskId ?? (caller.actor === 'SYSTEM' ? ((input.metadata?.taskId as string) ?? 'system-task') : 'task-unspecified');
+      // Persist atomic claims first so explicit evidence associations can reference them atomically
+      const persistedClaims: MemoryClaim[] = [];
+      const trustedTaskId = caller.taskId ?? (caller.actor === 'SYSTEM' ? ((input.metadata?.taskId as string) ?? 'system-task') : 'task-unspecified');
+      if (input.claims && input.claims.length > 0) {
+        for (const c of input.claims) {
+          const claim = this.memoryRepo.addClaim({
+            memoryId: memory.id,
+            originalText: c.originalText,
+            canonicalText: c.canonicalText,
+            claimHash: c.claimHash,
+            subject: c.subject,
+            predicate: c.predicate,
+            qualifier: c.qualifier,
+            scopeType: caller.scope.scopeType,
+            scopeId: caller.scope.scopeId,
+            taskId: trustedTaskId
+          });
+          persistedClaims.push(claim);
+        }
+      }
 
+      // Persist structured evidence and explicit claim-evidence associations atomically if provided
+      if (input.evidence && input.evidence.length > 0) {
         let trustedAgentId: string;
         if (caller.actor === 'AGENT') {
           if (!caller.agentId || typeof caller.agentId !== 'string' || caller.agentId.trim() === '') {
@@ -511,7 +531,7 @@ export class MemoryService {
         }
 
         for (const ev of input.evidence) {
-          this.memoryRepo.addEvidence({
+          const persistedEvidence = this.memoryRepo.addEvidence({
             memoryId: memory.id,
             sourceType: ev.sourceType,
             sourceUrl: ev.sourceUrl,
@@ -523,25 +543,23 @@ export class MemoryService {
             taskId: trustedTaskId,
             agentId: trustedAgentId
           });
-        }
-      }
 
-      // Persist atomic claims atomically if provided
-      if (input.claims && input.claims.length > 0) {
-        const trustedTaskId = caller.taskId ?? (caller.actor === 'SYSTEM' ? ((input.metadata?.taskId as string) ?? 'system-task') : 'task-unspecified');
-        for (const c of input.claims) {
-          this.memoryRepo.addClaim({
-            memoryId: memory.id,
-            originalText: c.originalText,
-            canonicalText: c.canonicalText,
-            claimHash: c.claimHash,
-            subject: c.subject,
-            predicate: c.predicate,
-            qualifier: c.qualifier,
-            scopeType: caller.scope.scopeType,
-            scopeId: caller.scope.scopeId,
-            taskId: trustedTaskId
-          });
+          const targetClaimIds = this.resolveExplicitEvidenceTargetClaimIds(
+            caller.scope,
+            persistedClaims,
+            ev
+          );
+
+          for (const targetClaimId of targetClaimIds) {
+            this.memoryRepo.addClaimEvidenceAssociation({
+              claimId: targetClaimId,
+              evidenceId: persistedEvidence.id,
+              memoryId: memory.id,
+              scopeType: caller.scope.scopeType,
+              scopeId: caller.scope.scopeId,
+              relationship: ev.relationship
+            });
+          }
         }
       }
 
@@ -3078,6 +3096,138 @@ export class MemoryService {
       scopeType: caller.scope.scopeType,
       scopeId: caller.scope.scopeId
     });
+  }
+
+  /**
+   * Retrieves explicit claim-evidence associations for a memory within caller's scope.
+   */
+  public getClaimEvidenceAssociationsByMemoryId(
+    caller: CallerContext,
+    memoryId: string
+  ): ClaimEvidenceAssociation[] {
+    this.validateCaller(caller, 'READ');
+    if (!memoryId || typeof memoryId !== 'string' || memoryId.trim() === '') {
+      throw new ValidationError('Memory ID must be a non-empty string.');
+    }
+
+    try {
+      return this.memoryRepo.getClaimEvidenceAssociationsByMemoryId(memoryId, caller.scope);
+    } catch (err) {
+      if (err instanceof MemoryScopeViolationError) {
+        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+          reason: 'CROSS_SCOPE_READ_ATTEMPT',
+          operation: 'getClaimEvidenceAssociationsByMemoryId',
+          expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+        }, false);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Retrieves explicit claim-evidence associations for a claim within caller's scope.
+   */
+  public getClaimEvidenceAssociationsByClaimId(
+    caller: CallerContext,
+    claimId: string
+  ): ClaimEvidenceAssociation[] {
+    this.validateCaller(caller, 'READ');
+    if (!claimId || typeof claimId !== 'string' || claimId.trim() === '') {
+      throw new ValidationError('Claim ID must be a non-empty string.');
+    }
+
+    try {
+      return this.memoryRepo.getClaimEvidenceAssociationsByClaimId(claimId, caller.scope);
+    } catch (err) {
+      if (err instanceof MemoryScopeViolationError) {
+        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+          reason: 'CROSS_SCOPE_CLAIM_ACCESS_ATTEMPT',
+          operation: 'getClaimEvidenceAssociationsByClaimId',
+          expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+        }, false);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Retrieves explicit claim-evidence associations for an evidence item within caller's scope.
+   */
+  public getClaimEvidenceAssociationsByEvidenceId(
+    caller: CallerContext,
+    evidenceId: string
+  ): ClaimEvidenceAssociation[] {
+    this.validateCaller(caller, 'READ');
+    if (!evidenceId || typeof evidenceId !== 'string' || evidenceId.trim() === '') {
+      throw new ValidationError('Evidence ID must be a non-empty string.');
+    }
+
+    try {
+      return this.memoryRepo.getClaimEvidenceAssociationsByEvidenceId(evidenceId, caller.scope);
+    } catch (err) {
+      if (err instanceof MemoryScopeViolationError) {
+        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+          reason: 'CROSS_SCOPE_READ_ATTEMPT',
+          operation: 'getClaimEvidenceAssociationsByEvidenceId',
+          expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+        }, false);
+      }
+      throw err;
+    }
+  }
+
+  private resolveExplicitEvidenceTargetClaimIds(
+    scope: ScopeIdentifier,
+    persistedClaims: readonly MemoryClaim[],
+    evidence: CandidateEvidence
+  ): string[] {
+    const resolvedIds = new Set<string>();
+
+    if (evidence.targetClaimIndices !== undefined) {
+      if (!Array.isArray(evidence.targetClaimIndices) || evidence.targetClaimIndices.length === 0) {
+        throw new ValidationError('Evidence targetClaimIndices must be a non-empty array when provided.');
+      }
+      const seenIndices = new Set<number>();
+      for (const idx of evidence.targetClaimIndices) {
+        if (typeof idx !== 'number' || !Number.isInteger(idx) || idx < 0) {
+          throw new ValidationError(`Invalid evidence targetClaimIndex '${String(idx)}'. Must be a non-negative integer.`);
+        }
+        if (idx >= persistedClaims.length) {
+          throw new ValidationError(
+            `Out-of-bounds evidence targetClaimIndex ${idx} for memory with ${persistedClaims.length} claims.`
+          );
+        }
+        if (seenIndices.has(idx)) {
+          throw new ValidationError(`Duplicate evidence targetClaimIndex ${idx}.`);
+        }
+        seenIndices.add(idx);
+        resolvedIds.add(persistedClaims[idx]!.id);
+      }
+    }
+
+    if (evidence.targetClaimIds !== undefined) {
+      if (!Array.isArray(evidence.targetClaimIds) || evidence.targetClaimIds.length === 0) {
+        throw new ValidationError('Evidence targetClaimIds must be a non-empty array when provided.');
+      }
+      const seenClaimIds = new Set<string>();
+      for (const rawId of evidence.targetClaimIds) {
+        if (typeof rawId !== 'string' || rawId.trim() === '') {
+          throw new ValidationError('Evidence targetClaimIds entries must be non-empty strings.');
+        }
+        const trimmedId = rawId.trim();
+        if (seenClaimIds.has(trimmedId)) {
+          throw new ValidationError(`Duplicate evidence targetClaimId '${trimmedId}'.`);
+        }
+        seenClaimIds.add(trimmedId);
+        const targetClaim = this.memoryRepo.getClaimById(trimmedId, scope);
+        if (!targetClaim) {
+          throw new ValidationError(`Target claim '${trimmedId}' not found in scope ${scope.scopeType}:${scope.scopeId}.`);
+        }
+        resolvedIds.add(targetClaim.id);
+      }
+    }
+
+    return Array.from(resolvedIds);
   }
 
   /**

@@ -575,6 +575,55 @@ export class DatabaseManager {
               );
           `);
         }
+      },
+      {
+        version: '012_claim_evidence_associations',
+        up(database: DatabaseSync): void {
+          database.exec(`
+            CREATE TABLE IF NOT EXISTS memory_claim_links (
+              memory_id TEXT NOT NULL,
+              claim_id TEXT NOT NULL,
+              scope_type TEXT NOT NULL CHECK (scope_type IN ('GLOBAL', 'WORKSPACE')),
+              scope_id TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (memory_id, claim_id),
+              FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+              FOREIGN KEY (claim_id) REFERENCES memory_claims(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_mcl_claim_id ON memory_claim_links(claim_id);
+            CREATE INDEX IF NOT EXISTS idx_mcl_scope ON memory_claim_links(scope_type, scope_id);
+
+            INSERT OR IGNORE INTO memory_claim_links (memory_id, claim_id, scope_type, scope_id, created_at)
+            SELECT c.memory_id, c.id, c.scope_type, c.scope_id, c.created_at
+            FROM memory_claims c
+            INNER JOIN memories m ON c.memory_id = m.id
+            WHERE c.memory_id IS NOT NULL
+              AND m.scope_type = c.scope_type
+              AND m.scope_id = c.scope_id;
+
+            CREATE TABLE IF NOT EXISTS claim_evidence_associations (
+              id TEXT PRIMARY KEY,
+              claim_id TEXT NOT NULL,
+              evidence_id TEXT NOT NULL,
+              memory_id TEXT NOT NULL,
+              scope_type TEXT NOT NULL CHECK (scope_type IN ('GLOBAL', 'WORKSPACE')),
+              scope_id TEXT NOT NULL,
+              relationship TEXT NOT NULL CHECK (relationship IN ('SUPPORTS', 'CONTRADICTS', 'LIMITATION')),
+              created_at TEXT NOT NULL,
+              FOREIGN KEY (claim_id) REFERENCES memory_claims(id) ON DELETE CASCADE,
+              FOREIGN KEY (evidence_id) REFERENCES memory_evidence(id) ON DELETE CASCADE,
+              FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_cea_claim_evidence
+              ON claim_evidence_associations(claim_id, evidence_id);
+            CREATE INDEX IF NOT EXISTS idx_cea_memory_id ON claim_evidence_associations(memory_id);
+            CREATE INDEX IF NOT EXISTS idx_cea_claim_id ON claim_evidence_associations(claim_id);
+            CREATE INDEX IF NOT EXISTS idx_cea_evidence_id ON claim_evidence_associations(evidence_id);
+            CREATE INDEX IF NOT EXISTS idx_cea_scope ON claim_evidence_associations(scope_type, scope_id);
+          `);
+        }
       }
     ];
 

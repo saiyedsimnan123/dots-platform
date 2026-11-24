@@ -995,23 +995,41 @@ export class EvidenceVerificationEngine {
       throw new MemoryNotFoundError(memoryId);
     }
 
-    const claims = this.memoryRepo.getClaimsByMemoryId(memory.id, verifiedCaller.scope);
-    const evidenceList = this.memoryRepo.getEvidenceByMemoryId(memory.id, verifiedCaller.scope);
-    if (claims.length === 0 || evidenceList.length === 0) {
+    const associations = this.memoryRepo.getClaimEvidenceAssociationsByMemoryId(
+      memory.id,
+      verifiedCaller.scope
+    );
+    if (associations.length === 0) {
       return [];
     }
 
+    const claimsById = new Map(
+      this.memoryRepo.getClaimsByMemoryId(memory.id, verifiedCaller.scope).map((c) => [c.id, c])
+    );
+    const evidenceById = new Map(
+      this.memoryRepo.getEvidenceByMemoryId(memory.id, verifiedCaller.scope).map((e) => [e.id, e])
+    );
+
+    const seenPairs = new Set<string>();
     const requests: VerifyClaimEvidenceRequest[] = [];
-    for (const claim of claims) {
-      for (const ev of evidenceList) {
-        if (!ev.snippet || ev.snippet.trim() === '') {
-          continue;
-        }
-        requests.push({
-          claimId: claim.id,
-          evidenceId: ev.id
-        });
+    for (const assoc of associations) {
+      const claim = claimsById.get(assoc.claimId);
+      const ev = evidenceById.get(assoc.evidenceId);
+      if (!claim || !ev) {
+        continue;
       }
+      if (!ev.snippet || ev.snippet.trim() === '') {
+        continue;
+      }
+      const pairKey = `${claim.id}:${ev.id}`;
+      if (seenPairs.has(pairKey)) {
+        continue;
+      }
+      seenPairs.add(pairKey);
+      requests.push({
+        claimId: claim.id,
+        evidenceId: ev.id
+      });
     }
 
     if (requests.length === 0) {

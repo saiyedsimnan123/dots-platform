@@ -169,7 +169,7 @@ export function extractResearchProposals(
   const openQuestions: string[] = Array.isArray(report.openQuestions) ? report.openQuestions : [];
 
   // Helper: extract CandidateEvidence records from a source ONLY if relationship is explicitly established
-  function extractSourceEvidence(s: any): CandidateEvidence[] {
+  function extractSourceEvidence(s: any, targetClaimIndices?: readonly number[]): CandidateEvidence[] {
     if (!s || typeof s !== 'object') return [];
     if (s.relationship !== 'SUPPORTS' && s.relationship !== 'CONTRADICTS' && s.relationship !== 'LIMITATION') {
       return [];
@@ -178,6 +178,9 @@ export function extractResearchProposals(
     const rawUrl = typeof s.url === 'string' && s.url.trim() ? s.url.trim() : undefined;
     const rawDomain = normalizeDomain(s.domain) ?? extractDomainFromUrl(rawUrl);
     const rawTitle = typeof s.title === 'string' && s.title.trim() ? s.title.trim() : undefined;
+    const normalizedTargets = targetClaimIndices && targetClaimIndices.length > 0
+      ? [...targetClaimIndices]
+      : undefined;
 
     const snippets: string[] = [];
     if (Array.isArray(s.relevantEvidence)) {
@@ -204,7 +207,8 @@ export function extractResearchProposals(
           sourceTitle: rawTitle,
           snippet,
           snippetHash: createHash('sha256').update(snippet, 'utf8').digest('hex'),
-          relationship: s.relationship
+          relationship: s.relationship,
+          targetClaimIndices: normalizedTargets
         });
       }
     } else if (rawUrl || rawDomain || rawTitle) {
@@ -216,50 +220,96 @@ export function extractResearchProposals(
         sourceTitle: rawTitle,
         snippet: undefined,
         snippetHash: createHash('sha256').update(fallback, 'utf8').digest('hex'),
-        relationship: s.relationship
+        relationship: s.relationship,
+        targetClaimIndices: normalizedTargets
       });
     }
     return results;
   }
 
-  function sourceTargetsFinding(s: any, findingIndex: number, allFindings: readonly string[]): boolean {
+  function hasAnyTargetSpecifier(s: any): boolean {
     if (!s || typeof s !== 'object') return false;
+    return (
+      s.targetFindingIndex !== undefined ||
+      s.targetFindingIndices !== undefined ||
+      s.targetFinding !== undefined
+    );
+  }
 
-    // Numerical index matching
-    if (typeof s.targetFindingIndex === 'number' && Number.isInteger(s.targetFindingIndex)) {
-      return s.targetFindingIndex === findingIndex;
+  /**
+   * Resolves explicit finding indices targeted by a source.
+   * Returns:
+   *  - undefined when the source declares no finding target specifier
+   *  - sorted unique number[] when all provided target specifiers agree and resolve to valid finding indices
+   *  - null when any target specifier is malformed, out-of-bounds, conflicting, or ambiguous (fail closed)
+   */
+  function resolveExplicitFindingTargets(s: any, allFindings: readonly string[]): number[] | undefined | null {
+    if (!hasAnyTargetSpecifier(s)) {
+      return undefined;
     }
 
-    // Array of indices matching
-    if (Array.isArray(s.targetFindingIndices)) {
-      return s.targetFindingIndices.includes(findingIndex);
+    const specifiers: number[][] = [];
+
+    if (s.targetFindingIndex !== undefined) {
+      if (
+        typeof s.targetFindingIndex !== 'number' ||
+        !Number.isInteger(s.targetFindingIndex) ||
+        s.targetFindingIndex < 0 ||
+        s.targetFindingIndex >= allFindings.length
+      ) {
+        return null;
+      }
+      specifiers.push([s.targetFindingIndex]);
     }
 
-    // String / title / slug matching
-    if (typeof s.targetFinding === 'string' && s.targetFinding.trim()) {
+    if (s.targetFindingIndices !== undefined) {
+      if (!Array.isArray(s.targetFindingIndices) || s.targetFindingIndices.length === 0) {
+        return null;
+      }
+      const indices: number[] = [];
+      for (const idx of s.targetFindingIndices) {
+        if (typeof idx !== 'number' || !Number.isInteger(idx) || idx < 0 || idx >= allFindings.length) {
+          return null;
+        }
+        indices.push(idx);
+      }
+      specifiers.push(Array.from(new Set(indices)).sort((a, b) => a - b));
+    }
+
+    if (s.targetFinding !== undefined) {
+      if (typeof s.targetFinding !== 'string' || s.targetFinding.trim() === '') {
+        return null;
+      }
       const tf = s.targetFinding.trim().toLowerCase();
-      const claim = (allFindings[findingIndex] ?? '').toLowerCase();
-      if (tf === claim || tf === String(findingIndex) || tf === `finding-${findingIndex + 1}`) {
-        return true;
+      if (tf === 'limitations' || tf === 'uncertainty') {
+        return null;
+      }
+      const matched: number[] = [];
+      for (let i = 0; i < allFindings.length; i++) {
+        const claim = (allFindings[i] ?? '').trim().toLowerCase();
+        if (tf === claim || tf === String(i) || tf === `finding-${i + 1}`) {
+          matched.push(i);
+        }
+      }
+      if (matched.length !== 1) {
+        return null;
+      }
+      specifiers.push(matched);
+    }
+
+    if (specifiers.length === 0) {
+      return null;
+    }
+
+    const primary = specifiers[0]!;
+    for (let i = 1; i < specifiers.length; i++) {
+      const other = specifiers[i]!;
+      if (primary.length !== other.length || primary.some((val, idx) => val !== other[idx])) {
+        return null;
       }
     }
 
-    return false;
-  }
-
-  function hasExplicitFindingTarget(s: any, numFindings: number): boolean {
-    if (!s || typeof s !== 'object') return false;
-    if (typeof s.targetFindingIndex === 'number' && Number.isInteger(s.targetFindingIndex)) {
-      // Must be within valid bounds to count as a valid target
-      return s.targetFindingIndex >= 0 && s.targetFindingIndex < numFindings;
-    }
-    if (Array.isArray(s.targetFindingIndices)) {
-      return s.targetFindingIndices.some((idx: unknown) => typeof idx === 'number' && idx >= 0 && idx < numFindings);
-    }
-    if (typeof s.targetFinding === 'string' && s.targetFinding.trim()) {
-      return true;
-    }
-    return false;
+    return primary;
   }
 
   // 1. Reusable Research Findings
@@ -282,20 +332,25 @@ export function extractResearchProposals(
       for (const s of sources) {
         if (!s || typeof s !== 'object') continue;
 
-        // If source has an explicit finding target specified:
-        if (hasExplicitFindingTarget(s, 1)) {
-          // Must target finding 0; if it targets another finding, reject
-          if (!sourceTargetsFinding(s, 0, findings)) {
+        const targets = resolveExplicitFindingTargets(s, findings);
+        if (targets === null) {
+          // Malformed, out-of-bounds, conflicting, or non-matching target specifier: fail closed
+          continue;
+        }
+        if (targets !== undefined) {
+          if (!targets.includes(0)) {
             continue;
           }
-        } else if (typeof s.targetFindingIndex === 'number' || Array.isArray(s.targetFindingIndices)) {
-          // Malformed or out-of-bounds numerical target index (e.g. 999 or -1): reject
+          evidenceList.push(...extractSourceEvidence(s, [0]));
           continue;
-        } else if (s.relationship === 'CONTRADICTS') {
+        }
+
+        if (s.relationship === 'CONTRADICTS') {
           // CONTRADICTS requires an explicit validated target finding; reject if untargeted
           continue;
         }
 
+        // Untargeted legacy evidence is retained without fabricating a claim-evidence association
         evidenceList.push(...extractSourceEvidence(s));
       }
 
@@ -316,18 +371,21 @@ export function extractResearchProposals(
         claims: [{ originalText: findings[0]! }]
       });
     } else {
-      // Multiple findings: check for explicit source-to-finding references
-      const hasTargeted = sources.some((s) => hasExplicitFindingTarget(s, findings.length));
+      // Multiple findings: resolve explicit source-to-finding references fail-closed
+      const sourceTargets = sources.map((s) => resolveExplicitFindingTargets(s, findings));
+      const hasTargeted = sourceTargets.some((t) => Array.isArray(t) && t.length > 0);
 
       if (hasTargeted) {
         // Emit individual finding proposals with isolated, dedicated evidence
         for (let i = 0; i < findings.length; i++) {
           const claim = findings[i]!;
           const findingSlug = slugify(claim, 35);
-          const targetedSources = sources.filter((s) => sourceTargetsFinding(s, i, findings));
+          const targetedSources = sources.filter(
+            (_, idx) => Array.isArray(sourceTargets[idx]) && sourceTargets[idx]!.includes(i)
+          );
           const findingEvidence: CandidateEvidence[] = [];
           for (const s of targetedSources) {
-            findingEvidence.push(...extractSourceEvidence(s));
+            findingEvidence.push(...extractSourceEvidence(s, [0]));
           }
 
           const cited = targetedSources
@@ -359,8 +417,8 @@ export function extractResearchProposals(
         }
 
         // Also emit the composite summary proposal with preserved markdown content.
-        // Dedicated finding evidence is NOT attached to the composite proposal.
-        const generalSources = sources.filter((s) => !hasExplicitFindingTarget(s, findings.length));
+        // Dedicated finding evidence is NOT attached to the composite proposal, and malformed targets never leak here.
+        const generalSources = sources.filter((_, idx) => sourceTargets[idx] === undefined);
         const generalEvidence: CandidateEvidence[] = [];
         for (const s of generalSources) {
           // General sources lack specific finding attribution; CONTRADICTS is never allowed without a target finding
