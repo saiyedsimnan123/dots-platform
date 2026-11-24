@@ -520,3 +520,139 @@ test('ResearchAgent - enforces Tier 3 tool approval requirements when approval i
     setWebSearchProvider(null);
   }
 });
+
+test("ResearchAgent - conservative contradiction: 'Tool A is faster' versus 'Tool A has a memory limitation' does not produce CONTRADICTS", async () => {
+  const mockProvider = new MockWebSearchProvider();
+  mockProvider.setDefaultResults([
+    {
+      title: 'Tool A Performance Benchmarks',
+      url: 'https://toola.example/benchmarks',
+      snippet: 'Tool A is faster than traditional tools for single-node in-memory processing workloads.',
+      domain: 'toola.example'
+    },
+    {
+      title: 'Tool A Architecture Boundaries',
+      url: 'https://toola-review.example/limits',
+      snippet: 'Tool A has a memory limitation when processing datasets larger than physical RAM.',
+      domain: 'toola-review.example'
+    }
+  ]);
+  setWebSearchProvider(mockProvider);
+
+  try {
+    const agent = new ResearchAgent();
+    const { context, approvalToken } = createTestContext();
+
+    const output = await agent.execute(
+      {
+        goal: 'Evaluate Tool A execution speed and operational memory constraints',
+        parameters: { approvalToken }
+      },
+      context
+    );
+
+    assert.equal(output.status, 'COMPLETED');
+    const report = output.result.report as ResearchReport;
+    assert.equal(report.completionStatus, 'COMPLETED');
+
+    // Neither source may be classified as CONTRADICTS
+    for (const src of report.evidenceAndSources) {
+      assert.notEqual(src.relationship, 'CONTRADICTS', `Source ${src.id} must not be classified as CONTRADICTS`);
+    }
+
+    // Both sources contributed positive findings
+    assert.ok(report.keyFindings.length >= 2);
+    const supportsCount = report.evidenceAndSources.filter((s) => s.relationship === 'SUPPORTS').length;
+    assert.ok(supportsCount >= 2, 'Both factual findings should be supported without false contradiction');
+  } finally {
+    setWebSearchProvider(null);
+  }
+});
+
+test("ResearchAgent - conservative contradiction: 'Tool A is superior' versus 'Tool A is slower in a different workload' does not produce CONTRADICTS", async () => {
+  const mockProvider = new MockWebSearchProvider();
+  mockProvider.setDefaultResults([
+    {
+      title: 'Tool A Transaction Engine',
+      url: 'https://db-eval.example/tx-superior',
+      snippet: 'Tool A is superior for lightweight OLTP transactions due to lock-free indexing.',
+      domain: 'db-eval.example'
+    },
+    {
+      title: 'Tool A Analytics Report',
+      url: 'https://analytics-eval.example/olap-limits',
+      snippet: 'Tool A is slower in high-concurrency analytical queries with complex multi-table joins.',
+      domain: 'analytics-eval.example'
+    }
+  ]);
+  setWebSearchProvider(mockProvider);
+
+  try {
+    const agent = new ResearchAgent();
+    const { context, approvalToken } = createTestContext();
+
+    const output = await agent.execute(
+      {
+        goal: 'Compare Tool A OLTP vs OLAP workload characteristics',
+        parameters: { approvalToken }
+      },
+      context
+    );
+
+    assert.equal(output.status, 'COMPLETED');
+    const report = output.result.report as ResearchReport;
+
+    // No source may have CONTRADICTS relationship
+    for (const src of report.evidenceAndSources) {
+      assert.notEqual(src.relationship, 'CONTRADICTS');
+    }
+  } finally {
+    setWebSearchProvider(null);
+  }
+});
+
+test('ResearchAgent - differing source sentiment or trade-offs do not automatically create CONTRADICTS evidence', async () => {
+  const mockProvider = new MockWebSearchProvider();
+  mockProvider.setDefaultResults([
+    {
+      title: 'Advantage Analysis',
+      url: 'https://sentiment-pos.example/advantages',
+      snippet: 'Advantageous architecture provides superior scalability, benefit, and growth for web platforms.',
+      domain: 'sentiment-pos.example'
+    },
+    {
+      title: 'Risk Analysis',
+      url: 'https://sentiment-neg.example/disadvantages',
+      snippet: 'Disadvantageous operational vulnerability and risk of failure during high network latency.',
+      domain: 'sentiment-neg.example'
+    }
+  ]);
+  setWebSearchProvider(mockProvider);
+
+  try {
+    const agent = new ResearchAgent();
+    const { context, approvalToken } = createTestContext();
+
+    const output = await agent.execute(
+      {
+        goal: 'Sentiment and trade-off evaluation',
+        parameters: { approvalToken }
+      },
+      context
+    );
+
+    assert.equal(output.status, 'COMPLETED');
+    const report = output.result.report as ResearchReport;
+
+    // The textual conflictingEvidence section may note perspective divergence for human visibility
+    assert.ok(report.conflictingEvidence.length > 0);
+    assert.ok(report.conflictingEvidence[0]!.includes('Perspective divergence'));
+
+    // But structured source evidence must NOT be classified as CONTRADICTS
+    for (const src of report.evidenceAndSources) {
+      assert.notEqual(src.relationship, 'CONTRADICTS', 'Polarity keywords must never produce CONTRADICTS evidence');
+    }
+  } finally {
+    setWebSearchProvider(null);
+  }
+});

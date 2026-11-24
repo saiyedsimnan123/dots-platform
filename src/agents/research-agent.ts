@@ -746,7 +746,7 @@ export class ResearchAgent extends BaseAgent {
       );
     }
 
-    // 3. Contradiction & Polarity Detection across sources
+    // 3. Perspective divergence across sources (textual narrative for human review; not evidence relationships)
     let posSource: ResearchSource | null = null;
     let negSource: ResearchSource | null = null;
 
@@ -767,9 +767,48 @@ export class ResearchAgent extends BaseAgent {
       }
     }
 
-    // Assign explicit, conservative evidence relationships
+    // Assign explicit, conservative evidence relationships.
+    // Keyword polarity regex must NEVER be used to classify sources as CONTRADICTS.
+    // Conflicting perspectives or complementary trade-offs do not constitute logical contradictions.
     const attributedSources: ResearchSource[] = sources.map((src) => {
       const supportedIndices = sourceFindingMap.get(src.id);
+
+      // 1. If source already has an explicitly established valid relationship, validate and preserve it
+      if (src.relationship === 'LIMITATION' || src.relationship === 'CONTRADICTS' || src.relationship === 'SUPPORTS') {
+        const targetFindingIndex =
+          src.targetFindingIndex ??
+          (supportedIndices && supportedIndices.length > 0 ? supportedIndices[0] : undefined);
+        const targetFindingIndices =
+          src.targetFindingIndices ??
+          (supportedIndices && supportedIndices.length > 0 ? supportedIndices : undefined);
+
+        // For CONTRADICTS, an explicit, in-bounds target finding is required
+        if (src.relationship === 'CONTRADICTS') {
+          const hasValidTarget =
+            (typeof targetFindingIndex === 'number' &&
+              Number.isInteger(targetFindingIndex) &&
+              targetFindingIndex >= 0 &&
+              targetFindingIndex < keyFindings.length) ||
+            (typeof src.targetFinding === 'string' && src.targetFinding.trim().length > 0);
+
+          if (!hasValidTarget) {
+            // Missing or malformed target finding: fail conservatively without creating unsupported CONTRADICTS
+            return {
+              ...src,
+              relationship: undefined
+            };
+          }
+        }
+
+        return {
+          ...src,
+          relationship: src.relationship,
+          targetFindingIndex,
+          targetFindingIndices
+        };
+      }
+
+      // 2. If source directly contributed evidence that formulated a key finding, assign SUPPORTS
       if (supportedIndices && supportedIndices.length > 0) {
         return {
           ...src,
@@ -778,14 +817,13 @@ export class ResearchAgent extends BaseAgent {
           targetFindingIndices: supportedIndices
         };
       }
-      if (negSource && src.id === negSource.id && posSource && posSource.id !== negSource.id) {
-        return {
-          ...src,
-          relationship: 'CONTRADICTS' as const
-        };
-      }
-      // Background or cited source without explicit support relationship
-      return src;
+
+      // 3. Background, cited, or unestablished sources retain citation metadata without
+      // creating an unsupported evidence relationship.
+      return {
+        ...src,
+        relationship: undefined
+      };
     });
 
     // 4. Limitations and uncertainty

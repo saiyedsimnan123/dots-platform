@@ -276,10 +276,22 @@ export function extractResearchProposals(
       // Single finding: proposal is research.finding.${questionSlug}
       const evidenceList: CandidateEvidence[] = [];
       for (const s of sources) {
-        // Exclude out-of-bounds finding targets
-        if (typeof s.targetFindingIndex === 'number' && s.targetFindingIndex !== 0) {
+        if (!s || typeof s !== 'object') continue;
+
+        // If source has an explicit finding target specified:
+        if (hasExplicitFindingTarget(s, 1)) {
+          // Must target finding 0; if it targets another finding, reject
+          if (!sourceTargetsFinding(s, 0, findings)) {
+            continue;
+          }
+        } else if (typeof s.targetFindingIndex === 'number' || Array.isArray(s.targetFindingIndices)) {
+          // Malformed or out-of-bounds numerical target index (e.g. 999 or -1): reject
+          continue;
+        } else if (s.relationship === 'CONTRADICTS') {
+          // CONTRADICTS requires an explicit validated target finding; reject if untargeted
           continue;
         }
+
         evidenceList.push(...extractSourceEvidence(s));
       }
 
@@ -345,6 +357,10 @@ export function extractResearchProposals(
         const generalSources = sources.filter((s) => !hasExplicitFindingTarget(s, findings.length));
         const generalEvidence: CandidateEvidence[] = [];
         for (const s of generalSources) {
+          // General sources lack specific finding attribution; CONTRADICTS is never allowed without a target finding
+          if (s?.relationship === 'CONTRADICTS') {
+            continue;
+          }
           generalEvidence.push(...extractSourceEvidence(s));
         }
 

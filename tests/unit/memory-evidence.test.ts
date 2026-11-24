@@ -1242,3 +1242,276 @@ test('22. Research evidence attribution - research limitations proposal does not
   assert.ok(limitationProposal);
   assert.equal(limitationProposal.evidence, undefined, 'Limitations proposal must never receive SUPPORTS evidence');
 });
+
+// ============================================================================
+// 23. Research evidence attribution - explicit validated contradiction for same finding is preserved
+// ============================================================================
+test('23. Research evidence attribution - explicit validated contradiction for same finding is preserved', () => {
+  const output = makeAgentOutput({
+    status: 'COMPLETED',
+    result: {
+      report: {
+        completionStatus: 'SUCCESS',
+        researchQuestion: 'Paxos consensus fault tolerance boundaries',
+        keyFindings: [
+          'Basic Paxos guarantees safety in asynchronous networks with crash-stop failures.'
+        ],
+        evidenceAndSources: [
+          {
+            id: 'src-paxos-supports',
+            title: 'Paxos Made Simple',
+            url: 'https://lamport.example/paxos-simple',
+            domain: 'lamport.example',
+            relationship: 'SUPPORTS',
+            targetFindingIndex: 0,
+            relevantEvidence: ['Consensus is guaranteed as long as a majority of acceptors are non-faulty.']
+          },
+          {
+            id: 'src-paxos-contradicts',
+            title: 'Byzantine Paxos Study',
+            url: 'https://security.example/byzantine-flaws',
+            domain: 'security.example',
+            relationship: 'CONTRADICTS',
+            targetFindingIndex: 0,
+            relevantEvidence: ['Basic Paxos violates safety under Byzantine or arbitrary message corruption.']
+          }
+        ]
+      }
+    }
+  });
+
+  const proposals = extractResearchProposals(output, 'Paxos consensus fault tolerance');
+  assert.equal(proposals.length, 1);
+  const proposal = proposals[0];
+  assert.ok(proposal.evidence);
+  assert.equal(proposal.evidence.length, 2);
+
+  const supports = proposal.evidence.find((e) => e.relationship === 'SUPPORTS');
+  assert.ok(supports, 'Explicit SUPPORTS evidence must be preserved');
+  assert.equal(supports.sourceDomain, 'lamport.example');
+
+  const contradicts = proposal.evidence.find((e) => e.relationship === 'CONTRADICTS');
+  assert.ok(contradicts, 'Explicit validated CONTRADICTS evidence targeting same finding must be preserved');
+  assert.equal(contradicts.sourceDomain, 'security.example');
+});
+
+// ============================================================================
+// 24. Research evidence attribution - contradiction attribution to a different finding is rejected
+// ============================================================================
+test('24. Research evidence attribution - contradiction attribution to a different finding is rejected', () => {
+  // Scenario A: Multiple findings where contradiction targets Finding 1, must not attach to Finding 0
+  const multiOutput = makeAgentOutput({
+    status: 'COMPLETED',
+    result: {
+      report: {
+        completionStatus: 'SUCCESS',
+        researchQuestion: 'Raft versus Multi-Paxos replication architectures',
+        keyFindings: [
+          'Multi-Paxos optimizes throughput by amortizing leader election across instances.',
+          'Raft enforces strong leader log invariant to simplify recovery reasoning.'
+        ],
+        evidenceAndSources: [
+          {
+            id: 'src-paxos-sup',
+            title: 'Multi-Paxos Guide',
+            url: 'https://example.com/multi-paxos',
+            domain: 'example.com',
+            relationship: 'SUPPORTS',
+            targetFindingIndex: 0,
+            relevantEvidence: ['Phase 1 can be skipped after leader is recognized.']
+          },
+          {
+            id: 'src-raft-contra',
+            title: 'Raft Split-Brain Analysis',
+            url: 'https://example.com/raft-critique',
+            domain: 'example.com',
+            relationship: 'CONTRADICTS',
+            targetFindingIndex: 1, // Explicitly targets Finding 1
+            relevantEvidence: ['Raft election timeouts can trigger livelock during asymmetric network partitions.']
+          }
+        ]
+      }
+    }
+  });
+
+  const multiProposals = extractResearchProposals(multiOutput, 'Raft vs Multi-Paxos');
+  assert.equal(multiProposals.length, 3); // Finding 0 + Finding 1 + Composite
+
+  const finding0 = multiProposals[0];
+  assert.ok(finding0.evidence);
+  assert.equal(finding0.evidence.length, 1);
+  assert.equal(finding0.evidence[0].relationship, 'SUPPORTS');
+  assert.equal(
+    finding0.evidence.some((e) => e.relationship === 'CONTRADICTS'),
+    false,
+    'Contradiction targeting Finding 1 must NOT attach to Finding 0'
+  );
+
+  const finding1 = multiProposals[1];
+  assert.ok(finding1.evidence);
+  assert.equal(finding1.evidence.length, 1);
+  assert.equal(finding1.evidence[0].relationship, 'CONTRADICTS');
+
+  // Scenario B: Single finding where contradiction explicitly targets a different (out-of-bounds) finding
+  const singleOutput = makeAgentOutput({
+    status: 'COMPLETED',
+    result: {
+      report: {
+        completionStatus: 'SUCCESS',
+        researchQuestion: 'Event-driven architecture performance',
+        keyFindings: [
+          'Event streaming decoupled publishers and consumers for linear throughput scaling.'
+        ],
+        evidenceAndSources: [
+          {
+            id: 'src-event-sup',
+            title: 'Kafka Architecture',
+            url: 'https://kafka.example/overview',
+            domain: 'kafka.example',
+            relationship: 'SUPPORTS',
+            targetFindingIndex: 0,
+            relevantEvidence: ['Partitioned logs provide horizontal scalability.']
+          },
+          {
+            id: 'src-wrong-target',
+            title: 'Unrelated RPC Finding Contradiction',
+            url: 'https://rpc.example/contra',
+            domain: 'rpc.example',
+            relationship: 'CONTRADICTS',
+            targetFindingIndex: 1, // Finding 1 does not exist in single-finding report!
+            relevantEvidence: ['Synchronous RPC introduces cascading failure bottlenecks.']
+          },
+          {
+            id: 'src-wrong-string-target',
+            title: 'Different Claim Contradiction',
+            url: 'https://rpc.example/contra-str',
+            domain: 'rpc.example',
+            relationship: 'CONTRADICTS',
+            targetFinding: 'Completely different claim that does not match Finding 0',
+            relevantEvidence: ['Different claim evidence.']
+          }
+        ]
+      }
+    }
+  });
+
+  const singleProposals = extractResearchProposals(singleOutput, 'Event streaming');
+  assert.equal(singleProposals.length, 1);
+  const singleFinding = singleProposals[0];
+  assert.ok(singleFinding.evidence);
+  assert.equal(singleFinding.evidence.length, 1, 'Only Source targeting Finding 0 should be attached');
+  assert.equal(singleFinding.evidence[0].relationship, 'SUPPORTS');
+  assert.equal(
+    singleFinding.evidence.some((e) => e.relationship === 'CONTRADICTS'),
+    false,
+    'Contradiction targeting a different finding must be rejected'
+  );
+});
+
+// ============================================================================
+// 25. Research evidence attribution - missing or malformed relationship information produces no unsupported contradiction
+// ============================================================================
+test('25. Research evidence attribution - missing or malformed relationship info produces no unsupported contradiction', () => {
+  const output = makeAgentOutput({
+    status: 'COMPLETED',
+    result: {
+      report: {
+        completionStatus: 'SUCCESS',
+        researchQuestion: 'Zero-knowledge proof verification latency',
+        keyFindings: [
+          'Groth16 proofs verify in under 5ms on commodity consumer hardware.'
+        ],
+        evidenceAndSources: [
+          {
+            id: 'src-no-target',
+            title: 'Generic Cryptography Paper',
+            url: 'https://crypto.example/paper',
+            domain: 'crypto.example',
+            relationship: 'CONTRADICTS',
+            // Missing targetFindingIndex and targetFinding!
+            relevantEvidence: ['Proof generation requires significant computational memory.']
+          },
+          {
+            id: 'src-out-of-bounds-999',
+            title: 'Out of Bounds Target',
+            url: 'https://crypto.example/oob',
+            domain: 'crypto.example',
+            relationship: 'CONTRADICTS',
+            targetFindingIndex: 999,
+            relevantEvidence: ['Invalid target snippet.']
+          },
+          {
+            id: 'src-negative-index',
+            title: 'Negative Target Index',
+            url: 'https://crypto.example/neg',
+            domain: 'crypto.example',
+            relationship: 'CONTRADICTS',
+            targetFindingIndex: -1,
+            relevantEvidence: ['Negative target snippet.']
+          }
+        ]
+      }
+    }
+  });
+
+  const proposals = extractResearchProposals(output, 'ZK proof verification');
+  assert.equal(proposals.length, 1);
+  const proposal = proposals[0];
+
+  // All malformed or untargeted CONTRADICTS sources must fail closed without creating evidence
+  assert.equal(proposal.evidence, undefined, 'Untargeted or out-of-bounds CONTRADICTS must produce no evidence records');
+});
+
+// ============================================================================
+// 26. Research evidence attribution - complementary trade-offs produce no CONTRADICTS evidence
+// ============================================================================
+test("26. Research evidence attribution - complementary trade-offs ('faster' vs 'limitation') produce no CONTRADICTS evidence", () => {
+  const output = makeAgentOutput({
+    status: 'COMPLETED',
+    result: {
+      report: {
+        completionStatus: 'SUCCESS',
+        researchQuestion: 'DuckDB vs SQLite for analytical embedded pipelines',
+        keyFindings: [
+          'DuckDB is faster than SQLite for columnar analytical aggregate queries.',
+          'DuckDB has a memory limitation and higher per-connection overhead in concurrent web backends.'
+        ],
+        evidenceAndSources: [
+          {
+            id: 'src-duckdb-perf',
+            title: 'DuckDB Benchmark Blog',
+            url: 'https://duckdb.example/perf',
+            domain: 'duckdb.example',
+            relationship: 'SUPPORTS',
+            targetFindingIndex: 0,
+            relevantEvidence: ['DuckDB delivers 10x faster execution for columnar scans and group-by queries.']
+          },
+          {
+            id: 'src-duckdb-limits',
+            title: 'DuckDB Concurrency Whitepaper',
+            url: 'https://duckdb.example/concurrency',
+            domain: 'duckdb.example',
+            relationship: 'SUPPORTS',
+            targetFindingIndex: 1,
+            relevantEvidence: ['DuckDB has high RAM usage per thread, presenting an operational limitation for multi-tenant services.']
+          }
+        ]
+      }
+    }
+  });
+
+  const proposals = extractResearchProposals(output, 'DuckDB analytical pipelines');
+  assert.equal(proposals.length, 3); // Finding 0 + Finding 1 + Composite
+
+  const finding0 = proposals[0];
+  assert.ok(finding0.evidence);
+  assert.equal(finding0.evidence[0].relationship, 'SUPPORTS');
+
+  const finding1 = proposals[1];
+  assert.ok(finding1.evidence);
+  assert.equal(finding1.evidence[0].relationship, 'SUPPORTS');
+
+  // Verify that no CONTRADICTS evidence exists across any proposal
+  const allEvidence = proposals.flatMap((p) => p.evidence ?? []);
+  assert.equal(allEvidence.some((e) => e.relationship === 'CONTRADICTS'), false, 'Complementary trade-offs must not produce CONTRADICTS');
+});
