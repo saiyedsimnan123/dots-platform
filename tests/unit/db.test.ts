@@ -503,12 +503,13 @@ test('DatabaseManager - ordinary migrations execute with FK enforcement enabled 
 
   // Verify all migrations recorded in order
   const applied = db.prepare('SELECT version FROM schema_migrations ORDER BY id ASC').all() as Array<{ version: string }>;
-  assert.equal(applied.length, 12);
+  assert.equal(applied.length, 13);
   assert.equal(applied[7].version, '008_memory_supersession');
   assert.equal(applied[8].version, '009_memory_evidence');
   assert.equal(applied[9].version, '010_memory_claims');
   assert.equal(applied[10].version, '011_claim_evidence_verifications');
   assert.equal(applied[11].version, '012_claim_evidence_associations');
+  assert.equal(applied[12].version, '013_verification_lifecycle_integrity');
   db.close();
 
   // 2. Existing database migration upgrade from 007 to 008 with populated child records

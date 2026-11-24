@@ -39,6 +39,7 @@ import type { EvidenceVerificationEngine } from './evidence-verifier.ts';
 import { defaultSecretScrubber } from '../model/secret-scrubber.ts';
 import { sanitizeProposalMetadata } from '../tools/memory-tools.ts';
 import { BASIC_ENGLISH_STOP_WORDS } from './relevance-matcher.ts';
+import { normalizeVerificationAssumptions } from './claim-normalizer.ts';
 
 export interface CandidateMemoryProposal {
   readonly key: string;
@@ -158,15 +159,101 @@ export function extractResearchProposals(
   const proposals: CandidateMemoryProposal[] = [];
   const questionSlug = slugify(question, 45);
 
-  const findings: string[] = Array.isArray(report.keyFindings)
-    ? report.keyFindings.filter((f: unknown): f is string => typeof f === 'string' && f.trim().length > 0)
-    : [];
+  const rawFindings: unknown[] = Array.isArray(report.keyFindings) ? report.keyFindings : [];
+  const findingQualifiersRaw = report.findingQualifiers;
+  const findingClaims: CandidateClaim[] = [];
+  const findings: string[] = [];
+
+  for (let i = 0; i < rawFindings.length; i++) {
+    const entry = rawFindings[i];
+    let text = '';
+    let qualifierParts: string[] = [];
+    let subject: string | undefined;
+    let predicate: string | undefined;
+
+    if (typeof entry === 'string') {
+      text = entry.trim();
+    } else if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+      const obj = entry as Record<string, unknown>;
+      const rawText = obj.claim ?? obj.text ?? obj.finding;
+      if (typeof rawText === 'string') {
+        text = rawText.trim();
+      }
+      for (const qKey of ['qualifier', 'condition', 'operatingConditions', 'workload', 'scope'] as const) {
+        if (typeof obj[qKey] === 'string' && (obj[qKey] as string).trim() !== '') {
+          qualifierParts.push(defaultSecretScrubber.scrub((obj[qKey] as string).trim()));
+        }
+      }
+      if (typeof obj.subject === 'string' && obj.subject.trim() !== '') {
+        subject = defaultSecretScrubber.scrub(obj.subject.trim()).slice(0, 200);
+      }
+      if (typeof obj.predicate === 'string' && obj.predicate.trim() !== '') {
+        predicate = defaultSecretScrubber.scrub(obj.predicate.trim()).slice(0, 200);
+      }
+    }
+
+    if (!text) {
+      continue;
+    }
+
+    const findingIdx = findings.length;
+    if (Array.isArray(findingQualifiersRaw)) {
+      const fq = findingQualifiersRaw[i] ?? findingQualifiersRaw[findingIdx];
+      if (typeof fq === 'string' && fq.trim() !== '') {
+        qualifierParts.push(defaultSecretScrubber.scrub(fq.trim()));
+      }
+    } else if (findingQualifiersRaw && typeof findingQualifiersRaw === 'object') {
+      const mapObj = findingQualifiersRaw as Record<string, unknown>;
+      const fq = mapObj[String(i)] ?? mapObj[String(findingIdx)] ?? mapObj[text];
+      if (typeof fq === 'string' && fq.trim() !== '') {
+        qualifierParts.push(defaultSecretScrubber.scrub(fq.trim()));
+      }
+    }
+
+    const qualifier = qualifierParts.length > 0
+      ? Array.from(new Set(qualifierParts)).join('; ').slice(0, 300)
+      : undefined;
+
+    findings.push(text);
+    findingClaims.push({
+      originalText: text,
+      ...(subject ? { subject } : {}),
+      ...(predicate ? { predicate } : {}),
+      ...(qualifier ? { qualifier } : {})
+    });
+  }
 
   const sources: any[] = Array.isArray(report.evidenceAndSources) ? report.evidenceAndSources : [];
   const agreements: string[] = Array.isArray(report.agreements) ? report.agreements : [];
   const conflicting: string[] = Array.isArray(report.conflictingEvidence) ? report.conflictingEvidence : [];
   const limitations: string[] = Array.isArray(report.limitationsAndUncertainty) ? report.limitationsAndUncertainty : [];
   const openQuestions: string[] = Array.isArray(report.openQuestions) ? report.openQuestions : [];
+  const unverifiedClaims: string[] = Array.isArray(report.unverifiedClaims) ? report.unverifiedClaims : [];
+
+  const rawAssumptionStrings: string[] = [];
+  for (const field of ['assumptions', 'conditions', 'operatingConditions'] as const) {
+    const val = report[field];
+    if (Array.isArray(val)) {
+      for (const item of val) {
+        if (typeof item === 'string' && item.trim() !== '') {
+          rawAssumptionStrings.push(defaultSecretScrubber.scrub(item.trim()));
+        }
+      }
+    } else if (typeof val === 'string' && val.trim() !== '') {
+      rawAssumptionStrings.push(defaultSecretScrubber.scrub(val.trim()));
+    }
+  }
+  for (const lim of limitations) {
+    if (typeof lim === 'string' && lim.trim() !== '') {
+      rawAssumptionStrings.push(`Limitation: ${defaultSecretScrubber.scrub(lim.trim())}`);
+    }
+  }
+  for (const unc of unverifiedClaims) {
+    if (typeof unc === 'string' && unc.trim() !== '') {
+      rawAssumptionStrings.push(`Uncertainty: ${defaultSecretScrubber.scrub(unc.trim())}`);
+    }
+  }
+  const verificationAssumptions = normalizeVerificationAssumptions(rawAssumptionStrings);
 
   // Helper: extract CandidateEvidence records from a source ONLY if relationship is explicitly established
   function extractSourceEvidence(s: any, targetClaimIndices?: readonly number[]): CandidateEvidence[] {
@@ -365,10 +452,11 @@ export function extractResearchProposals(
           agentType: 'research',
           question,
           findingsCount: 1,
-          sourcesCount: sources.length
+          sourcesCount: sources.length,
+          ...(verificationAssumptions.length > 0 ? { verificationAssumptions } : {})
         },
         evidence: evidenceList.length > 0 ? evidenceList : undefined,
-        claims: [{ originalText: findings[0]! }]
+        claims: [findingClaims[0]!]
       });
     } else {
       // Multiple findings: resolve explicit source-to-finding references fail-closed
@@ -409,10 +497,11 @@ export function extractResearchProposals(
               question,
               findingIndex: i,
               finding: claim,
-              sourcesCount: targetedSources.length
+              sourcesCount: targetedSources.length,
+              ...(verificationAssumptions.length > 0 ? { verificationAssumptions } : {})
             },
             evidence: findingEvidence.length > 0 ? findingEvidence : undefined,
-            claims: [{ originalText: claim }]
+            claims: [findingClaims[i]!]
           });
         }
 
@@ -439,10 +528,11 @@ export function extractResearchProposals(
             agentType: 'research',
             question,
             findingsCount: findings.length,
-            sourcesCount: sources.length
+            sourcesCount: sources.length,
+            ...(verificationAssumptions.length > 0 ? { verificationAssumptions } : {})
           },
           evidence: generalEvidence.length > 0 ? generalEvidence : undefined,
-          claims: findings.map((f) => ({ originalText: f }))
+          claims: [...findingClaims]
         });
       } else {
         // No explicit source-to-finding targets: preserve composite proposal.
@@ -458,10 +548,11 @@ export function extractResearchProposals(
             agentType: 'research',
             question,
             findingsCount: findings.length,
-            sourcesCount: sources.length
+            sourcesCount: sources.length,
+            ...(verificationAssumptions.length > 0 ? { verificationAssumptions } : {})
           },
           evidence: undefined,
-          claims: findings.map((f) => ({ originalText: f }))
+          claims: [...findingClaims]
         });
       }
     }
@@ -1152,7 +1243,17 @@ export class KnowledgeProposalPipeline {
           candidate.evidence.length > 0
         ) {
           try {
-            await options.verificationEngine.verifyProposalClaims(caller, memory.id);
+            const candidateAssumptions = Array.isArray(candidate.metadata?.verificationAssumptions)
+              ? (candidate.metadata.verificationAssumptions as unknown[])
+                  .filter((item): item is string => typeof item === 'string' && item.trim() !== '')
+              : undefined;
+            await options.verificationEngine.verifyProposalClaims(
+              caller,
+              memory.id,
+              candidateAssumptions && candidateAssumptions.length > 0
+                ? { assumptions: candidateAssumptions }
+                : undefined
+            );
           } catch {
             // Verification failure or unavailability must never fail proposal creation or the research task
           }

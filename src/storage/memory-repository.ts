@@ -39,12 +39,16 @@ import type {
   CreateClaimVerificationInput,
   ListClaimVerificationsFilter,
   ClaimEvidenceAssociation,
-  CreateClaimEvidenceAssociationInput
+  CreateClaimEvidenceAssociationInput,
+  ClaimAssociationStatus,
+  ClaimVerificationLifecycleStatus
 } from '../domain/types.ts';
 import {
   canonicalizeClaimText,
   computeClaimHash,
-  computeClaimId
+  computeClaimId,
+  normalizeVerificationAssumptions,
+  computeVerificationAssumptionsHash
 } from '../memory/claim-normalizer.ts';
 import type {
   MissingEmbeddingMemoryRecord,
@@ -90,10 +94,13 @@ export function computeClaimVerificationId(
   evidenceId: string,
   verifierId: string,
   verifierVersion: string,
-  promptPolicyHash: string
+  promptPolicyHash: string,
+  assumptionsHash: string = ''
 ): string {
+  const base = `${claimId}:${evidenceId}:${verifierId}:${verifierVersion}:${promptPolicyHash}`;
+  const material = assumptionsHash ? `${base}:${assumptionsHash}` : base;
   return createHash('sha256')
-    .update(`${claimId}:${evidenceId}:${verifierId}:${verifierVersion}:${promptPolicyHash}`, 'utf8')
+    .update(material, 'utf8')
     .digest('hex');
 }
 
@@ -174,9 +181,14 @@ interface ClaimVerificationDbRow {
   verifier_version: string;
   prompt_policy_version: string;
   prompt_policy_hash: string;
+  assumptions_hash: string;
+  assumptions_json: string;
   confidence: number | null;
   explanation: string;
   review_recommended: number;
+  status: string;
+  stale_at: string | null;
+  stale_reason: string | null;
   task_id: string | null;
   created_at: string;
 }
@@ -189,6 +201,9 @@ interface ClaimEvidenceAssociationDbRow {
   scope_type: string;
   scope_id: string;
   relationship: string;
+  status: string;
+  invalidated_at: string | null;
+  invalidation_reason: string | null;
   created_at: string;
 }
 
@@ -601,6 +616,11 @@ export class MemoryRepository {
     if (!existing) {
       throw new MemoryNotFoundError(id);
     }
+    if (existing.status === 'SUPERSEDED') {
+      throw new ValidationError(
+        `Cannot update memory '${id}': record is superseded. Superseded memories are immutable historical records.`
+      );
+    }
 
     const updates: string[] = [];
     const params: SqlParam[] = [];
@@ -687,6 +707,7 @@ export class MemoryRepository {
 
   /**
    * Sets status to 'ARCHIVED' without deleting the record.
+   * Marks any CURRENT claim-evidence verifications backed by this memory's evidence as STALE.
    */
   public archiveMemory(id: string, scope: ScopeIdentifier): Memory {
     const existing = this.getMemoryById(id, scope);
@@ -696,7 +717,84 @@ export class MemoryRepository {
     if (existing.status === 'SUPERSEDED') {
       throw new ValidationError(`Cannot archive memory '${id}': record is superseded. Superseded memories are immutable historical records.`);
     }
-    return this.updateMemory(id, scope, { status: 'ARCHIVED' });
+    return this.transaction(() => {
+      const archived = this.updateMemory(id, scope, { status: 'ARCHIVED' });
+      this.markMemoryVerificationsStale(id, scope, 'MEMORY_ARCHIVED', archived.updatedAt);
+      return archived;
+    });
+  }
+
+  /**
+   * Invalidates active claim links and claim-evidence associations belonging to a memory
+   * and marks any CURRENT verifications backed by that memory's evidence as STALE, preserving history.
+   */
+  public invalidateMemoryVerificationLifecycle(
+    memoryId: string,
+    scope: ScopeIdentifier,
+    reason: string = 'MEMORY_CONTENT_UPDATED',
+    timestamp?: string
+  ): {
+    readonly invalidatedClaimLinks: number;
+    readonly invalidatedAssociations: number;
+    readonly staledVerifications: number;
+  } {
+    if (!memoryId || typeof memoryId !== 'string' || memoryId.trim() === '') {
+      throw new ValidationError('Memory ID must be a non-empty string.');
+    }
+    if (!scope || typeof scope !== 'object') {
+      throw new ValidationError('Scope must be provided to invalidateMemoryVerificationLifecycle.');
+    }
+    this.validateScope(scope.scopeType, scope.scopeId);
+
+    const trimmedMemoryId = memoryId.trim();
+    const now = timestamp && timestamp.trim() !== '' ? timestamp.trim() : new Date().toISOString();
+
+    const linkResult = this.db.prepare(`
+      UPDATE memory_claim_links
+      SET status = 'INVALIDATED', invalidated_at = ?, invalidation_reason = ?
+      WHERE memory_id = ?
+        AND scope_type = ?
+        AND scope_id = ?
+        AND status = 'ACTIVE'
+    `).run(now, reason, trimmedMemoryId, scope.scopeType, scope.scopeId);
+
+    const assocResult = this.db.prepare(`
+      UPDATE claim_evidence_associations
+      SET status = 'INVALIDATED', invalidated_at = ?, invalidation_reason = ?
+      WHERE memory_id = ?
+        AND scope_type = ?
+        AND scope_id = ?
+        AND status = 'ACTIVE'
+    `).run(now, reason, trimmedMemoryId, scope.scopeType, scope.scopeId);
+
+    const staledVerifications = this.markMemoryVerificationsStale(trimmedMemoryId, scope, reason, now);
+
+    return {
+      invalidatedClaimLinks: Number(linkResult.changes ?? 0),
+      invalidatedAssociations: Number(assocResult.changes ?? 0),
+      staledVerifications
+    };
+  }
+
+  public markMemoryVerificationsStale(
+    memoryId: string,
+    scope: ScopeIdentifier,
+    reason: string,
+    timestamp?: string
+  ): number {
+    this.validateScope(scope.scopeType, scope.scopeId);
+    const now = timestamp && timestamp.trim() !== '' ? timestamp.trim() : new Date().toISOString();
+    const res = this.db.prepare(`
+      UPDATE claim_evidence_verifications
+      SET status = 'STALE', stale_at = ?, stale_reason = ?
+      WHERE scope_type = ?
+        AND scope_id = ?
+        AND status = 'CURRENT'
+        AND evidence_id IN (
+          SELECT id FROM memory_evidence WHERE memory_id = ?
+        )
+    `).run(now, reason, scope.scopeType, scope.scopeId, memoryId.trim());
+    return Number(res.changes ?? 0);
   }
 
   /**
@@ -1016,9 +1114,13 @@ export class MemoryRepository {
       throw new ValidationError('Claim text cannot be empty or consist solely of citation markers.');
     }
 
+    const subject = typeof input.subject === 'string' && input.subject.trim() !== '' ? input.subject.trim() : null;
+    const predicate = typeof input.predicate === 'string' && input.predicate.trim() !== '' ? input.predicate.trim() : null;
+    const qualifier = typeof input.qualifier === 'string' && input.qualifier.trim() !== '' ? input.qualifier.trim() : null;
+
     const claimHash = input.claimHash && input.claimHash.trim() !== ''
       ? input.claimHash.trim()
-      : computeClaimHash(canonicalText);
+      : computeClaimHash(canonicalText, { subject, predicate, qualifier });
 
     const id = input.id && input.id.trim() !== ''
       ? input.id.trim()
@@ -1070,10 +1172,6 @@ export class MemoryRepository {
       }
       return existingByHash;
     }
-
-    const subject = typeof input.subject === 'string' && input.subject.trim() !== '' ? input.subject.trim() : null;
-    const predicate = typeof input.predicate === 'string' && input.predicate.trim() !== '' ? input.predicate.trim() : null;
-    const qualifier = typeof input.qualifier === 'string' && input.qualifier.trim() !== '' ? input.qualifier.trim() : null;
 
     const stmt = this.db.prepare(`
       INSERT INTO memory_claims (
@@ -1180,12 +1278,17 @@ export class MemoryRepository {
    * Retrieves all atomic claims linked to a memory or proposal.
    * If scope is provided, verifies that the memory belongs to the designated scope.
    */
-  public getClaimsByMemoryId(memoryId: string, scope?: ScopeIdentifier): MemoryClaim[] {
+  public getClaimsByMemoryId(
+    memoryId: string,
+    scope?: ScopeIdentifier,
+    options?: { readonly includeInvalidated?: boolean }
+  ): MemoryClaim[] {
     if (!memoryId || typeof memoryId !== 'string' || memoryId.trim() === '') {
       throw new ValidationError('Memory ID must be a non-empty string.');
     }
 
     const trimmedMemoryId = memoryId.trim();
+    const activeClause = options?.includeInvalidated ? '' : " AND mcl.status = 'ACTIVE'";
     if (scope) {
       this.validateScope(scope.scopeType, scope.scopeId);
       const rows = this.db.prepare(`
@@ -1199,7 +1302,7 @@ export class MemoryRepository {
           AND mcl.scope_type = ?
           AND mcl.scope_id = ?
           AND c.scope_type = ?
-          AND c.scope_id = ?
+          AND c.scope_id = ?${activeClause}
         ORDER BY c.created_at ASC, c.id ASC
       `).all(
         trimmedMemoryId,
@@ -1218,7 +1321,7 @@ export class MemoryRepository {
       SELECT c.*
       FROM memory_claims c
       INNER JOIN memory_claim_links mcl ON mcl.claim_id = c.id
-      WHERE mcl.memory_id = ?
+      WHERE mcl.memory_id = ?${activeClause}
       ORDER BY c.created_at ASC, c.id ASC
     `).all(trimmedMemoryId) as unknown as ClaimDbRow[];
 
@@ -1243,8 +1346,9 @@ export class MemoryRepository {
     }
 
     if (filter.memoryId) {
+      const linkStatusClause = filter.includeInvalidated ? '' : " AND mcl.status = 'ACTIVE'";
       conditions.push(
-        'EXISTS (SELECT 1 FROM memory_claim_links mcl WHERE mcl.claim_id = memory_claims.id AND mcl.memory_id = ? AND mcl.scope_type = memory_claims.scope_type AND mcl.scope_id = memory_claims.scope_id)'
+        `EXISTS (SELECT 1 FROM memory_claim_links mcl WHERE mcl.claim_id = memory_claims.id AND mcl.memory_id = ? AND mcl.scope_type = memory_claims.scope_type AND mcl.scope_id = memory_claims.scope_id${linkStatusClause})`
       );
       params.push(filter.memoryId.trim());
     }
@@ -1299,6 +1403,14 @@ export class MemoryRepository {
     const verifierVersion = input.verifierVersion.trim();
     const promptPolicyVersion = input.promptPolicyVersion.trim();
     const promptPolicyHash = input.promptPolicyHash.trim();
+    const assumptions = normalizeVerificationAssumptions(input.assumptions);
+    const assumptionsHash = input.assumptionsHash !== undefined
+      ? input.assumptionsHash.trim()
+      : computeVerificationAssumptionsHash(assumptions);
+    const assumptionsJson = JSON.stringify(assumptions);
+    const status: ClaimVerificationLifecycleStatus = input.status ?? 'CURRENT';
+    const staleAt = status === 'STALE' ? (input.staleAt ?? input.createdAt ?? new Date().toISOString()) : null;
+    const staleReason = status === 'STALE' ? (input.staleReason ?? 'INVALIDATED') : null;
     const scope: ScopeIdentifier = { scopeType: input.scopeType, scopeId: input.scopeId };
 
     // Verify both claim and evidence exist strictly inside this scope
@@ -1311,25 +1423,28 @@ export class MemoryRepository {
       throw new ValidationError(`Evidence '${evidenceId}' was not found in scope '${scope.scopeType}:${scope.scopeId}'.`);
     }
 
-    const id = input.id && input.id.trim() !== ''
-      ? input.id.trim()
-      : computeClaimVerificationId(claimId, evidenceId, verifierId, verifierVersion, promptPolicyHash);
-
-    const existingById = this.getClaimVerificationById(id, scope);
-    if (existingById) {
-      return existingById;
+    if (status === 'CURRENT') {
+      const existingByKey = this.findClaimVerification({
+        claimId,
+        evidenceId,
+        verifierId,
+        verifierVersion,
+        promptPolicyHash,
+        assumptionsHash,
+        scope
+      });
+      if (existingByKey) {
+        return existingByKey;
+      }
     }
 
-    const existingByKey = this.findClaimVerification({
-      claimId,
-      evidenceId,
-      verifierId,
-      verifierVersion,
-      promptPolicyHash,
-      scope
-    });
-    if (existingByKey) {
-      return existingByKey;
+    const baseId = input.id && input.id.trim() !== ''
+      ? input.id.trim()
+      : computeClaimVerificationId(claimId, evidenceId, verifierId, verifierVersion, promptPolicyHash, assumptionsHash);
+    const existingById = this.getClaimVerificationById(baseId, scope);
+    const id = existingById ? randomUUID() : baseId;
+    if (existingById && existingById.status === 'CURRENT' && status === 'CURRENT') {
+      return existingById;
     }
 
     const confidence = input.confidence === undefined || input.confidence === null ? null : input.confidence;
@@ -1343,8 +1458,11 @@ export class MemoryRepository {
         id, claim_id, evidence_id, scope_type, scope_id,
         proposed_relationship, verification_outcome,
         verifier_id, verifier_version, prompt_policy_version, prompt_policy_hash,
-        confidence, explanation, review_recommended, task_id, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        assumptions_hash, assumptions_json,
+        confidence, explanation, review_recommended,
+        status, stale_at, stale_reason,
+        task_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     try {
@@ -1360,9 +1478,14 @@ export class MemoryRepository {
         verifierVersion,
         promptPolicyVersion,
         promptPolicyHash,
+        assumptionsHash,
+        assumptionsJson,
         confidence,
         explanation,
         reviewRecommended ? 1 : 0,
+        status,
+        staleAt,
+        staleReason,
         taskId,
         now
       );
@@ -1375,6 +1498,7 @@ export class MemoryRepository {
           verifierId,
           verifierVersion,
           promptPolicyHash,
+          assumptionsHash,
           scope
         });
         if (raceRow) {
@@ -1396,9 +1520,14 @@ export class MemoryRepository {
       verifierVersion,
       promptPolicyVersion,
       promptPolicyHash,
+      assumptionsHash,
+      assumptions,
       confidence,
       explanation,
       reviewRecommended,
+      status,
+      staleAt,
+      staleReason,
       taskId,
       createdAt: now
     };
@@ -1434,9 +1563,11 @@ export class MemoryRepository {
     readonly verifierId: string;
     readonly verifierVersion: string;
     readonly promptPolicyHash: string;
+    readonly assumptionsHash?: string;
     readonly scope: ScopeIdentifier;
   }): ClaimEvidenceVerification | null {
     this.validateScope(params.scope.scopeType, params.scope.scopeId);
+    const assumptionsHash = params.assumptionsHash !== undefined ? params.assumptionsHash.trim() : '';
     const row = this.db.prepare(`
       SELECT * FROM claim_evidence_verifications
       WHERE claim_id = ?
@@ -1444,6 +1575,8 @@ export class MemoryRepository {
         AND verifier_id = ?
         AND verifier_version = ?
         AND prompt_policy_hash = ?
+        AND assumptions_hash = ?
+        AND status = 'CURRENT'
         AND scope_type = ?
         AND scope_id = ?
     `).get(
@@ -1452,6 +1585,7 @@ export class MemoryRepository {
       params.verifierId.trim(),
       params.verifierVersion.trim(),
       params.promptPolicyHash.trim(),
+      assumptionsHash,
       params.scope.scopeType,
       params.scope.scopeId
     ) as unknown as ClaimVerificationDbRow | undefined;
@@ -1509,11 +1643,11 @@ export class MemoryRepository {
     const linked = this.db.prepare(`
       SELECT 1 AS present
       FROM memory_claim_links
-      WHERE memory_id = ? AND claim_id = ? AND scope_type = ? AND scope_id = ?
+      WHERE memory_id = ? AND claim_id = ? AND scope_type = ? AND scope_id = ? AND status = 'ACTIVE'
     `).get(memory.id, claim.id, scope.scopeType, scope.scopeId) as { present: number } | undefined;
-    if (!linked && claim.memoryId !== memory.id) {
+    if (!linked) {
       throw new ValidationError(
-        `Claim '${claim.id}' is not linked to memory '${memory.id}' in scope ${scope.scopeType}:${scope.scopeId}.`
+        `Claim '${claim.id}' does not have an active link to memory '${memory.id}' in scope ${scope.scopeType}:${scope.scopeId}.`
       );
     }
 
@@ -1531,7 +1665,7 @@ export class MemoryRepository {
     const relationship = evidence.relationship;
     const existing = this.db.prepare(`
       SELECT * FROM claim_evidence_associations
-      WHERE claim_id = ? AND evidence_id = ?
+      WHERE claim_id = ? AND evidence_id = ? AND status = 'ACTIVE'
     `).get(claim.id, evidence.id) as unknown as ClaimEvidenceAssociationDbRow | undefined;
 
     if (existing) {
@@ -1544,16 +1678,23 @@ export class MemoryRepository {
       return this.mapClaimEvidenceAssociationRow(existing);
     }
 
+    const existingAny = this.db.prepare(`
+      SELECT id FROM claim_evidence_associations WHERE id = ?
+    `).get(
+      input.id && input.id.trim() !== '' ? input.id.trim() : computeClaimEvidenceAssociationId(claim.id, evidence.id)
+    ) as { id: string } | undefined;
     const id = input.id && input.id.trim() !== ''
       ? input.id.trim()
-      : computeClaimEvidenceAssociationId(claim.id, evidence.id);
+      : existingAny
+        ? randomUUID()
+        : computeClaimEvidenceAssociationId(claim.id, evidence.id);
     const now = input.createdAt ?? new Date().toISOString();
 
     try {
       this.db.prepare(`
         INSERT INTO claim_evidence_associations (
-          id, claim_id, evidence_id, memory_id, scope_type, scope_id, relationship, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          id, claim_id, evidence_id, memory_id, scope_type, scope_id, relationship, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)
       `).run(
         id,
         claim.id,
@@ -1567,7 +1708,7 @@ export class MemoryRepository {
     } catch (err: any) {
       if (String(err?.message).includes('UNIQUE constraint failed')) {
         const raceRow = this.db.prepare(`
-          SELECT * FROM claim_evidence_associations WHERE claim_id = ? AND evidence_id = ?
+          SELECT * FROM claim_evidence_associations WHERE claim_id = ? AND evidence_id = ? AND status = 'ACTIVE'
         `).get(claim.id, evidence.id) as unknown as ClaimEvidenceAssociationDbRow | undefined;
         if (raceRow) {
           this.assertScopeMatch(raceRow.scope_type as MemoryScopeType, raceRow.scope_id, scope, raceRow.id);
@@ -1585,21 +1726,27 @@ export class MemoryRepository {
       scopeType: scope.scopeType,
       scopeId: scope.scopeId,
       relationship,
+      status: 'ACTIVE',
+      invalidatedAt: null,
+      invalidationReason: null,
       createdAt: now
     };
   }
 
   /**
-   * Retrieves all explicit claim-evidence associations for a memory, enforcing scope isolation.
+   * Retrieves explicit claim-evidence associations for a memory, enforcing scope isolation.
    */
   public getClaimEvidenceAssociationsByMemoryId(
     memoryId: string,
-    scope?: ScopeIdentifier
+    scope?: ScopeIdentifier,
+    options?: { readonly includeInvalidated?: boolean }
   ): ClaimEvidenceAssociation[] {
     if (!memoryId || typeof memoryId !== 'string' || memoryId.trim() === '') {
       throw new ValidationError('Memory ID must be a non-empty string.');
     }
     const trimmedMemoryId = memoryId.trim();
+    const activeCea = options?.includeInvalidated ? '' : " AND cea.status = 'ACTIVE'";
+    const activeMcl = options?.includeInvalidated ? '' : " AND mcl.status = 'ACTIVE'";
 
     if (scope) {
       this.validateScope(scope.scopeType, scope.scopeId);
@@ -1614,44 +1761,46 @@ export class MemoryRepository {
           ON mcl.claim_id = cea.claim_id
           AND mcl.memory_id = cea.memory_id
           AND mcl.scope_type = cea.scope_type
-          AND mcl.scope_id = cea.scope_id
+          AND mcl.scope_id = cea.scope_id${activeMcl}
         INNER JOIN memory_evidence ev
           ON ev.id = cea.evidence_id
           AND ev.memory_id = cea.memory_id
         WHERE cea.memory_id = ?
           AND cea.scope_type = ?
-          AND cea.scope_id = ?
+          AND cea.scope_id = ?${activeCea}
         ORDER BY cea.created_at ASC, cea.id ASC
       `).all(trimmedMemoryId, scope.scopeType, scope.scopeId) as unknown as ClaimEvidenceAssociationDbRow[];
       return rows.map((r) => this.mapClaimEvidenceAssociationRow(r));
     }
 
     const rows = this.db.prepare(`
-      SELECT * FROM claim_evidence_associations
-      WHERE memory_id = ?
-      ORDER BY created_at ASC, id ASC
+      SELECT * FROM claim_evidence_associations cea
+      WHERE cea.memory_id = ?${activeCea}
+      ORDER BY cea.created_at ASC, cea.id ASC
     `).all(trimmedMemoryId) as unknown as ClaimEvidenceAssociationDbRow[];
     return rows.map((r) => this.mapClaimEvidenceAssociationRow(r));
   }
 
   /**
-   * Retrieves all explicit claim-evidence associations for a claim within scope.
+   * Retrieves explicit claim-evidence associations for a claim within scope.
    */
   public getClaimEvidenceAssociationsByClaimId(
     claimId: string,
-    scope?: ScopeIdentifier
+    scope?: ScopeIdentifier,
+    options?: { readonly includeInvalidated?: boolean }
   ): ClaimEvidenceAssociation[] {
     if (!claimId || typeof claimId !== 'string' || claimId.trim() === '') {
       throw new ValidationError('Claim ID must be a non-empty string.');
     }
     const trimmedClaimId = claimId.trim();
+    const statusClause = options?.includeInvalidated ? '' : " AND status = 'ACTIVE'";
 
     if (scope) {
       this.validateScope(scope.scopeType, scope.scopeId);
       this.getClaimById(trimmedClaimId, scope);
       const rows = this.db.prepare(`
         SELECT * FROM claim_evidence_associations
-        WHERE claim_id = ? AND scope_type = ? AND scope_id = ?
+        WHERE claim_id = ? AND scope_type = ? AND scope_id = ?${statusClause}
         ORDER BY created_at ASC, id ASC
       `).all(trimmedClaimId, scope.scopeType, scope.scopeId) as unknown as ClaimEvidenceAssociationDbRow[];
       return rows.map((r) => this.mapClaimEvidenceAssociationRow(r));
@@ -1659,30 +1808,32 @@ export class MemoryRepository {
 
     const rows = this.db.prepare(`
       SELECT * FROM claim_evidence_associations
-      WHERE claim_id = ?
+      WHERE claim_id = ?${statusClause}
       ORDER BY created_at ASC, id ASC
     `).all(trimmedClaimId) as unknown as ClaimEvidenceAssociationDbRow[];
     return rows.map((r) => this.mapClaimEvidenceAssociationRow(r));
   }
 
   /**
-   * Retrieves all explicit claim-evidence associations for an evidence record within scope.
+   * Retrieves explicit claim-evidence associations for an evidence record within scope.
    */
   public getClaimEvidenceAssociationsByEvidenceId(
     evidenceId: string,
-    scope?: ScopeIdentifier
+    scope?: ScopeIdentifier,
+    options?: { readonly includeInvalidated?: boolean }
   ): ClaimEvidenceAssociation[] {
     if (!evidenceId || typeof evidenceId !== 'string' || evidenceId.trim() === '') {
       throw new ValidationError('Evidence ID must be a non-empty string.');
     }
     const trimmedEvidenceId = evidenceId.trim();
+    const statusClause = options?.includeInvalidated ? '' : " AND status = 'ACTIVE'";
 
     if (scope) {
       this.validateScope(scope.scopeType, scope.scopeId);
       this.getEvidenceById(trimmedEvidenceId, scope);
       const rows = this.db.prepare(`
         SELECT * FROM claim_evidence_associations
-        WHERE evidence_id = ? AND scope_type = ? AND scope_id = ?
+        WHERE evidence_id = ? AND scope_type = ? AND scope_id = ?${statusClause}
         ORDER BY created_at ASC, id ASC
       `).all(trimmedEvidenceId, scope.scopeType, scope.scopeId) as unknown as ClaimEvidenceAssociationDbRow[];
       return rows.map((r) => this.mapClaimEvidenceAssociationRow(r));
@@ -1690,7 +1841,7 @@ export class MemoryRepository {
 
     const rows = this.db.prepare(`
       SELECT * FROM claim_evidence_associations
-      WHERE evidence_id = ?
+      WHERE evidence_id = ?${statusClause}
       ORDER BY created_at ASC, id ASC
     `).all(trimmedEvidenceId) as unknown as ClaimEvidenceAssociationDbRow[];
     return rows.map((r) => this.mapClaimEvidenceAssociationRow(r));
@@ -1704,9 +1855,15 @@ export class MemoryRepository {
     createdAt: string
   ): void {
     this.db.prepare(`
-      INSERT OR IGNORE INTO memory_claim_links (
-        memory_id, claim_id, scope_type, scope_id, created_at
-      ) VALUES (?, ?, ?, ?, ?)
+      INSERT INTO memory_claim_links (
+        memory_id, claim_id, scope_type, scope_id, status, created_at
+      ) VALUES (?, ?, ?, ?, 'ACTIVE', ?)
+      ON CONFLICT(memory_id, claim_id) DO UPDATE SET
+        status = 'ACTIVE',
+        invalidated_at = NULL,
+        invalidation_reason = NULL,
+        created_at = excluded.created_at
+      WHERE memory_claim_links.status = 'INVALIDATED'
     `).run(memoryId, claimId, scopeType, scopeId, createdAt);
   }
 
@@ -1719,66 +1876,94 @@ export class MemoryRepository {
       scopeType: row.scope_type as MemoryScopeType,
       scopeId: row.scope_id,
       relationship: row.relationship as EvidenceRelationship,
+      status: (row.status as ClaimAssociationStatus) ?? 'ACTIVE',
+      invalidatedAt: row.invalidated_at ?? null,
+      invalidationReason: row.invalidation_reason ?? null,
       createdAt: row.created_at
     };
   }
 
   /**
    * Retrieves verification records for a claim, enforcing scope if provided.
+   * Defaults to CURRENT verifications unless includeStale or explicit status is requested.
    */
-  public getVerificationsByClaimId(claimId: string, scope?: ScopeIdentifier): ClaimEvidenceVerification[] {
+  public getVerificationsByClaimId(
+    claimId: string,
+    scope?: ScopeIdentifier,
+    options?: { readonly includeStale?: boolean; readonly status?: ClaimVerificationLifecycleStatus }
+  ): ClaimEvidenceVerification[] {
     if (!claimId || typeof claimId !== 'string' || claimId.trim() === '') {
       throw new ValidationError('Claim ID must be a non-empty string.');
     }
+    const statusClause = options?.status
+      ? ' AND status = ?'
+      : options?.includeStale
+        ? ''
+        : " AND status = 'CURRENT'";
+    const statusParams: SqlParam[] = options?.status ? [options.status] : [];
+
     if (scope) {
       this.validateScope(scope.scopeType, scope.scopeId);
       // Also enforce claim scope check if claim exists in another scope
       this.getClaimById(claimId.trim(), scope);
       const rows = this.db.prepare(`
         SELECT * FROM claim_evidence_verifications
-        WHERE claim_id = ? AND scope_type = ? AND scope_id = ?
+        WHERE claim_id = ? AND scope_type = ? AND scope_id = ?${statusClause}
         ORDER BY created_at ASC, id ASC
-      `).all(claimId.trim(), scope.scopeType, scope.scopeId) as unknown as ClaimVerificationDbRow[];
+      `).all(claimId.trim(), scope.scopeType, scope.scopeId, ...statusParams) as unknown as ClaimVerificationDbRow[];
       return rows.map((r) => this.mapClaimVerificationRow(r));
     }
 
     const rows = this.db.prepare(`
       SELECT * FROM claim_evidence_verifications
-      WHERE claim_id = ?
+      WHERE claim_id = ?${statusClause}
       ORDER BY created_at ASC, id ASC
-    `).all(claimId.trim()) as unknown as ClaimVerificationDbRow[];
+    `).all(claimId.trim(), ...statusParams) as unknown as ClaimVerificationDbRow[];
     return rows.map((r) => this.mapClaimVerificationRow(r));
   }
 
   /**
    * Retrieves verification records for an evidence item, enforcing scope if provided.
+   * Defaults to CURRENT verifications unless includeStale or explicit status is requested.
    */
-  public getVerificationsByEvidenceId(evidenceId: string, scope?: ScopeIdentifier): ClaimEvidenceVerification[] {
+  public getVerificationsByEvidenceId(
+    evidenceId: string,
+    scope?: ScopeIdentifier,
+    options?: { readonly includeStale?: boolean; readonly status?: ClaimVerificationLifecycleStatus }
+  ): ClaimEvidenceVerification[] {
     if (!evidenceId || typeof evidenceId !== 'string' || evidenceId.trim() === '') {
       throw new ValidationError('Evidence ID must be a non-empty string.');
     }
+    const statusClause = options?.status
+      ? ' AND status = ?'
+      : options?.includeStale
+        ? ''
+        : " AND status = 'CURRENT'";
+    const statusParams: SqlParam[] = options?.status ? [options.status] : [];
+
     if (scope) {
       this.validateScope(scope.scopeType, scope.scopeId);
       // Also enforce evidence scope check if evidence exists in another scope
       this.getEvidenceById(evidenceId.trim(), scope);
       const rows = this.db.prepare(`
         SELECT * FROM claim_evidence_verifications
-        WHERE evidence_id = ? AND scope_type = ? AND scope_id = ?
+        WHERE evidence_id = ? AND scope_type = ? AND scope_id = ?${statusClause}
         ORDER BY created_at ASC, id ASC
-      `).all(evidenceId.trim(), scope.scopeType, scope.scopeId) as unknown as ClaimVerificationDbRow[];
+      `).all(evidenceId.trim(), scope.scopeType, scope.scopeId, ...statusParams) as unknown as ClaimVerificationDbRow[];
       return rows.map((r) => this.mapClaimVerificationRow(r));
     }
 
     const rows = this.db.prepare(`
       SELECT * FROM claim_evidence_verifications
-      WHERE evidence_id = ?
+      WHERE evidence_id = ?${statusClause}
       ORDER BY created_at ASC, id ASC
-    `).all(evidenceId.trim()) as unknown as ClaimVerificationDbRow[];
+    `).all(evidenceId.trim(), ...statusParams) as unknown as ClaimVerificationDbRow[];
     return rows.map((r) => this.mapClaimVerificationRow(r));
   }
 
   /**
    * Lists verification records within an explicit scope.
+   * Defaults to CURRENT verifications unless includeStale or explicit status is requested.
    */
   public listClaimVerifications(filter: ListClaimVerificationsFilter): ClaimEvidenceVerification[] {
     if (!filter || typeof filter !== 'object') {
@@ -1789,6 +1974,16 @@ export class MemoryRepository {
     const conditions: string[] = ['scope_type = ?', 'scope_id = ?'];
     const params: SqlParam[] = [filter.scopeType, filter.scopeId];
 
+    if (filter.status !== undefined) {
+      if (filter.status !== 'CURRENT' && filter.status !== 'STALE') {
+        throw new ValidationError(`Invalid verification status '${String(filter.status)}'.`);
+      }
+      conditions.push('status = ?');
+      params.push(filter.status);
+    } else if (!filter.includeStale) {
+      conditions.push("status = 'CURRENT'");
+    }
+
     if (filter.claimId) {
       conditions.push('claim_id = ?');
       params.push(filter.claimId.trim());
@@ -1796,6 +1991,10 @@ export class MemoryRepository {
     if (filter.evidenceId) {
       conditions.push('evidence_id = ?');
       params.push(filter.evidenceId.trim());
+    }
+    if (filter.memoryId) {
+      conditions.push('evidence_id IN (SELECT id FROM memory_evidence WHERE memory_id = ?)');
+      params.push(filter.memoryId.trim());
     }
     if (filter.proposedRelationship) {
       if (!VALID_VERIFICATION_RELATIONSHIPS.has(filter.proposedRelationship)) {
@@ -2034,6 +2233,9 @@ export class MemoryRepository {
         throw new ValidationError('Failed to retrieve updated memories after supersession.');
       }
 
+      // Mark any CURRENT verifications on the superseded memory's evidence as historical STALE
+      this.markMemoryVerificationsStale(previous.id, params.scope, 'MEMORY_SUPERSEDED', now);
+
       return {
         previous: updatedPrevious,
         replacement: updatedReplacement
@@ -2204,6 +2406,17 @@ export class MemoryRepository {
   }
 
   private mapClaimVerificationRow(row: ClaimVerificationDbRow): ClaimEvidenceVerification {
+    let parsedAssumptions: string[] = [];
+    if (row.assumptions_json) {
+      try {
+        const parsed = JSON.parse(row.assumptions_json);
+        if (Array.isArray(parsed)) {
+          parsedAssumptions = parsed.filter((item): item is string => typeof item === 'string');
+        }
+      } catch {
+        parsedAssumptions = [];
+      }
+    }
     return {
       id: row.id,
       claimId: row.claim_id,
@@ -2216,9 +2429,14 @@ export class MemoryRepository {
       verifierVersion: row.verifier_version,
       promptPolicyVersion: row.prompt_policy_version,
       promptPolicyHash: row.prompt_policy_hash,
+      assumptionsHash: row.assumptions_hash ?? '',
+      assumptions: parsedAssumptions,
       confidence: row.confidence,
       explanation: row.explanation,
       reviewRecommended: row.review_recommended === 1,
+      status: (row.status as ClaimVerificationLifecycleStatus) ?? 'CURRENT',
+      staleAt: row.stale_at ?? null,
+      staleReason: row.stale_reason ?? null,
       taskId: row.task_id,
       createdAt: row.created_at
     };

@@ -71,7 +71,8 @@ import type {
   CandidateClaim,
   ClaimEvidenceVerification,
   ListClaimVerificationsFilter,
-  ClaimEvidenceAssociation
+  ClaimEvidenceAssociation,
+  ClaimVerificationLifecycleStatus
 } from '../domain/types.ts';
 import {
   ValidationError,
@@ -738,6 +739,16 @@ export class MemoryService {
         };
       }
 
+      // IMMUTABLE SUPERSESSION GATE: Superseded records are immutable historical records
+      if (existing.status === 'SUPERSEDED') {
+        return {
+          ok: false,
+          error: new ValidationError(
+            `Cannot update memory '${id}': record is superseded. Superseded memories are immutable historical records.`
+          )
+        };
+      }
+
       const sanitizedInput: UpdateMemoryInput = {
         ...(input.content !== undefined ? { content: input.content } : {}),
         ...(input.category !== undefined ? { category: input.category } : {}),
@@ -747,11 +758,23 @@ export class MemoryService {
         ...(input.status !== undefined ? { status: input.status } : {})
       };
 
+      const contentChanged = input.content !== undefined && input.content.trim() !== existing.content.trim();
       const updated = this.memoryRepo.updateMemory(id, caller.scope, sanitizedInput);
 
-      // Invalidate existing embeddings if embedding-relevant content changes.
-      // Priority, tag, category, and metadata updates do not trigger embedding invalidation.
+      // Invalidate existing embeddings and verification lifecycle if content changes.
+      // Priority, tag, category, and metadata updates do not invalidate content claims or embeddings.
+      let lifecycleInvalidation:
+        | { readonly invalidatedClaimLinks: number; readonly invalidatedAssociations: number; readonly staledVerifications: number }
+        | undefined;
       if (input.content !== undefined) {
+        if (contentChanged) {
+          lifecycleInvalidation = this.memoryRepo.invalidateMemoryVerificationLifecycle(
+            id,
+            caller.scope,
+            'MEMORY_CONTENT_UPDATED',
+            updated.updatedAt
+          );
+        }
         if (this.embeddingRepo) {
           this.embeddingRepo.deleteEmbeddingsByMemoryId(id);
         }
@@ -775,7 +798,16 @@ export class MemoryService {
         category: updated.category,
         scopeType: updated.scopeType,
         scopeId: updated.scopeId,
-        updatedFields: Object.keys(input)
+        updatedFields: Object.keys(input),
+        ...(lifecycleInvalidation ? {
+          verificationLifecycleInvalidated:
+            lifecycleInvalidation.invalidatedClaimLinks > 0 ||
+            lifecycleInvalidation.invalidatedAssociations > 0 ||
+            lifecycleInvalidation.staledVerifications > 0,
+          invalidatedClaimLinksCount: lifecycleInvalidation.invalidatedClaimLinks,
+          invalidatedAssociationsCount: lifecycleInvalidation.invalidatedAssociations,
+          staledVerificationsCount: lifecycleInvalidation.staledVerifications
+        } : {})
       }, true);
 
       if (this._testPostAuditHook) {
@@ -2979,7 +3011,11 @@ export class MemoryService {
   /**
    * Retrieves all atomic claims linked to a memory within caller's scope.
    */
-  public getClaimsByMemoryId(caller: CallerContext, memoryId: string): MemoryClaim[] {
+  public getClaimsByMemoryId(
+    caller: CallerContext,
+    memoryId: string,
+    options?: { readonly includeInvalidated?: boolean }
+  ): MemoryClaim[] {
     this.validateCaller(caller, 'READ');
     if (!memoryId || typeof memoryId !== 'string' || memoryId.trim() === '') {
       throw new ValidationError('Memory ID must be a non-empty string.');
@@ -2987,7 +3023,7 @@ export class MemoryService {
 
     let claims: MemoryClaim[];
     try {
-      claims = this.memoryRepo.getClaimsByMemoryId(memoryId, caller.scope);
+      claims = this.memoryRepo.getClaimsByMemoryId(memoryId, caller.scope, options);
     } catch (err) {
       if (err instanceof MemoryScopeViolationError) {
         this.audit(caller, 'MEMORY_ACCESS_DENIED', {
@@ -3036,7 +3072,8 @@ export class MemoryService {
    */
   public getClaimVerificationsByClaimId(
     caller: CallerContext,
-    claimId: string
+    claimId: string,
+    options?: { readonly includeStale?: boolean; readonly status?: ClaimVerificationLifecycleStatus }
   ): ClaimEvidenceVerification[] {
     this.validateCaller(caller, 'READ');
     if (!claimId || typeof claimId !== 'string' || claimId.trim() === '') {
@@ -3044,7 +3081,7 @@ export class MemoryService {
     }
 
     try {
-      return this.memoryRepo.getVerificationsByClaimId(claimId, caller.scope);
+      return this.memoryRepo.getVerificationsByClaimId(claimId, caller.scope, options);
     } catch (err) {
       if (err instanceof MemoryScopeViolationError) {
         this.audit(caller, 'MEMORY_ACCESS_DENIED', {
@@ -3062,7 +3099,8 @@ export class MemoryService {
    */
   public getClaimVerificationsByEvidenceId(
     caller: CallerContext,
-    evidenceId: string
+    evidenceId: string,
+    options?: { readonly includeStale?: boolean; readonly status?: ClaimVerificationLifecycleStatus }
   ): ClaimEvidenceVerification[] {
     this.validateCaller(caller, 'READ');
     if (!evidenceId || typeof evidenceId !== 'string' || evidenceId.trim() === '') {
@@ -3070,7 +3108,7 @@ export class MemoryService {
     }
 
     try {
-      return this.memoryRepo.getVerificationsByEvidenceId(evidenceId, caller.scope);
+      return this.memoryRepo.getVerificationsByEvidenceId(evidenceId, caller.scope, options);
     } catch (err) {
       if (err instanceof MemoryScopeViolationError) {
         this.audit(caller, 'MEMORY_ACCESS_DENIED', {
@@ -3103,7 +3141,8 @@ export class MemoryService {
    */
   public getClaimEvidenceAssociationsByMemoryId(
     caller: CallerContext,
-    memoryId: string
+    memoryId: string,
+    options?: { readonly includeInvalidated?: boolean }
   ): ClaimEvidenceAssociation[] {
     this.validateCaller(caller, 'READ');
     if (!memoryId || typeof memoryId !== 'string' || memoryId.trim() === '') {
@@ -3111,7 +3150,7 @@ export class MemoryService {
     }
 
     try {
-      return this.memoryRepo.getClaimEvidenceAssociationsByMemoryId(memoryId, caller.scope);
+      return this.memoryRepo.getClaimEvidenceAssociationsByMemoryId(memoryId, caller.scope, options);
     } catch (err) {
       if (err instanceof MemoryScopeViolationError) {
         this.audit(caller, 'MEMORY_ACCESS_DENIED', {
@@ -3129,7 +3168,8 @@ export class MemoryService {
    */
   public getClaimEvidenceAssociationsByClaimId(
     caller: CallerContext,
-    claimId: string
+    claimId: string,
+    options?: { readonly includeInvalidated?: boolean }
   ): ClaimEvidenceAssociation[] {
     this.validateCaller(caller, 'READ');
     if (!claimId || typeof claimId !== 'string' || claimId.trim() === '') {
@@ -3137,7 +3177,7 @@ export class MemoryService {
     }
 
     try {
-      return this.memoryRepo.getClaimEvidenceAssociationsByClaimId(claimId, caller.scope);
+      return this.memoryRepo.getClaimEvidenceAssociationsByClaimId(claimId, caller.scope, options);
     } catch (err) {
       if (err instanceof MemoryScopeViolationError) {
         this.audit(caller, 'MEMORY_ACCESS_DENIED', {
@@ -3155,7 +3195,8 @@ export class MemoryService {
    */
   public getClaimEvidenceAssociationsByEvidenceId(
     caller: CallerContext,
-    evidenceId: string
+    evidenceId: string,
+    options?: { readonly includeInvalidated?: boolean }
   ): ClaimEvidenceAssociation[] {
     this.validateCaller(caller, 'READ');
     if (!evidenceId || typeof evidenceId !== 'string' || evidenceId.trim() === '') {
@@ -3163,7 +3204,7 @@ export class MemoryService {
     }
 
     try {
-      return this.memoryRepo.getClaimEvidenceAssociationsByEvidenceId(evidenceId, caller.scope);
+      return this.memoryRepo.getClaimEvidenceAssociationsByEvidenceId(evidenceId, caller.scope, options);
     } catch (err) {
       if (err instanceof MemoryScopeViolationError) {
         this.audit(caller, 'MEMORY_ACCESS_DENIED', {

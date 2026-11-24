@@ -78,14 +78,98 @@ export function canonicalizeClaimText(text: string): string {
   return cleaned;
 }
 
+export interface ClaimHashMetadata {
+  readonly subject?: string | null;
+  readonly predicate?: string | null;
+  readonly qualifier?: string | null;
+}
+
+export const DEFAULT_MAX_VERIFICATION_ASSUMPTIONS = 10;
+export const DEFAULT_MAX_VERIFICATION_ASSUMPTION_CHARS = 300;
+
 /**
- * Computes a deterministic SHA-256 hash of canonicalized claim text.
+ * Normalizes a qualifier/subject/predicate metadata component deterministically.
  */
-export function computeClaimHash(canonicalText: string): string {
+export function canonicalizeClaimMetadataPart(value?: string | null): string {
+  if (!value || typeof value !== 'string') {
+    return '';
+  }
+  return value
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+    .replace(/[.!?;,]+$/, '')
+    .trim();
+}
+
+/**
+ * Normalizes verification assumptions/conditions deterministically with bounded item count and length.
+ */
+export function normalizeVerificationAssumptions(
+  assumptions?: readonly string[],
+  maxItems: number = DEFAULT_MAX_VERIFICATION_ASSUMPTIONS,
+  maxChars: number = DEFAULT_MAX_VERIFICATION_ASSUMPTION_CHARS
+): string[] {
+  if (!Array.isArray(assumptions) || assumptions.length === 0) {
+    return [];
+  }
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const item of assumptions) {
+    if (typeof item !== 'string') {
+      continue;
+    }
+    const trimmed = item.replace(/\s+/g, ' ').trim();
+    if (!trimmed) {
+      continue;
+    }
+    const bounded = trimmed.length > maxChars ? trimmed.slice(0, maxChars) : trimmed;
+    const key = bounded.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    normalized.push(bounded);
+    if (normalized.length >= maxItems) {
+      break;
+    }
+  }
+  return normalized;
+}
+
+/**
+ * Computes a deterministic hash of normalized verification assumptions.
+ * Returns empty string '' when no assumptions are supplied so legacy empty-assumption records remain compatible.
+ */
+export function computeVerificationAssumptionsHash(assumptions?: readonly string[]): string {
+  const normalized = normalizeVerificationAssumptions(assumptions);
+  if (normalized.length === 0) {
+    return '';
+  }
+  const canonicalSorted = normalized.map((item) => item.toLowerCase()).sort();
+  return createHash('sha256').update(JSON.stringify(canonicalSorted), 'utf8').digest('hex');
+}
+
+/**
+ * Computes a deterministic SHA-256 hash of canonicalized claim text and optional qualifiers.
+ * When subject/predicate/qualifier are absent or empty, produces the exact canonical text hash.
+ */
+export function computeClaimHash(canonicalText: string, metadata?: ClaimHashMetadata): string {
   if (!canonicalText || typeof canonicalText !== 'string' || canonicalText.trim() === '') {
     throw new ValidationError('Canonical claim text cannot be empty for hash computation.');
   }
-  return createHash('sha256').update(canonicalText.trim(), 'utf8').digest('hex');
+  const parts: string[] = [canonicalText.trim()];
+  if (metadata) {
+    const sub = canonicalizeClaimMetadataPart(metadata.subject);
+    const pred = canonicalizeClaimMetadataPart(metadata.predicate);
+    const qual = canonicalizeClaimMetadataPart(metadata.qualifier);
+    if (sub) parts.push(`subject:${sub}`);
+    if (pred) parts.push(`predicate:${pred}`);
+    if (qual) parts.push(`qualifier:${qual}`);
+  }
+  return createHash('sha256').update(parts.join('||'), 'utf8').digest('hex');
 }
 
 /**
@@ -127,9 +211,20 @@ export function createAtomicClaim(input: CreateClaimInput): MemoryClaim {
     throw new ValidationError('Claim text cannot be empty or consist solely of citation markers.');
   }
 
+  // Subject, predicate, qualifier: only include if provided non-empty; never invent
+  const subject = typeof input.subject === 'string' && input.subject.trim() !== ''
+    ? input.subject.trim()
+    : null;
+  const predicate = typeof input.predicate === 'string' && input.predicate.trim() !== ''
+    ? input.predicate.trim()
+    : null;
+  const qualifier = typeof input.qualifier === 'string' && input.qualifier.trim() !== ''
+    ? input.qualifier.trim()
+    : null;
+
   const claimHash = input.claimHash && input.claimHash.trim() !== ''
     ? input.claimHash.trim()
-    : computeClaimHash(canonicalText);
+    : computeClaimHash(canonicalText, { subject, predicate, qualifier });
 
   const scopeType = input.scopeType;
   const scopeId = typeof input.scopeId === 'string' ? input.scopeId.trim() : '';
@@ -149,17 +244,6 @@ export function createAtomicClaim(input: CreateClaimInput): MemoryClaim {
   const createdAt = input.createdAt && input.createdAt.trim() !== ''
     ? input.createdAt.trim()
     : new Date().toISOString();
-
-  // Subject, predicate, qualifier: only include if provided non-empty; never invent
-  const subject = typeof input.subject === 'string' && input.subject.trim() !== ''
-    ? input.subject.trim()
-    : null;
-  const predicate = typeof input.predicate === 'string' && input.predicate.trim() !== ''
-    ? input.predicate.trim()
-    : null;
-  const qualifier = typeof input.qualifier === 'string' && input.qualifier.trim() !== ''
-    ? input.qualifier.trim()
-    : null;
 
   return {
     id,

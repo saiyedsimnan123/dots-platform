@@ -403,11 +403,15 @@ export interface CreateClaimInput {
   readonly createdAt?: string;
 }
 
+export type ClaimAssociationStatus = 'ACTIVE' | 'INVALIDATED';
+export type ClaimVerificationLifecycleStatus = 'CURRENT' | 'STALE';
+
 export interface ListClaimsFilter {
   readonly scopeType: MemoryScopeType;
   readonly scopeId: string;
   readonly taskId?: string;
   readonly memoryId?: string;
+  readonly includeInvalidated?: boolean;
   readonly limit?: number;
   readonly offset?: number;
 }
@@ -420,6 +424,9 @@ export interface ClaimEvidenceAssociation {
   readonly scopeType: MemoryScopeType;
   readonly scopeId: string;
   readonly relationship: EvidenceRelationship;
+  readonly status: ClaimAssociationStatus;
+  readonly invalidatedAt: string | null;
+  readonly invalidationReason: string | null;
   readonly createdAt: string;
 }
 
@@ -467,9 +474,14 @@ export interface ClaimEvidenceVerification {
   readonly verifierVersion: string;
   readonly promptPolicyVersion: string;
   readonly promptPolicyHash: string;
+  readonly assumptionsHash: string;
+  readonly assumptions: readonly string[];
   readonly confidence: number | null;
   readonly explanation: string;
   readonly reviewRecommended: boolean;
+  readonly status: ClaimVerificationLifecycleStatus;
+  readonly staleAt: string | null;
+  readonly staleReason: string | null;
   readonly taskId: string | null;
   readonly createdAt: string;
 }
@@ -486,9 +498,14 @@ export interface CreateClaimVerificationInput {
   readonly verifierVersion: string;
   readonly promptPolicyVersion: string;
   readonly promptPolicyHash: string;
+  readonly assumptionsHash?: string;
+  readonly assumptions?: readonly string[];
   readonly confidence?: number | null;
   readonly explanation: string;
   readonly reviewRecommended?: boolean;
+  readonly status?: ClaimVerificationLifecycleStatus;
+  readonly staleAt?: string | null;
+  readonly staleReason?: string | null;
   readonly taskId?: string | null;
   readonly createdAt?: string;
 }
@@ -498,7 +515,10 @@ export interface ListClaimVerificationsFilter {
   readonly scopeId: string;
   readonly claimId?: string;
   readonly evidenceId?: string;
+  readonly memoryId?: string;
   readonly proposedRelationship?: ClaimVerificationRelationship;
+  readonly status?: ClaimVerificationLifecycleStatus;
+  readonly includeStale?: boolean;
   readonly limit?: number;
   readonly offset?: number;
 }

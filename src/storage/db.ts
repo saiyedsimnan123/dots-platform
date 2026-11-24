@@ -624,6 +624,61 @@ export class DatabaseManager {
             CREATE INDEX IF NOT EXISTS idx_cea_scope ON claim_evidence_associations(scope_type, scope_id);
           `);
         }
+      },
+      {
+        version: '013_verification_lifecycle_integrity',
+        up(database: DatabaseSync): void {
+          database.exec(`
+            ALTER TABLE memory_claim_links
+              ADD COLUMN status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'INVALIDATED'));
+            ALTER TABLE memory_claim_links
+              ADD COLUMN invalidated_at TEXT;
+            ALTER TABLE memory_claim_links
+              ADD COLUMN invalidation_reason TEXT;
+
+            CREATE INDEX IF NOT EXISTS idx_mcl_memory_status
+              ON memory_claim_links(memory_id, status);
+
+            ALTER TABLE claim_evidence_associations
+              ADD COLUMN status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'INVALIDATED'));
+            ALTER TABLE claim_evidence_associations
+              ADD COLUMN invalidated_at TEXT;
+            ALTER TABLE claim_evidence_associations
+              ADD COLUMN invalidation_reason TEXT;
+
+            DROP INDEX IF EXISTS idx_cea_claim_evidence;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_cea_claim_evidence_active
+              ON claim_evidence_associations(claim_id, evidence_id)
+              WHERE status = 'ACTIVE';
+            CREATE INDEX IF NOT EXISTS idx_cea_memory_status
+              ON claim_evidence_associations(memory_id, status);
+
+            ALTER TABLE claim_evidence_verifications
+              ADD COLUMN status TEXT NOT NULL DEFAULT 'CURRENT' CHECK (status IN ('CURRENT', 'STALE'));
+            ALTER TABLE claim_evidence_verifications
+              ADD COLUMN stale_at TEXT;
+            ALTER TABLE claim_evidence_verifications
+              ADD COLUMN stale_reason TEXT;
+            ALTER TABLE claim_evidence_verifications
+              ADD COLUMN assumptions_hash TEXT NOT NULL DEFAULT '';
+            ALTER TABLE claim_evidence_verifications
+              ADD COLUMN assumptions_json TEXT NOT NULL DEFAULT '[]';
+
+            DROP INDEX IF EXISTS idx_cev_dedup;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_cev_dedup_current
+              ON claim_evidence_verifications(
+                claim_id,
+                evidence_id,
+                verifier_id,
+                verifier_version,
+                prompt_policy_hash,
+                assumptions_hash
+              )
+              WHERE status = 'CURRENT';
+            CREATE INDEX IF NOT EXISTS idx_cev_status
+              ON claim_evidence_verifications(status);
+          `);
+        }
       }
     ];
 

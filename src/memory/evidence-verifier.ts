@@ -40,6 +40,10 @@ import {
 } from '../domain/errors.ts';
 import type { IModelProvider, ModelMessage } from '../model/types.ts';
 import { defaultSecretScrubber } from '../model/secret-scrubber.ts';
+import {
+  normalizeVerificationAssumptions,
+  computeVerificationAssumptionsHash
+} from './claim-normalizer.ts';
 import type { MemoryAuthorizer } from '../security/memory-authorizer.ts';
 import type { AuditRepository } from '../storage/audit-repository.ts';
 import type { MemoryRepository } from '../storage/memory-repository.ts';
@@ -1054,6 +1058,9 @@ export class EvidenceVerificationEngine {
       });
     }
 
+    const normalizedAssumptions = normalizeVerificationAssumptions(request.assumptions);
+    const assumptionsHash = computeVerificationAssumptionsHash(normalizedAssumptions);
+
     // 4. Persistent deduplication check BEFORE any model call
     const existing = this.memoryRepo.findClaimVerification({
       claimId: claim.id,
@@ -1061,6 +1068,7 @@ export class EvidenceVerificationEngine {
       verifierId,
       verifierVersion,
       promptPolicyHash,
+      assumptionsHash,
       scope: verifiedCaller.scope
     });
     if (existing) {
@@ -1092,7 +1100,8 @@ export class EvidenceVerificationEngine {
       evidence.id,
       verifierId,
       verifierVersion,
-      promptPolicyHash
+      promptPolicyHash,
+      assumptionsHash
     ].join('|');
 
     const activePromise = this.inFlight.get(dedupKey);
@@ -1108,7 +1117,11 @@ export class EvidenceVerificationEngine {
       verifiedCaller,
       claim,
       evidence,
-      request,
+      {
+        ...request,
+        assumptions: normalizedAssumptions
+      },
+      assumptionsHash,
       this.verifier
     );
     this.inFlight.set(dedupKey, workPromise);
@@ -1191,7 +1204,12 @@ export class EvidenceVerificationEngine {
    */
   public async verifyProposalClaims(
     caller: CallerContext,
-    memoryId: string
+    memoryId: string,
+    options?: {
+      readonly assumptions?: readonly string[];
+      readonly timeoutMs?: number;
+      readonly signal?: AbortSignal;
+    }
   ): Promise<VerifyClaimEvidenceResult[]> {
     const verifiedCaller = this.authorizeCaller(caller);
     if (!memoryId || typeof memoryId !== 'string' || memoryId.trim() === '') {
@@ -1210,6 +1228,26 @@ export class EvidenceVerificationEngine {
     if (associations.length === 0) {
       return [];
     }
+
+    const storedAssumptions: string[] = [];
+    if (memory.metadataJson) {
+      try {
+        const meta = JSON.parse(memory.metadataJson) as Record<string, unknown>;
+        if (Array.isArray(meta.verificationAssumptions)) {
+          for (const item of meta.verificationAssumptions) {
+            if (typeof item === 'string' && item.trim() !== '') {
+              storedAssumptions.push(item.trim());
+            }
+          }
+        }
+      } catch {
+        // Ignore malformed metadata JSON safely
+      }
+    }
+    const mergedAssumptions = normalizeVerificationAssumptions([
+      ...storedAssumptions,
+      ...(options?.assumptions ?? [])
+    ]);
 
     const claimsById = new Map(
       this.memoryRepo.getClaimsByMemoryId(memory.id, verifiedCaller.scope).map((c) => [c.id, c])
@@ -1236,7 +1274,10 @@ export class EvidenceVerificationEngine {
       seenPairs.add(pairKey);
       requests.push({
         claimId: claim.id,
-        evidenceId: ev.id
+        evidenceId: ev.id,
+        ...(mergedAssumptions.length > 0 ? { assumptions: mergedAssumptions } : {}),
+        ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+        ...(options?.signal ? { signal: options.signal } : {})
       });
     }
 
@@ -1290,6 +1331,7 @@ export class EvidenceVerificationEngine {
     claim: MemoryClaim,
     evidence: MemoryEvidence,
     request: VerifyClaimEvidenceRequest,
+    assumptionsHash: string,
     verifier: IEvidenceVerifier
   ): Promise<VerifyClaimEvidenceResult> {
     const now = new Date().toISOString();
@@ -1478,6 +1520,8 @@ export class EvidenceVerificationEngine {
         verifierVersion: verifier.verifierVersion,
         promptPolicyVersion: verifier.promptPolicyVersion,
         promptPolicyHash: verifier.promptPolicyHash,
+        assumptionsHash,
+        assumptions: request.assumptions,
         confidence: validated.confidence,
         explanation: validated.explanation,
         reviewRecommended: validated.reviewRecommended,
