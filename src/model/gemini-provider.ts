@@ -65,10 +65,17 @@ export class GeminiProvider implements IModelProvider {
   private readonly compiler: PromptCompiler;
 
   constructor(options: GeminiProviderOptions = {}) {
-    this.apiKey = options.apiKey || process.env.GEMINI_API_KEY || '';
+    this.apiKey = options.apiKey !== undefined ? options.apiKey : (process.env.GEMINI_API_KEY || '');
     this.modelId = options.modelId || 'gemini-2.5-flash';
     this.baseUrl = options.baseUrl || 'https://generativelanguage.googleapis.com/v1beta';
     this.compiler = options.promptCompiler || new PromptCompiler();
+  }
+
+  /**
+   * Local non-network check verifying that a non-empty Gemini API key is configured.
+   */
+  public isConfigured(): boolean {
+    return typeof this.apiKey === 'string' && this.apiKey.trim() !== '';
   }
 
   /**

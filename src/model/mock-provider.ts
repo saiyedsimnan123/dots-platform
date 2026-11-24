@@ -39,6 +39,10 @@ export class MockModelProvider implements IModelProvider {
     this.modelId = modelId;
   }
 
+  public isConfigured(): boolean {
+    return true;
+  }
+
   /**
    * Enqueues a scripted plan to be returned on the next generatePlan() call.
    */

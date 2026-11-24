@@ -85,6 +85,16 @@ export interface IModelProvider {
   readonly modelId: string;
 
   /**
+   * Non-network local check indicating whether required credentials and configuration exist.
+   */
+  isConfigured?(): boolean;
+
+  /**
+   * Optional provider availability check invoked before evaluation.
+   */
+  isAvailable?(): Promise<boolean>;
+
+  /**
    * Generates a structured multi-step plan for the given goal and available tools.
    * Supports both legacy callers passing optional context string, and callers passing
    * a pre-compiled, scrubbed, bounded prompt (CompiledPlanPrompt).

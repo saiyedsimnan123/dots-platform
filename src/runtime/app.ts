@@ -72,7 +72,11 @@ import type { AuthenticatedPrincipal, MemoryAuthorizer } from '../security/memor
 import { TokenIdentityProvider } from '../security/token-identity-provider.ts';
 import { VerificationEngine } from '../verification/verifier.ts';
 import { MemoryService } from '../memory/memory-service.ts';
-import { EvidenceVerificationEngine } from '../memory/evidence-verifier.ts';
+import {
+  EvidenceVerificationEngine,
+  checkModelProviderVerificationReadiness,
+  sanitizeVerificationHealthMessage
+} from '../memory/evidence-verifier.ts';
 import { TaskCoordinator } from '../orchestrator/coordinator.ts';
 import { AgentRegistry, ResearchAgent, AnalyticsAgent, DeveloperAgent, type AgentMetadata } from '../agents/index.ts';
 import { TaskScheduler } from '../scheduler/task-scheduler.ts';
@@ -156,8 +160,19 @@ export function toPublicMessageView(m: ConversationMessage): PublicMessageView {
   };
 }
 
+export interface EvidenceVerificationRuntimeStatus {
+  readonly enabled: boolean;
+  readonly status: 'disabled' | 'configured' | 'unavailable';
+  readonly configured: boolean;
+  readonly liveCheckPerformed: false;
+  readonly provider?: string;
+  readonly modelId?: string;
+  readonly reason?: string;
+}
+
 export interface DotsRuntimeOptions extends Omit<LoadRuntimeConfigOverrides, 'webSearchProvider' | 'embeddingProvider'> {
   readonly modelProvider?: IModelProvider;
+  readonly evidenceVerifier?: EvidenceVerificationEngine;
   readonly webSearchProvider?: IWebSearchProvider | ConfiguredWebSearchProviderMode;
   readonly embeddingProvider?: IEmbeddingProvider | ConfiguredEmbeddingProviderMode;
   readonly lifecycleManager?: EmbeddingLifecycleManager;
@@ -223,7 +238,7 @@ export class DotsRuntime {
   public readonly identityProvider: TokenIdentityProvider;
   public readonly authorizer: MemoryAuthorizer;
   public readonly memoryService: MemoryService;
-  public readonly evidenceVerifier: EvidenceVerificationEngine;
+  public readonly evidenceVerifier: EvidenceVerificationEngine | null;
   public readonly toolRegistry: ToolRegistry;
   public readonly policyEngine: PolicyEngine;
   public readonly approvalBroker: ApprovalBroker;
@@ -240,6 +255,7 @@ export class DotsRuntime {
   public readonly webSearchProvider: IWebSearchProvider | null;
 
   private readonly hostAuthority: HostMemoryAuthority;
+  private readonly initialEvidenceVerificationStatus: EvidenceVerificationRuntimeStatus;
   private readonly startedAtMs: number = Date.now();
   private started: boolean = false;
   private stopped: boolean = false;
@@ -368,13 +384,128 @@ export class DotsRuntime {
           })
         : new MockModelProvider());
 
-    this.evidenceVerifier = new EvidenceVerificationEngine({
-      modelProvider: this.modelProvider,
-      memoryRepo: this.memoryRepo,
-      authorizer: this.authorizer,
-      auditRepo: this.auditRepo,
-      taskRepo: this.taskRepo
-    });
+    if (!this.config.enableEvidenceVerification) {
+      this.evidenceVerifier = null;
+      this.initialEvidenceVerificationStatus = {
+        enabled: false,
+        status: 'disabled',
+        configured: false,
+        liveCheckPerformed: false
+      };
+    } else if (options.evidenceVerifier !== undefined) {
+      let initializedVerifier: EvidenceVerificationEngine | null = null;
+      let initStatus: EvidenceVerificationRuntimeStatus;
+      try {
+        if (
+          !options.evidenceVerifier ||
+          typeof options.evidenceVerifier !== 'object' ||
+          typeof options.evidenceVerifier.verifyProposalClaims !== 'function'
+        ) {
+          throw new ValidationError('Configured evidenceVerifier does not implement the required verification engine interface.');
+        }
+        const opStatus =
+          typeof options.evidenceVerifier.getOperationalStatus === 'function'
+            ? options.evidenceVerifier.getOperationalStatus()
+            : { configured: true, available: true, liveCheckPerformed: false as const };
+        if (!opStatus.configured || !opStatus.available) {
+          initStatus = {
+            enabled: true,
+            status: 'unavailable',
+            configured: opStatus.configured,
+            liveCheckPerformed: false,
+            ...(opStatus.providerName ? { provider: opStatus.providerName } : {}),
+            ...(opStatus.modelId ? { modelId: opStatus.modelId } : {}),
+            reason: sanitizeVerificationHealthMessage(
+              opStatus.reason,
+              'Evidence verification provider is unavailable or misconfigured.'
+            )
+          };
+        } else {
+          initializedVerifier = options.evidenceVerifier;
+          initStatus = {
+            enabled: true,
+            status: 'configured',
+            configured: true,
+            liveCheckPerformed: false,
+            ...(opStatus.providerName ? { provider: opStatus.providerName } : {}),
+            ...(opStatus.modelId ? { modelId: opStatus.modelId } : {})
+          };
+        }
+      } catch (err) {
+        initStatus = {
+          enabled: true,
+          status: 'unavailable',
+          configured: false,
+          liveCheckPerformed: false,
+          reason: sanitizeVerificationHealthMessage(err, 'Failed to initialize evidence verification engine.')
+        };
+      }
+      this.evidenceVerifier = initializedVerifier;
+      this.initialEvidenceVerificationStatus = initStatus;
+      if (initStatus.status === 'unavailable') {
+        this.logger.warn('runtime', 'evidence_verification_unavailable', {
+          provider: initStatus.provider,
+          reason: initStatus.reason
+        });
+      }
+    } else {
+      const readiness = checkModelProviderVerificationReadiness(this.modelProvider);
+      if (!readiness.ready) {
+        this.evidenceVerifier = null;
+        this.initialEvidenceVerificationStatus = {
+          enabled: true,
+          status: 'unavailable',
+          configured: false,
+          liveCheckPerformed: false,
+          ...(readiness.providerName ? { provider: readiness.providerName } : {}),
+          ...(readiness.modelId ? { modelId: readiness.modelId } : {}),
+          reason: sanitizeVerificationHealthMessage(
+            readiness.reason,
+            'Evidence verification provider is unavailable or misconfigured.'
+          )
+        };
+        this.logger.warn('runtime', 'evidence_verification_unavailable', {
+          provider: this.initialEvidenceVerificationStatus.provider,
+          reason: this.initialEvidenceVerificationStatus.reason
+        });
+      } else {
+        let initializedVerifier: EvidenceVerificationEngine | null = null;
+        let initStatus: EvidenceVerificationRuntimeStatus;
+        try {
+          initializedVerifier = new EvidenceVerificationEngine({
+            modelProvider: this.modelProvider,
+            memoryRepo: this.memoryRepo,
+            authorizer: this.authorizer,
+            auditRepo: this.auditRepo,
+            taskRepo: this.taskRepo
+          });
+          initStatus = {
+            enabled: true,
+            status: 'configured',
+            configured: true,
+            liveCheckPerformed: false,
+            ...(readiness.providerName ? { provider: readiness.providerName } : {}),
+            ...(readiness.modelId ? { modelId: readiness.modelId } : {})
+          };
+        } catch (err) {
+          initStatus = {
+            enabled: true,
+            status: 'unavailable',
+            configured: false,
+            liveCheckPerformed: false,
+            ...(readiness.providerName ? { provider: readiness.providerName } : {}),
+            ...(readiness.modelId ? { modelId: readiness.modelId } : {}),
+            reason: sanitizeVerificationHealthMessage(err, 'Failed to initialize evidence verification engine.')
+          };
+          this.logger.warn('runtime', 'evidence_verification_init_failed', {
+            provider: initStatus.provider,
+            reason: initStatus.reason
+          });
+        }
+        this.evidenceVerifier = initializedVerifier;
+        this.initialEvidenceVerificationStatus = initStatus;
+      }
+    }
 
     this.agentRegistry = options.agentRegistry ?? new AgentRegistry();
     if (!this.agentRegistry.has('research-agent')) {
@@ -412,7 +543,10 @@ export class DotsRuntime {
       enableDynamicReplan: this.config.enableDynamicReplan,
       enableCompensation: this.config.enableCompensation,
       agentRegistry: this.agentRegistry,
-      evidenceVerifier: this.evidenceVerifier
+      enableEvidenceVerification: this.config.enableEvidenceVerification,
+      ...(this.config.enableEvidenceVerification && this.evidenceVerifier
+        ? { evidenceVerifier: this.evidenceVerifier }
+        : {})
     });
 
     this.crashRecovery = new CrashRecoveryEngine(this.taskRepo, this.auditRepo);
@@ -504,10 +638,13 @@ export class DotsRuntime {
       }
     }
 
+    const verificationStatus = this.getEvidenceVerificationStatus();
     this.logger.info('runtime', 'started', {
       provider: this.modelProvider.name,
       schedulerEnabled: this.config.enableScheduler,
       embeddingProvider: this.embeddingProvider ? this.embeddingProvider.name : 'none',
+      evidenceVerificationEnabled: verificationStatus.enabled,
+      evidenceVerificationStatus: verificationStatus.status,
       workspaceRoot: this.config.workspaceRoot
     });
   }
@@ -539,7 +676,51 @@ export class DotsRuntime {
     this.logger.info('runtime', 'stopped');
   }
 
+  public getEvidenceVerificationStatus(): EvidenceVerificationRuntimeStatus {
+    if (!this.config.enableEvidenceVerification) {
+      return {
+        enabled: false,
+        status: 'disabled',
+        configured: false,
+        liveCheckPerformed: false
+      };
+    }
+
+    if (!this.evidenceVerifier) {
+      return this.initialEvidenceVerificationStatus;
+    }
+
+    if (typeof this.evidenceVerifier.getOperationalStatus === 'function') {
+      const opStatus = this.evidenceVerifier.getOperationalStatus();
+      if (!opStatus.configured || !opStatus.available) {
+        return {
+          enabled: true,
+          status: 'unavailable',
+          configured: opStatus.configured,
+          liveCheckPerformed: false,
+          ...(opStatus.providerName ? { provider: opStatus.providerName } : {}),
+          ...(opStatus.modelId ? { modelId: opStatus.modelId } : {}),
+          reason: sanitizeVerificationHealthMessage(
+            opStatus.reason,
+            'Evidence verification provider is currently unavailable.'
+          )
+        };
+      }
+      return {
+        enabled: true,
+        status: 'configured',
+        configured: true,
+        liveCheckPerformed: false,
+        ...(opStatus.providerName ? { provider: opStatus.providerName } : {}),
+        ...(opStatus.modelId ? { modelId: opStatus.modelId } : {})
+      };
+    }
+
+    return this.initialEvidenceVerificationStatus;
+  }
+
   public getHealth(): Record<string, unknown> {
+    const verificationStatus = this.getEvidenceVerificationStatus();
     return {
       status: this.stopped ? 'stopped' : 'ok',
       uptimeMs: Date.now() - this.startedAtMs,
@@ -548,7 +729,10 @@ export class DotsRuntime {
       modelId: this.modelProvider.modelId,
       embeddingProvider: this.embeddingProvider ? this.embeddingProvider.name : 'none',
       embeddingEnabled: Boolean(this.embeddingProvider),
-      embeddingWorkerActive: Boolean(this.lifecycleManager?.active)
+      embeddingWorkerActive: Boolean(this.lifecycleManager?.active),
+      evidenceVerificationEnabled: verificationStatus.enabled,
+      evidenceVerificationStatus: verificationStatus.status,
+      evidenceVerification: verificationStatus
     };
   }
 

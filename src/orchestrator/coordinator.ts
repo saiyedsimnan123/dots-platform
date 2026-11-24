@@ -250,8 +250,14 @@ export class TaskCoordinator {
     this.agentRegistry = options.agentRegistry ?? new AgentRegistry();
     this.knowledgePipeline = options.knowledgePipeline ?? new KnowledgeProposalPipeline();
     this.enableKnowledgeProposals = options.enableKnowledgeProposals ?? true;
+    if (
+      options.enableEvidenceVerification !== undefined &&
+      typeof options.enableEvidenceVerification !== 'boolean'
+    ) {
+      throw new ValidationError('Coordinator enableEvidenceVerification must be a boolean when provided.');
+    }
     this.evidenceVerifier = options.evidenceVerifier;
-    this.enableEvidenceVerification = options.enableEvidenceVerification ?? false;
+    this.enableEvidenceVerification = options.enableEvidenceVerification === true;
 
     // Register agent memory tools when memory subsystem and authorizer are configured
     if (this.memoryService && this.authorizer) {

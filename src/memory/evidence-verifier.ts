@@ -194,6 +194,7 @@ export interface IEvidenceVerifier {
   readonly promptPolicyVersion: string;
   readonly promptPolicyHash: string;
 
+  isConfigured?(): boolean;
   isAvailable?(): Promise<boolean>;
 
   evaluate(request: {
@@ -202,6 +203,103 @@ export interface IEvidenceVerifier {
     readonly qualifiersAndAssumptions: readonly string[];
     readonly context: VerificationRequestContext;
   }): Promise<UntrustedVerificationCandidate>;
+}
+
+export interface VerificationProviderReadiness {
+  readonly ready: boolean;
+  readonly providerName?: string;
+  readonly modelId?: string;
+  readonly reason?: string;
+}
+
+export interface EvidenceVerificationOperationalStatus {
+  readonly configured: boolean;
+  readonly available: boolean;
+  readonly liveCheckPerformed: false;
+  readonly verifierId?: string;
+  readonly verifierVersion?: string;
+  readonly providerName?: string;
+  readonly modelId?: string;
+  readonly reason?: string;
+}
+
+export function sanitizeVerificationHealthMessage(
+  rawMessage: unknown,
+  fallback: string = 'Provider error or unavailability.'
+): string {
+  const raw = typeof rawMessage === 'string'
+    ? rawMessage
+    : rawMessage instanceof Error
+      ? rawMessage.message
+      : String(rawMessage ?? '');
+  if (!raw.trim()) {
+    return fallback;
+  }
+  const redactedParams = raw
+    .replace(/([?&](?:key|api_key|apikey|token|access_token)=)[^&\s"'`]+/gi, '$1[REDACTED]')
+    .replace(/\b(AIza|sk-ant-|sk-|ghp_|gho_|ghu_|ghs_|ghr_)[A-Za-z0-9\-_]+/g, '[REDACTED_CREDENTIAL]');
+  const scrubbed = defaultSecretScrubber.scrub(redactedParams).trim();
+  if (!scrubbed) {
+    return fallback;
+  }
+  return scrubbed.length > 240 ? `${scrubbed.slice(0, 237)}...` : scrubbed;
+}
+
+export function checkModelProviderVerificationReadiness(
+  provider: unknown
+): VerificationProviderReadiness {
+  if (!provider || typeof provider !== 'object') {
+    return {
+      ready: false,
+      reason: 'No model provider is configured for evidence verification.'
+    };
+  }
+
+  const candidate = provider as Partial<IModelProvider>;
+  const providerName = typeof candidate.name === 'string' && candidate.name.trim() !== ''
+    ? candidate.name.trim()
+    : 'unknown';
+  const modelId = typeof candidate.modelId === 'string' && candidate.modelId.trim() !== ''
+    ? candidate.modelId.trim()
+    : undefined;
+
+  if (typeof candidate.generateCompletion !== 'function') {
+    return {
+      ready: false,
+      providerName,
+      modelId,
+      reason: `Model provider '${providerName}' does not support completion generation required for verification.`
+    };
+  }
+
+  if (typeof candidate.isConfigured === 'function') {
+    try {
+      if (!candidate.isConfigured()) {
+        return {
+          ready: false,
+          providerName,
+          modelId,
+          reason: `Model provider '${providerName}' credentials or configuration are missing.`
+        };
+      }
+    } catch (err) {
+      return {
+        ready: false,
+        providerName,
+        modelId,
+        reason: sanitizeVerificationHealthMessage(
+          err instanceof Error ? err.message : String(err),
+          `Model provider '${providerName}' configuration check failed.`
+        )
+      };
+    }
+  }
+
+  return {
+    ready: true,
+    providerName,
+    modelId
+  };
 }
 
 export type VerificationFailureCode =
@@ -371,6 +469,29 @@ export class ModelProviderEvidenceVerifier implements IEvidenceVerifier {
     this.maxClaimChars = options.maxClaimChars ?? DEFAULT_MAX_CLAIM_CHARS;
     this.maxEvidenceChars = options.maxEvidenceChars ?? DEFAULT_MAX_EVIDENCE_CHARS;
     this.maxResponseChars = options.maxResponseChars ?? DEFAULT_MAX_RESPONSE_CHARS;
+  }
+
+  public isConfigured(): boolean {
+    return checkModelProviderVerificationReadiness(this.modelProvider).ready;
+  }
+
+  public getReadiness(): VerificationProviderReadiness {
+    return checkModelProviderVerificationReadiness(this.modelProvider);
+  }
+
+  public async isAvailable(): Promise<boolean> {
+    const readiness = checkModelProviderVerificationReadiness(this.modelProvider);
+    if (!readiness.ready) {
+      return false;
+    }
+    if (typeof this.modelProvider.isAvailable === 'function') {
+      try {
+        return Boolean(await this.modelProvider.isAvailable());
+      } catch {
+        return false;
+      }
+    }
+    return true;
   }
 
   public async evaluate(request: {
@@ -705,6 +826,11 @@ export class EvidenceVerificationEngine {
   private readonly maxExplanationChars: number;
   private readonly confidenceThreshold: number;
   private readonly inFlight: Map<string, Promise<VerifyClaimEvidenceResult>> = new Map();
+  private lastUnavailableIssue?: {
+    readonly code: VerificationFailureCode;
+    readonly reason: string;
+    readonly timestamp: string;
+  };
 
   constructor(options: EvidenceVerificationEngineOptions) {
     if (!options || typeof options !== 'object') {
@@ -773,6 +899,88 @@ export class EvidenceVerificationEngine {
         maxResponseChars: this.maxResponseChars
       });
     }
+  }
+
+  /**
+   * Returns non-sensitive local configuration and availability state without making any network calls.
+   */
+  public getOperationalStatus(): EvidenceVerificationOperationalStatus {
+    if (!this.verifier) {
+      return {
+        configured: false,
+        available: false,
+        liveCheckPerformed: false,
+        reason: 'No evidence verification provider is configured.'
+      };
+    }
+
+    if (this.verifier instanceof ModelProviderEvidenceVerifier) {
+      const readiness = this.verifier.getReadiness();
+      if (!readiness.ready) {
+        return {
+          configured: false,
+          available: false,
+          liveCheckPerformed: false,
+          verifierId: this.verifier.verifierId,
+          verifierVersion: this.verifier.verifierVersion,
+          providerName: readiness.providerName,
+          modelId: readiness.modelId,
+          reason: readiness.reason
+        };
+      }
+    } else if (typeof this.verifier.isConfigured === 'function') {
+      try {
+        if (!this.verifier.isConfigured()) {
+          return {
+            configured: false,
+            available: false,
+            liveCheckPerformed: false,
+            verifierId: this.verifier.verifierId,
+            verifierVersion: this.verifier.verifierVersion,
+            providerName: this.verifier.verifierId,
+            modelId: this.verifier.verifierVersion,
+            reason: `Verifier '${this.verifier.verifierId}' is not configured.`
+          };
+        }
+      } catch (err) {
+        return {
+          configured: false,
+          available: false,
+          liveCheckPerformed: false,
+          verifierId: this.verifier.verifierId,
+          verifierVersion: this.verifier.verifierVersion,
+          providerName: this.verifier.verifierId,
+          modelId: this.verifier.verifierVersion,
+          reason: sanitizeVerificationHealthMessage(
+            err,
+            `Verifier '${this.verifier.verifierId}' configuration check failed.`
+          )
+        };
+      }
+    }
+
+    if (this.lastUnavailableIssue) {
+      return {
+        configured: true,
+        available: false,
+        liveCheckPerformed: false,
+        verifierId: this.verifier.verifierId,
+        verifierVersion: this.verifier.verifierVersion,
+        providerName: this.verifier.verifierId,
+        modelId: this.verifier.verifierVersion,
+        reason: this.lastUnavailableIssue.reason
+      };
+    }
+
+    return {
+      configured: true,
+      available: true,
+      liveCheckPerformed: false,
+      verifierId: this.verifier.verifierId,
+      verifierVersion: this.verifier.verifierVersion,
+      providerName: this.verifier.verifierId,
+      modelId: this.verifier.verifierVersion
+    };
   }
 
   /**
@@ -1099,12 +1307,20 @@ export class EvidenceVerificationEngine {
         available = false;
       }
       if (!available) {
+        const failureReason = verifier instanceof ModelProviderEvidenceVerifier
+          ? (verifier.getReadiness().reason ?? `Verifier '${verifier.verifierId}' is currently unavailable.`)
+          : `Verifier '${verifier.verifierId}' is currently unavailable.`;
+        this.lastUnavailableIssue = {
+          code: 'PROVIDER_UNAVAILABLE',
+          reason: sanitizeVerificationHealthMessage(failureReason),
+          timestamp: now
+        };
         return this.buildFailureResult({
           claimId: claim.id,
           evidenceId: evidence.id,
           outcome: 'UNVERIFIED',
           errorCode: 'PROVIDER_UNAVAILABLE',
-          failureReason: `Verifier '${verifier.verifierId}' is currently unavailable.`,
+          failureReason: this.lastUnavailableIssue.reason,
           verifierId: verifier.verifierId,
           verifierVersion: verifier.verifierVersion,
           promptPolicyVersion: verifier.promptPolicyVersion,
@@ -1189,6 +1405,13 @@ export class EvidenceVerificationEngine {
       );
     } catch (err: unknown) {
       const classified = classifyVerificationError(err);
+      if (classified.errorCode === 'PROVIDER_UNAVAILABLE') {
+        this.lastUnavailableIssue = {
+          code: classified.errorCode,
+          reason: classified.message,
+          timestamp: now
+        };
+      }
       return this.buildFailureResult({
         claimId: claim.id,
         evidenceId: evidence.id,
@@ -1279,6 +1502,8 @@ export class EvidenceVerificationEngine {
 
       return record;
     });
+
+    this.lastUnavailableIssue = undefined;
 
     return {
       ok: true,
@@ -1391,12 +1616,12 @@ function classifyVerificationError(err: unknown): {
     return {
       outcome: isUnavailable ? 'UNVERIFIED' : 'FAILED',
       errorCode: err.code,
-      message: defaultSecretScrubber.scrub(err.message)
+      message: sanitizeVerificationHealthMessage(err.message)
     };
   }
 
   const rawMsg = err instanceof Error ? err.message : String(err);
-  const msg = defaultSecretScrubber.scrub(rawMsg);
+  const msg = sanitizeVerificationHealthMessage(rawMsg, '');
   const lower = msg.toLowerCase();
 
   if (

@@ -46,6 +46,7 @@ export interface DotsRuntimeConfig {
   readonly enableDynamicReplan: boolean;
   readonly enableCompensation: boolean;
   readonly enableScheduler: boolean;
+  readonly enableEvidenceVerification: boolean;
   readonly maxConversationHistory: number;
   readonly webSearchProvider: ConfiguredWebSearchProviderMode;
   readonly searxngUrl?: string;
@@ -81,6 +82,7 @@ export interface LoadRuntimeConfigOverrides {
   readonly enableDynamicReplan?: boolean;
   readonly enableCompensation?: boolean;
   readonly enableScheduler?: boolean;
+  readonly enableEvidenceVerification?: boolean;
   readonly maxConversationHistory?: number;
   readonly webSearchProvider?: ConfiguredWebSearchProviderMode;
   readonly searxngUrl?: string;
@@ -418,6 +420,18 @@ export function loadRuntimeConfig(overrides: LoadRuntimeConfigOverrides = {}): D
     embeddingJobPruneBatchSize = parsed;
   }
 
+  let enableEvidenceVerification = false;
+  if (overrides.enableEvidenceVerification !== undefined) {
+    if (typeof overrides.enableEvidenceVerification !== 'boolean') {
+      throw new ValidationError(
+        `Configuration 'enableEvidenceVerification' must be a boolean. Received '${String(overrides.enableEvidenceVerification)}'.`
+      );
+    }
+    enableEvidenceVerification = overrides.enableEvidenceVerification;
+  } else {
+    enableEvidenceVerification = parseBoolean(env.DOTS_ENABLE_EVIDENCE_VERIFICATION, false);
+  }
+
   return {
     dbPath,
     workspaceRoot,
@@ -440,6 +454,7 @@ export function loadRuntimeConfig(overrides: LoadRuntimeConfigOverrides = {}): D
     enableDynamicReplan: overrides.enableDynamicReplan ?? parseBoolean(env.DOTS_ENABLE_DYNAMIC_REPLAN, false),
     enableCompensation: overrides.enableCompensation ?? parseBoolean(env.DOTS_ENABLE_COMPENSATION, true),
     enableScheduler: overrides.enableScheduler ?? parseBoolean(env.DOTS_ENABLE_SCHEDULER, true),
+    enableEvidenceVerification,
     maxConversationHistory:
       overrides.maxConversationHistory ??
       parsePositiveInt(env.DOTS_MAX_CONVERSATION_HISTORY, 50, 'DOTS_MAX_CONVERSATION_HISTORY'),
