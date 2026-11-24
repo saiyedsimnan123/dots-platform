@@ -488,9 +488,21 @@ export class MemoryService {
       // Persist structured evidence atomically if provided
       if (input.evidence && input.evidence.length > 0) {
         const trustedTaskId = caller.taskId ?? (caller.actor === 'SYSTEM' ? ((input.metadata?.taskId as string) ?? 'system-task') : 'task-unspecified');
-        const trustedAgentId = caller.actor === 'AGENT'
-          ? (caller.principalId ?? 'agent-unspecified')
-          : (caller.principalId ?? caller.actor.toLowerCase());
+
+        let trustedAgentId: string;
+        if (caller.actor === 'AGENT') {
+          if (!caller.agentId || typeof caller.agentId !== 'string' || caller.agentId.trim() === '') {
+            throw new SecurityViolationError(
+              'Agent caller lacks authenticated agent identity attestation required for evidence persistence.',
+              'MISSING_AGENT_IDENTITY'
+            );
+          }
+          trustedAgentId = caller.agentId.trim();
+        } else {
+          trustedAgentId = caller.actor === 'SYSTEM'
+            ? (caller.agentId ?? 'system')
+            : (caller.actor === 'USER' ? 'user' : caller.actor.toLowerCase());
+        }
 
         for (const ev of input.evidence) {
           this.memoryRepo.addEvidence({

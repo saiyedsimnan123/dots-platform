@@ -500,6 +500,7 @@ export interface CallerContext {
   readonly permissions: ReadonlySet<MemoryPermission> | readonly MemoryPermission[];
   readonly taskId?: string;
   readonly principalId?: string;
+  readonly agentId?: string;
   readonly permittedScopes?: readonly ScopeIdentifier[];
   readonly _proof?: {
     readonly signature: string;

@@ -164,7 +164,101 @@ export function extractResearchProposals(
   const limitations: string[] = Array.isArray(report.limitationsAndUncertainty) ? report.limitationsAndUncertainty : [];
   const openQuestions: string[] = Array.isArray(report.openQuestions) ? report.openQuestions : [];
 
-  // 1. Reusable Research Findings (only if backed by verified sources)
+  // Helper: extract CandidateEvidence records from a source ONLY if relationship is explicitly established
+  function extractSourceEvidence(s: any): CandidateEvidence[] {
+    if (!s || typeof s !== 'object') return [];
+    if (s.relationship !== 'SUPPORTS' && s.relationship !== 'CONTRADICTS' && s.relationship !== 'LIMITATION') {
+      return [];
+    }
+
+    const rawUrl = typeof s.url === 'string' && s.url.trim() ? s.url.trim() : undefined;
+    const rawDomain = normalizeDomain(s.domain) ?? extractDomainFromUrl(rawUrl);
+    const rawTitle = typeof s.title === 'string' && s.title.trim() ? s.title.trim() : undefined;
+
+    const snippets: string[] = [];
+    if (Array.isArray(s.relevantEvidence)) {
+      for (const item of s.relevantEvidence) {
+        if (typeof item === 'string' && item.trim()) {
+          snippets.push(item.trim());
+        }
+      }
+    }
+    if (typeof s.snippet === 'string' && s.snippet.trim()) {
+      snippets.push(s.snippet.trim());
+    }
+    if (snippets.length === 0 && typeof s.summary === 'string' && s.summary.trim()) {
+      snippets.push(s.summary.trim());
+    }
+
+    const results: CandidateEvidence[] = [];
+    if (snippets.length > 0) {
+      for (const snippet of snippets) {
+        results.push({
+          sourceType: 'WEB_RESEARCH',
+          sourceUrl: rawUrl,
+          sourceDomain: rawDomain,
+          sourceTitle: rawTitle,
+          snippet,
+          snippetHash: createHash('sha256').update(snippet, 'utf8').digest('hex'),
+          relationship: s.relationship
+        });
+      }
+    } else if (rawUrl || rawDomain || rawTitle) {
+      const fallback = rawUrl ?? rawDomain ?? rawTitle ?? '';
+      results.push({
+        sourceType: 'WEB_RESEARCH',
+        sourceUrl: rawUrl,
+        sourceDomain: rawDomain,
+        sourceTitle: rawTitle,
+        snippet: undefined,
+        snippetHash: createHash('sha256').update(fallback, 'utf8').digest('hex'),
+        relationship: s.relationship
+      });
+    }
+    return results;
+  }
+
+  function sourceTargetsFinding(s: any, findingIndex: number, allFindings: readonly string[]): boolean {
+    if (!s || typeof s !== 'object') return false;
+
+    // Numerical index matching
+    if (typeof s.targetFindingIndex === 'number' && Number.isInteger(s.targetFindingIndex)) {
+      return s.targetFindingIndex === findingIndex;
+    }
+
+    // Array of indices matching
+    if (Array.isArray(s.targetFindingIndices)) {
+      return s.targetFindingIndices.includes(findingIndex);
+    }
+
+    // String / title / slug matching
+    if (typeof s.targetFinding === 'string' && s.targetFinding.trim()) {
+      const tf = s.targetFinding.trim().toLowerCase();
+      const claim = (allFindings[findingIndex] ?? '').toLowerCase();
+      if (tf === claim || tf === String(findingIndex) || tf === `finding-${findingIndex + 1}`) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function hasExplicitFindingTarget(s: any, numFindings: number): boolean {
+    if (!s || typeof s !== 'object') return false;
+    if (typeof s.targetFindingIndex === 'number' && Number.isInteger(s.targetFindingIndex)) {
+      // Must be within valid bounds to count as a valid target
+      return s.targetFindingIndex >= 0 && s.targetFindingIndex < numFindings;
+    }
+    if (Array.isArray(s.targetFindingIndices)) {
+      return s.targetFindingIndices.some((idx: unknown) => typeof idx === 'number' && idx >= 0 && idx < numFindings);
+    }
+    if (typeof s.targetFinding === 'string' && s.targetFinding.trim()) {
+      return true;
+    }
+    return false;
+  }
+
+  // 1. Reusable Research Findings
   if (findings.length > 0 && sources.length > 0) {
     const sourceSummary = sources
       .slice(0, 5)
@@ -178,74 +272,117 @@ export function extractResearchProposals(
       (conflicting.length > 0 ? `Differing Perspectives / Conflicting Evidence:\n${conflicting.map((c) => `- ${c}`).join('\n')}\n\n` : '') +
       `Sources Cited:\n- ${sourceSummary}`;
 
-    const evidenceList: CandidateEvidence[] = [];
-    for (const s of sources) {
-      if (!s || typeof s !== 'object') continue;
-      const rawUrl = typeof s.url === 'string' && s.url.trim() ? s.url.trim() : undefined;
-      const rawDomain = normalizeDomain(s.domain) ?? extractDomainFromUrl(rawUrl);
-      const rawTitle = typeof s.title === 'string' && s.title.trim() ? s.title.trim() : undefined;
-
-      const snippets: string[] = [];
-      if (Array.isArray(s.relevantEvidence)) {
-        for (const item of s.relevantEvidence) {
-          if (typeof item === 'string' && item.trim()) {
-            snippets.push(item.trim());
-          }
+    if (findings.length === 1) {
+      // Single finding: proposal is research.finding.${questionSlug}
+      const evidenceList: CandidateEvidence[] = [];
+      for (const s of sources) {
+        // Exclude out-of-bounds finding targets
+        if (typeof s.targetFindingIndex === 'number' && s.targetFindingIndex !== 0) {
+          continue;
         }
-      }
-      if (typeof s.snippet === 'string' && s.snippet.trim()) {
-        snippets.push(s.snippet.trim());
-      }
-      if (snippets.length === 0 && typeof s.summary === 'string' && s.summary.trim()) {
-        snippets.push(s.summary.trim());
+        evidenceList.push(...extractSourceEvidence(s));
       }
 
-      const relationship: EvidenceRelationship =
-        s.relationship === 'CONTRADICTS' || s.relationship === 'LIMITATION' || s.relationship === 'SUPPORTS'
-          ? s.relationship
-          : 'SUPPORTS';
+      proposals.push({
+        key: `research.finding.${questionSlug}`,
+        content: findingsContent,
+        category: 'PROJECT_FACT',
+        tags: ['research', 'finding', ...tokenizeKeyWords(question).slice(0, 5)],
+        priority: 60,
+        metadata: {
+          source: 'automatic_knowledge_proposal',
+          agentType: 'research',
+          question,
+          findingsCount: 1,
+          sourcesCount: sources.length
+        },
+        evidence: evidenceList.length > 0 ? evidenceList : undefined
+      });
+    } else {
+      // Multiple findings: check for explicit source-to-finding references
+      const hasTargeted = sources.some((s) => hasExplicitFindingTarget(s, findings.length));
 
-      if (snippets.length > 0) {
-        for (const snippet of snippets) {
-          evidenceList.push({
-            sourceType: 'WEB_RESEARCH',
-            sourceUrl: rawUrl,
-            sourceDomain: rawDomain,
-            sourceTitle: rawTitle,
-            snippet,
-            snippetHash: createHash('sha256').update(snippet, 'utf8').digest('hex'),
-            relationship
+      if (hasTargeted) {
+        // Emit individual finding proposals with isolated, dedicated evidence
+        for (let i = 0; i < findings.length; i++) {
+          const claim = findings[i]!;
+          const findingSlug = slugify(claim, 35);
+          const targetedSources = sources.filter((s) => sourceTargetsFinding(s, i, findings));
+          const findingEvidence: CandidateEvidence[] = [];
+          for (const s of targetedSources) {
+            findingEvidence.push(...extractSourceEvidence(s));
+          }
+
+          const cited = targetedSources
+            .map((s) => `${s.title ?? s.domain ?? 'Source'}: ${s.url ?? s.domain ?? 'public source'}`)
+            .join('\n- ');
+
+          const findingContent =
+            `Research Topic: ${question}\n\n` +
+            `Verified Finding ${i + 1}:\n${claim}\n\n` +
+            (cited ? `Sources Cited:\n- ${cited}` : `Sources Cited:\n- ${sourceSummary}`);
+
+          proposals.push({
+            key: `research.finding.${questionSlug}.${findingSlug}`,
+            content: findingContent.trim(),
+            category: 'PROJECT_FACT',
+            tags: ['research', 'finding', ...tokenizeKeyWords(question).slice(0, 3), ...tokenizeKeyWords(claim).slice(0, 2)],
+            priority: 60,
+            metadata: {
+              source: 'automatic_knowledge_proposal',
+              agentType: 'research',
+              question,
+              findingIndex: i,
+              finding: claim,
+              sourcesCount: targetedSources.length
+            },
+            evidence: findingEvidence.length > 0 ? findingEvidence : undefined
           });
         }
-      } else if (rawUrl || rawDomain || rawTitle) {
-        const fallback = rawUrl ?? rawDomain ?? rawTitle ?? '';
-        evidenceList.push({
-          sourceType: 'WEB_RESEARCH',
-          sourceUrl: rawUrl,
-          sourceDomain: rawDomain,
-          sourceTitle: rawTitle,
-          snippet: undefined,
-          snippetHash: createHash('sha256').update(fallback, 'utf8').digest('hex'),
-          relationship
+
+        // Also emit the composite summary proposal with preserved markdown content.
+        // Dedicated finding evidence is NOT attached to the composite proposal.
+        const generalSources = sources.filter((s) => !hasExplicitFindingTarget(s, findings.length));
+        const generalEvidence: CandidateEvidence[] = [];
+        for (const s of generalSources) {
+          generalEvidence.push(...extractSourceEvidence(s));
+        }
+
+        proposals.push({
+          key: `research.finding.${questionSlug}`,
+          content: findingsContent,
+          category: 'PROJECT_FACT',
+          tags: ['research', 'finding', ...tokenizeKeyWords(question).slice(0, 5)],
+          priority: 60,
+          metadata: {
+            source: 'automatic_knowledge_proposal',
+            agentType: 'research',
+            question,
+            findingsCount: findings.length,
+            sourcesCount: sources.length
+          },
+          evidence: generalEvidence.length > 0 ? generalEvidence : undefined
+        });
+      } else {
+        // No explicit source-to-finding targets: preserve composite proposal.
+        // Sources cannot be reliably associated with individual findings, so no false SUPPORTS evidence is attached.
+        proposals.push({
+          key: `research.finding.${questionSlug}`,
+          content: findingsContent,
+          category: 'PROJECT_FACT',
+          tags: ['research', 'finding', ...tokenizeKeyWords(question).slice(0, 5)],
+          priority: 60,
+          metadata: {
+            source: 'automatic_knowledge_proposal',
+            agentType: 'research',
+            question,
+            findingsCount: findings.length,
+            sourcesCount: sources.length
+          },
+          evidence: undefined
         });
       }
     }
-
-    proposals.push({
-      key: `research.finding.${questionSlug}`,
-      content: findingsContent,
-      category: 'PROJECT_FACT',
-      tags: ['research', 'finding', ...tokenizeKeyWords(question).slice(0, 5)],
-      priority: 60,
-      metadata: {
-        source: 'automatic_knowledge_proposal',
-        agentType: 'research',
-        question,
-        findingsCount: findings.length,
-        sourcesCount: sources.length
-      },
-      evidence: evidenceList.length > 0 ? evidenceList : undefined
-    });
   }
 
   // 2. Explicit Limitations & Unresolved Questions
@@ -254,6 +391,15 @@ export function extractResearchProposals(
       `Research Boundaries & Uncertainty for: ${question}\n\n` +
       (limitations.length > 0 ? `Limitations & Uncertainty:\n${limitations.map((l) => `- ${l}`).join('\n')}\n\n` : '') +
       (openQuestions.length > 0 ? `Open Questions for Future Investigation:\n${openQuestions.map((q) => `- ${q}`).join('\n')}` : '');
+
+    // Never attach SUPPORTS evidence to limitations.
+    // Only attach sources explicitly established as LIMITATION targeting limitations.
+    const limitationEvidence: CandidateEvidence[] = [];
+    for (const s of sources) {
+      if (s && s.relationship === 'LIMITATION' && (s.targetFinding === 'limitations' || s.targetFinding === 'uncertainty')) {
+        limitationEvidence.push(...extractSourceEvidence(s));
+      }
+    }
 
     proposals.push({
       key: `research.limitations.${questionSlug}`,
@@ -267,7 +413,8 @@ export function extractResearchProposals(
         question,
         limitationsCount: limitations.length,
         openQuestionsCount: openQuestions.length
-      }
+      },
+      evidence: limitationEvidence.length > 0 ? limitationEvidence : undefined
     });
   }
 
@@ -752,6 +899,11 @@ export class KnowledgeProposalPipeline {
 
     // Invariant 2: Agent caller must be authenticated and valid
     if (caller.actor !== 'AGENT') {
+      return [];
+    }
+
+    // Executing agent identity validation: attested agentId must match the executing agent
+    if (caller.agentId && caller.agentId !== agentId) {
       return [];
     }
 

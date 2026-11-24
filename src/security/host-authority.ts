@@ -137,7 +137,7 @@ export class HostMemoryAuthority {
 
     const nonce = randomBytes(16).toString('hex');
     const sortedPerms = Array.from(SYSTEM_PERMISSIONS).sort().join(',');
-    const payload = `SYSTEM|${input.scope.scopeType}|${input.scope.scopeId}|${sortedPerms}|${input.taskId ?? ''}|${nonce}`;
+    const payload = `SYSTEM|${input.scope.scopeType}|${input.scope.scopeId}|${sortedPerms}|${input.taskId ?? ''}|${input.agentId ?? ''}|${nonce}`;
     const signature = createHmac('sha256', this.#hostSecret).update(payload, 'utf8').digest('hex');
 
     const context: CallerContext = Object.freeze({
@@ -149,6 +149,7 @@ export class HostMemoryAuthority {
       permissions: Object.freeze(new Set(SYSTEM_PERMISSIONS)),
       taskId: input.taskId,
       ...(input.principalId !== undefined ? { principalId: input.principalId } : {}),
+      ...(input.agentId !== undefined ? { agentId: input.agentId } : {}),
       ...(input.permittedScopes !== undefined
         ? {
             permittedScopes: Object.freeze(

@@ -22,6 +22,7 @@ import type {
   AgentExecutionStatus
 } from './types.ts';
 import type { ToolDefinition } from '../model/types.ts';
+import type { EvidenceRelationship } from '../domain/types.ts';
 import type { WebSearchResult, WebSearchResponse } from '../tools/web-tools.ts';
 import { defaultSecretScrubber } from '../model/secret-scrubber.ts';
 import {
@@ -56,6 +57,10 @@ export interface ResearchSource {
   readonly retrievedAt: string;
   readonly relevantEvidence: readonly string[];
   readonly summary: string;
+  readonly relationship?: EvidenceRelationship;
+  readonly targetFindingIndex?: number;
+  readonly targetFindingIndices?: readonly number[];
+  readonly targetFinding?: string;
 }
 
 /**
@@ -370,7 +375,7 @@ export class ResearchAgent extends BaseAgent {
       researchQuestion,
       executiveSummary: synthesis.executiveSummary,
       keyFindings: synthesis.keyFindings,
-      evidenceAndSources: gatheredSources,
+      evidenceAndSources: synthesis.sources,
       agreements: synthesis.agreements,
       conflictingEvidence: synthesis.conflictingEvidence,
       inferences: synthesis.inferences,
@@ -662,6 +667,7 @@ export class ResearchAgent extends BaseAgent {
   ): {
     executiveSummary: string;
     keyFindings: readonly string[];
+    sources: readonly ResearchSource[];
     agreements: readonly string[];
     conflictingEvidence: readonly string[];
     inferences: readonly string[];
@@ -675,6 +681,7 @@ export class ResearchAgent extends BaseAgent {
       return {
         executiveSummary: `No verified public sources were found to answer '${question}'.`,
         keyFindings: [],
+        sources: [],
         agreements: [],
         conflictingEvidence: [],
         inferences: [],
@@ -696,12 +703,19 @@ export class ResearchAgent extends BaseAgent {
     const openQuestions: string[] = [];
     const suggestedNextSteps: string[] = [];
 
+    // Map source ID to finding indices it directly backed
+    const sourceFindingMap = new Map<string, number[]>();
+
     // 1. Compile Key Findings directly from evidence
     for (let i = 0; i < sources.length; i++) {
       const src = sources[i]!;
       for (const ev of src.relevantEvidence) {
         if (keyFindings.length < 5) {
+          const findingIndex = keyFindings.length;
           keyFindings.push(`${ev} [Source: ${src.domain}]`);
+          const existing = sourceFindingMap.get(src.id) ?? [];
+          existing.push(findingIndex);
+          sourceFindingMap.set(src.id, existing);
         }
       }
     }
@@ -733,12 +747,12 @@ export class ResearchAgent extends BaseAgent {
     }
 
     // 3. Contradiction & Polarity Detection across sources
+    let posSource: ResearchSource | null = null;
+    let negSource: ResearchSource | null = null;
+
     if (sources.length >= 2) {
       const polarPositive = /(?:advantage|faster|benefit|superior|increases|growth|success|effective|secure)/i;
       const polarNegative = /(?:disadvantage|slower|risk|inferior|decreases|decline|limitation|flaw|vulnerability)/i;
-
-      let posSource: ResearchSource | null = null;
-      let negSource: ResearchSource | null = null;
 
       for (const src of sources) {
         const text = src.relevantEvidence.join(' ');
@@ -752,6 +766,27 @@ export class ResearchAgent extends BaseAgent {
         );
       }
     }
+
+    // Assign explicit, conservative evidence relationships
+    const attributedSources: ResearchSource[] = sources.map((src) => {
+      const supportedIndices = sourceFindingMap.get(src.id);
+      if (supportedIndices && supportedIndices.length > 0) {
+        return {
+          ...src,
+          relationship: 'SUPPORTS' as const,
+          targetFindingIndex: supportedIndices[0],
+          targetFindingIndices: supportedIndices
+        };
+      }
+      if (negSource && src.id === negSource.id && posSource && posSource.id !== negSource.id) {
+        return {
+          ...src,
+          relationship: 'CONTRADICTS' as const
+        };
+      }
+      // Background or cited source without explicit support relationship
+      return src;
+    });
 
     // 4. Limitations and uncertainty
     limitationsAndUncertainty.push(
@@ -780,6 +815,7 @@ export class ResearchAgent extends BaseAgent {
     return {
       executiveSummary,
       keyFindings,
+      sources: attributedSources,
       agreements,
       conflictingEvidence,
       inferences,

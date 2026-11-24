@@ -110,12 +110,14 @@ export interface AuthorizeUserInput {
 
 export interface AuthorizeAgentInput {
   readonly taskId: string;
+  readonly agentId?: string;
 }
 
 export interface AuthorizeSystemInput {
   readonly scope: ScopeIdentifier;
   readonly taskId?: string;
   readonly principalId?: string;
+  readonly agentId?: string;
   readonly permittedScopes?: readonly ScopeIdentifier[];
 }
 
@@ -325,6 +327,14 @@ export class MemoryAuthorizer {
       throw new ValidationError('TaskRepository is required to authorize an agent.');
     }
 
+    let agentId: string | undefined;
+    if (input.agentId !== undefined) {
+      if (typeof input.agentId !== 'string' || input.agentId.trim() === '') {
+        throw new ValidationError('agentId must be a non-empty string.');
+      }
+      agentId = input.agentId.trim();
+    }
+
     const task = this.#taskRepo.getTaskById(input.taskId);
     if (!task) {
       throw new TaskNotFoundError(input.taskId);
@@ -365,6 +375,7 @@ export class MemoryAuthorizer {
       permissions: AGENT_PERMISSIONS,
       taskId: input.taskId,
       principalId,
+      agentId,
       permittedScopes
     });
   }
@@ -460,6 +471,7 @@ export class MemoryAuthorizer {
       c.scope,
       c.permissions,
       c.taskId,
+      c.agentId,
       c._proof.nonce
     );
 
@@ -492,6 +504,7 @@ export class MemoryAuthorizer {
     readonly permissions: ReadonlySet<MemoryPermission>;
     readonly taskId?: string;
     readonly principalId?: string;
+    readonly agentId?: string;
     readonly permittedScopes?: readonly ScopeIdentifier[];
   }): CallerContext {
     const nonce = randomBytes(16).toString('hex');
@@ -500,6 +513,7 @@ export class MemoryAuthorizer {
       params.scope,
       params.permissions,
       params.taskId,
+      params.agentId,
       nonce
     );
 
@@ -512,6 +526,7 @@ export class MemoryAuthorizer {
       permissions: Object.freeze(new Set(params.permissions)),
       taskId: params.taskId,
       ...(params.principalId !== undefined ? { principalId: params.principalId } : {}),
+      ...(params.agentId !== undefined ? { agentId: params.agentId } : {}),
       ...(params.permittedScopes !== undefined
         ? {
             permittedScopes: Object.freeze(
@@ -534,10 +549,11 @@ export class MemoryAuthorizer {
     scope: ScopeIdentifier,
     permissions: ReadonlySet<MemoryPermission> | readonly MemoryPermission[],
     taskId: string | undefined,
+    agentId: string | undefined,
     nonce: string
   ): string {
     const sortedPerms = Array.from(permissions).sort().join(',');
-    const payload = `${actor}|${scope.scopeType}|${scope.scopeId}|${sortedPerms}|${taskId ?? ''}|${nonce}`;
+    const payload = `${actor}|${scope.scopeType}|${scope.scopeId}|${sortedPerms}|${taskId ?? ''}|${agentId ?? ''}|${nonce}`;
     return createHmac('sha256', this.#hostSecret).update(payload, 'utf8').digest('hex');
   }
 }

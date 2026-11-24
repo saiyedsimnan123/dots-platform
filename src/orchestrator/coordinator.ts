@@ -604,7 +604,7 @@ export class TaskCoordinator {
     if (this.authorizer) {
       const taskScope = this.verifyTaskScope(task);
       if (taskScope !== null) {
-        agentCaller = this.authorizer.authorizeAgent({ taskId: task.id });
+        agentCaller = this.authorizer.authorizeAgent({ taskId: task.id, agentId });
 
         // Phase 4B.1: Pre-Execution Memory Retrieval
         if (this.memoryService && !input.context?._memoryInjected) {
