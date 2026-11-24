@@ -66,6 +66,8 @@ export interface ModelConfig {
   readonly temperature?: number;
   readonly maxTokens?: number;
   readonly stopSequences?: readonly string[];
+  readonly responseMimeType?: string;
+  readonly signal?: AbortSignal;
 }
 
 export interface CompiledPlanPrompt {

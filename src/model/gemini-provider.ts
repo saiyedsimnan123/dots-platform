@@ -183,9 +183,14 @@ export class GeminiProvider implements IModelProvider {
     this.assertApiKey();
 
     const sanitizedMessages = this.compiler.compileMessages(messages);
+    const systemParts: Array<{ text: string }> = [];
     const contents: GeminiContent[] = [];
 
     for (const msg of sanitizedMessages) {
+      if (msg.role === 'system') {
+        systemParts.push({ text: msg.content });
+        continue;
+      }
       const role: 'user' | 'model' = msg.role === 'assistant' ? 'model' : 'user';
       contents.push({
         role,
@@ -194,13 +199,19 @@ export class GeminiProvider implements IModelProvider {
     }
 
     const endpoint = `${this.baseUrl}/models/${this.modelId}:generateContent?key=${this.apiKey}`;
+    const generationConfig: Record<string, unknown> = {
+      temperature: config?.temperature ?? 0.2,
+      maxOutputTokens: config?.maxTokens ?? 2048,
+      stopSequences: config?.stopSequences
+    };
+    if (config?.responseMimeType) {
+      generationConfig.responseMimeType = config.responseMimeType;
+    }
+
     const payload: Record<string, unknown> = {
+      ...(systemParts.length > 0 ? { systemInstruction: { parts: systemParts } } : {}),
       contents,
-      generationConfig: {
-        temperature: config?.temperature ?? 0.2,
-        maxOutputTokens: config?.maxTokens ?? 2048,
-        stopSequences: config?.stopSequences
-      }
+      generationConfig
     };
 
     if (tools && tools.length > 0) {
@@ -222,7 +233,8 @@ export class GeminiProvider implements IModelProvider {
     const response = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      ...(config?.signal ? { signal: config.signal } : {})
     });
 
     if (!response.ok) {

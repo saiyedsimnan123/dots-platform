@@ -32,7 +32,12 @@ import type {
   CreateEvidenceInput,
   MemoryClaim,
   CreateClaimInput,
-  ListClaimsFilter
+  ListClaimsFilter,
+  ClaimVerificationRelationship,
+  ClaimVerificationCandidateOutcome,
+  ClaimEvidenceVerification,
+  CreateClaimVerificationInput,
+  ListClaimVerificationsFilter
 } from '../domain/types.ts';
 import {
   canonicalizeClaimText,
@@ -59,7 +64,12 @@ export type {
   EvidenceRelationship,
   MemoryClaim,
   CreateClaimInput,
-  ListClaimsFilter
+  ListClaimsFilter,
+  ClaimVerificationRelationship,
+  ClaimVerificationCandidateOutcome,
+  ClaimEvidenceVerification,
+  CreateClaimVerificationInput,
+  ListClaimVerificationsFilter
 };
 
 export function computeSnippetHash(snippet?: string | null, fallback: string = ''): string {
@@ -69,6 +79,18 @@ export function computeSnippetHash(snippet?: string | null, fallback: string = '
 
 export function computeEvidenceId(memoryId: string, snippetHash: string, relationship: string): string {
   return createHash('sha256').update(`${memoryId}:${snippetHash}:${relationship}`, 'utf8').digest('hex');
+}
+
+export function computeClaimVerificationId(
+  claimId: string,
+  evidenceId: string,
+  verifierId: string,
+  verifierVersion: string,
+  promptPolicyHash: string
+): string {
+  return createHash('sha256')
+    .update(`${claimId}:${evidenceId}:${verifierId}:${verifierVersion}:${promptPolicyHash}`, 'utf8')
+    .digest('hex');
 }
 
 interface MemoryDbRow {
@@ -130,6 +152,25 @@ interface ClaimDbRow {
   created_at: string;
 }
 
+interface ClaimVerificationDbRow {
+  id: string;
+  claim_id: string;
+  evidence_id: string;
+  scope_type: string;
+  scope_id: string;
+  proposed_relationship: string;
+  verification_outcome: string;
+  verifier_id: string;
+  verifier_version: string;
+  prompt_policy_version: string;
+  prompt_policy_hash: string;
+  confidence: number | null;
+  explanation: string;
+  review_recommended: number;
+  task_id: string | null;
+  created_at: string;
+}
+
 type SqlParam = null | number | bigint | string | Uint8Array;
 
 const VALID_CATEGORIES: ReadonlySet<MemoryCategory> = new Set([
@@ -159,6 +200,20 @@ const VALID_EVIDENCE_RELATIONSHIPS: ReadonlySet<EvidenceRelationship> = new Set(
   'SUPPORTS',
   'CONTRADICTS',
   'LIMITATION'
+]);
+
+const VALID_VERIFICATION_RELATIONSHIPS: ReadonlySet<ClaimVerificationRelationship> = new Set([
+  'SUPPORTS',
+  'CONTRADICTS',
+  'LIMITATION',
+  'INSUFFICIENT',
+  'AMBIGUOUS'
+]);
+
+const VALID_VERIFICATION_OUTCOMES: ReadonlySet<ClaimVerificationCandidateOutcome> = new Set([
+  'PROPOSED',
+  'INSUFFICIENT',
+  'AMBIGUOUS'
 ]);
 
 export class MemoryRepository {
@@ -846,11 +901,33 @@ export class MemoryRepository {
 
   /**
    * Retrieves an evidence record by ID.
+   * If scope is provided, verifies that the parent memory belongs to the designated scope.
+   * Throws MemoryScopeViolationError if the evidence belongs to another scope.
    */
-  public getEvidenceById(id: string): MemoryEvidence | null {
+  public getEvidenceById(id: string, scope?: ScopeIdentifier): MemoryEvidence | null {
     if (!id || typeof id !== 'string' || id.trim() === '') {
       throw new ValidationError('Evidence ID must be a non-empty string.');
     }
+    if (scope) {
+      this.validateScope(scope.scopeType, scope.scopeId);
+      const row = this.db.prepare(`
+        SELECT e.*, m.scope_type AS memory_scope_type, m.scope_id AS memory_scope_id
+        FROM memory_evidence e
+        INNER JOIN memories m ON e.memory_id = m.id
+        WHERE e.id = ?
+      `).get(id.trim()) as unknown as (EvidenceDbRow & { memory_scope_type: string; memory_scope_id: string }) | undefined;
+      if (!row) {
+        return null;
+      }
+      this.assertScopeMatch(
+        row.memory_scope_type as MemoryScopeType,
+        row.memory_scope_id,
+        scope,
+        row.memory_id
+      );
+      return this.mapEvidenceRow(row);
+    }
+
     const row = this.db.prepare('SELECT * FROM memory_evidence WHERE id = ?').get(id.trim()) as unknown as EvidenceDbRow | undefined;
     return row ? this.mapEvidenceRow(row) : null;
   }
@@ -1123,6 +1200,299 @@ export class MemoryRepository {
     const stmt = this.db.prepare(sql);
     const rows = stmt.all(...params) as unknown as ClaimDbRow[];
     return rows.map((r) => this.mapClaimRow(r));
+  }
+
+  /**
+   * Computes deterministic claim-evidence verification ID.
+   */
+  public computeClaimVerificationId(
+    claimId: string,
+    evidenceId: string,
+    verifierId: string,
+    verifierVersion: string,
+    promptPolicyHash: string
+  ): string {
+    return computeClaimVerificationId(claimId, evidenceId, verifierId, verifierVersion, promptPolicyHash);
+  }
+
+  /**
+   * Persists a proposed claim-evidence verification record within the designated scope.
+   * Deduplicates deterministically by (claim_id, evidence_id, verifier_id, verifier_version, prompt_policy_hash).
+   * Never mutates memory status or existing human approval decisions.
+   */
+  public addClaimVerification(input: CreateClaimVerificationInput): ClaimEvidenceVerification {
+    this.validateClaimVerificationInput(input);
+
+    const claimId = input.claimId.trim();
+    const evidenceId = input.evidenceId.trim();
+    const verifierId = input.verifierId.trim();
+    const verifierVersion = input.verifierVersion.trim();
+    const promptPolicyVersion = input.promptPolicyVersion.trim();
+    const promptPolicyHash = input.promptPolicyHash.trim();
+    const scope: ScopeIdentifier = { scopeType: input.scopeType, scopeId: input.scopeId };
+
+    // Verify both claim and evidence exist strictly inside this scope
+    const claim = this.getClaimById(claimId, scope);
+    if (!claim) {
+      throw new ValidationError(`Claim '${claimId}' was not found in scope '${scope.scopeType}:${scope.scopeId}'.`);
+    }
+    const evidence = this.getEvidenceById(evidenceId, scope);
+    if (!evidence) {
+      throw new ValidationError(`Evidence '${evidenceId}' was not found in scope '${scope.scopeType}:${scope.scopeId}'.`);
+    }
+
+    const id = input.id && input.id.trim() !== ''
+      ? input.id.trim()
+      : computeClaimVerificationId(claimId, evidenceId, verifierId, verifierVersion, promptPolicyHash);
+
+    const existingById = this.getClaimVerificationById(id, scope);
+    if (existingById) {
+      return existingById;
+    }
+
+    const existingByKey = this.findClaimVerification({
+      claimId,
+      evidenceId,
+      verifierId,
+      verifierVersion,
+      promptPolicyHash,
+      scope
+    });
+    if (existingByKey) {
+      return existingByKey;
+    }
+
+    const confidence = input.confidence === undefined || input.confidence === null ? null : input.confidence;
+    const explanation = input.explanation.trim();
+    const reviewRecommended = Boolean(input.reviewRecommended);
+    const taskId = typeof input.taskId === 'string' && input.taskId.trim() !== '' ? input.taskId.trim() : null;
+    const now = input.createdAt && input.createdAt.trim() !== '' ? input.createdAt.trim() : new Date().toISOString();
+
+    const stmt = this.db.prepare(`
+      INSERT INTO claim_evidence_verifications (
+        id, claim_id, evidence_id, scope_type, scope_id,
+        proposed_relationship, verification_outcome,
+        verifier_id, verifier_version, prompt_policy_version, prompt_policy_hash,
+        confidence, explanation, review_recommended, task_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    try {
+      stmt.run(
+        id,
+        claimId,
+        evidenceId,
+        input.scopeType,
+        input.scopeId,
+        input.proposedRelationship,
+        input.verificationOutcome,
+        verifierId,
+        verifierVersion,
+        promptPolicyVersion,
+        promptPolicyHash,
+        confidence,
+        explanation,
+        reviewRecommended ? 1 : 0,
+        taskId,
+        now
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/UNIQUE constraint failed/i.test(msg)) {
+        const raceRow = this.findClaimVerification({
+          claimId,
+          evidenceId,
+          verifierId,
+          verifierVersion,
+          promptPolicyHash,
+          scope
+        });
+        if (raceRow) {
+          return raceRow;
+        }
+      }
+      throw err;
+    }
+
+    return {
+      id,
+      claimId,
+      evidenceId,
+      scopeType: input.scopeType,
+      scopeId: input.scopeId,
+      proposedRelationship: input.proposedRelationship,
+      verificationOutcome: input.verificationOutcome,
+      verifierId,
+      verifierVersion,
+      promptPolicyVersion,
+      promptPolicyHash,
+      confidence,
+      explanation,
+      reviewRecommended,
+      taskId,
+      createdAt: now
+    };
+  }
+
+  /**
+   * Retrieves a proposed claim verification record by ID.
+   * If scope is provided, enforces scope containment.
+   */
+  public getClaimVerificationById(id: string, scope?: ScopeIdentifier): ClaimEvidenceVerification | null {
+    if (!id || typeof id !== 'string' || id.trim() === '') {
+      throw new ValidationError('Verification ID must be a non-empty string.');
+    }
+    const row = this.db
+      .prepare('SELECT * FROM claim_evidence_verifications WHERE id = ?')
+      .get(id.trim()) as unknown as ClaimVerificationDbRow | undefined;
+    if (!row) {
+      return null;
+    }
+    if (scope) {
+      this.validateScope(scope.scopeType, scope.scopeId);
+      this.assertScopeMatch(row.scope_type as MemoryScopeType, row.scope_id, scope, id);
+    }
+    return this.mapClaimVerificationRow(row);
+  }
+
+  /**
+   * Finds an existing deduplicated verification record by exact provenance tuple within scope.
+   */
+  public findClaimVerification(params: {
+    readonly claimId: string;
+    readonly evidenceId: string;
+    readonly verifierId: string;
+    readonly verifierVersion: string;
+    readonly promptPolicyHash: string;
+    readonly scope: ScopeIdentifier;
+  }): ClaimEvidenceVerification | null {
+    this.validateScope(params.scope.scopeType, params.scope.scopeId);
+    const row = this.db.prepare(`
+      SELECT * FROM claim_evidence_verifications
+      WHERE claim_id = ?
+        AND evidence_id = ?
+        AND verifier_id = ?
+        AND verifier_version = ?
+        AND prompt_policy_hash = ?
+        AND scope_type = ?
+        AND scope_id = ?
+    `).get(
+      params.claimId.trim(),
+      params.evidenceId.trim(),
+      params.verifierId.trim(),
+      params.verifierVersion.trim(),
+      params.promptPolicyHash.trim(),
+      params.scope.scopeType,
+      params.scope.scopeId
+    ) as unknown as ClaimVerificationDbRow | undefined;
+
+    return row ? this.mapClaimVerificationRow(row) : null;
+  }
+
+  /**
+   * Retrieves verification records for a claim, enforcing scope if provided.
+   */
+  public getVerificationsByClaimId(claimId: string, scope?: ScopeIdentifier): ClaimEvidenceVerification[] {
+    if (!claimId || typeof claimId !== 'string' || claimId.trim() === '') {
+      throw new ValidationError('Claim ID must be a non-empty string.');
+    }
+    if (scope) {
+      this.validateScope(scope.scopeType, scope.scopeId);
+      // Also enforce claim scope check if claim exists in another scope
+      this.getClaimById(claimId.trim(), scope);
+      const rows = this.db.prepare(`
+        SELECT * FROM claim_evidence_verifications
+        WHERE claim_id = ? AND scope_type = ? AND scope_id = ?
+        ORDER BY created_at ASC, id ASC
+      `).all(claimId.trim(), scope.scopeType, scope.scopeId) as unknown as ClaimVerificationDbRow[];
+      return rows.map((r) => this.mapClaimVerificationRow(r));
+    }
+
+    const rows = this.db.prepare(`
+      SELECT * FROM claim_evidence_verifications
+      WHERE claim_id = ?
+      ORDER BY created_at ASC, id ASC
+    `).all(claimId.trim()) as unknown as ClaimVerificationDbRow[];
+    return rows.map((r) => this.mapClaimVerificationRow(r));
+  }
+
+  /**
+   * Retrieves verification records for an evidence item, enforcing scope if provided.
+   */
+  public getVerificationsByEvidenceId(evidenceId: string, scope?: ScopeIdentifier): ClaimEvidenceVerification[] {
+    if (!evidenceId || typeof evidenceId !== 'string' || evidenceId.trim() === '') {
+      throw new ValidationError('Evidence ID must be a non-empty string.');
+    }
+    if (scope) {
+      this.validateScope(scope.scopeType, scope.scopeId);
+      // Also enforce evidence scope check if evidence exists in another scope
+      this.getEvidenceById(evidenceId.trim(), scope);
+      const rows = this.db.prepare(`
+        SELECT * FROM claim_evidence_verifications
+        WHERE evidence_id = ? AND scope_type = ? AND scope_id = ?
+        ORDER BY created_at ASC, id ASC
+      `).all(evidenceId.trim(), scope.scopeType, scope.scopeId) as unknown as ClaimVerificationDbRow[];
+      return rows.map((r) => this.mapClaimVerificationRow(r));
+    }
+
+    const rows = this.db.prepare(`
+      SELECT * FROM claim_evidence_verifications
+      WHERE evidence_id = ?
+      ORDER BY created_at ASC, id ASC
+    `).all(evidenceId.trim()) as unknown as ClaimVerificationDbRow[];
+    return rows.map((r) => this.mapClaimVerificationRow(r));
+  }
+
+  /**
+   * Lists verification records within an explicit scope.
+   */
+  public listClaimVerifications(filter: ListClaimVerificationsFilter): ClaimEvidenceVerification[] {
+    if (!filter || typeof filter !== 'object') {
+      throw new ValidationError('Filter must be provided to listClaimVerifications.');
+    }
+    this.validateScope(filter.scopeType, filter.scopeId);
+
+    const conditions: string[] = ['scope_type = ?', 'scope_id = ?'];
+    const params: SqlParam[] = [filter.scopeType, filter.scopeId];
+
+    if (filter.claimId) {
+      conditions.push('claim_id = ?');
+      params.push(filter.claimId.trim());
+    }
+    if (filter.evidenceId) {
+      conditions.push('evidence_id = ?');
+      params.push(filter.evidenceId.trim());
+    }
+    if (filter.proposedRelationship) {
+      if (!VALID_VERIFICATION_RELATIONSHIPS.has(filter.proposedRelationship)) {
+        throw new ValidationError(
+          `Invalid proposedRelationship '${String(filter.proposedRelationship)}'.`
+        );
+      }
+      conditions.push('proposed_relationship = ?');
+      params.push(filter.proposedRelationship);
+    }
+
+    let sql = `SELECT * FROM claim_evidence_verifications WHERE ${conditions.join(' AND ')} ORDER BY created_at ASC, id ASC`;
+
+    if (filter.limit !== undefined) {
+      if (typeof filter.limit !== 'number' || !Number.isInteger(filter.limit) || filter.limit < 1) {
+        throw new ValidationError('Limit must be a positive integer.');
+      }
+      sql += ' LIMIT ?';
+      params.push(filter.limit);
+
+      if (filter.offset !== undefined) {
+        if (typeof filter.offset !== 'number' || !Number.isInteger(filter.offset) || filter.offset < 0) {
+          throw new ValidationError('Offset must be a non-negative integer.');
+        }
+        sql += ' OFFSET ?';
+        params.push(filter.offset);
+      }
+    }
+
+    const rows = this.db.prepare(sql).all(...params) as unknown as ClaimVerificationDbRow[];
+    return rows.map((r) => this.mapClaimVerificationRow(r));
   }
 
   /**
@@ -1497,6 +1867,75 @@ export class MemoryRepository {
       taskId: row.task_id,
       createdAt: row.created_at
     };
+  }
+
+  private mapClaimVerificationRow(row: ClaimVerificationDbRow): ClaimEvidenceVerification {
+    return {
+      id: row.id,
+      claimId: row.claim_id,
+      evidenceId: row.evidence_id,
+      scopeType: row.scope_type as MemoryScopeType,
+      scopeId: row.scope_id,
+      proposedRelationship: row.proposed_relationship as ClaimVerificationRelationship,
+      verificationOutcome: row.verification_outcome as ClaimVerificationCandidateOutcome,
+      verifierId: row.verifier_id,
+      verifierVersion: row.verifier_version,
+      promptPolicyVersion: row.prompt_policy_version,
+      promptPolicyHash: row.prompt_policy_hash,
+      confidence: row.confidence,
+      explanation: row.explanation,
+      reviewRecommended: row.review_recommended === 1,
+      taskId: row.task_id,
+      createdAt: row.created_at
+    };
+  }
+
+  private validateClaimVerificationInput(input: CreateClaimVerificationInput): void {
+    if (!input || typeof input !== 'object') {
+      throw new ValidationError('CreateClaimVerificationInput must be provided.');
+    }
+    this.validateScope(input.scopeType, input.scopeId);
+    if (!input.claimId || typeof input.claimId !== 'string' || input.claimId.trim() === '') {
+      throw new ValidationError('Verification claimId must be a non-empty string.');
+    }
+    if (!input.evidenceId || typeof input.evidenceId !== 'string' || input.evidenceId.trim() === '') {
+      throw new ValidationError('Verification evidenceId must be a non-empty string.');
+    }
+    if (!input.proposedRelationship || !VALID_VERIFICATION_RELATIONSHIPS.has(input.proposedRelationship)) {
+      throw new ValidationError(
+        `Invalid proposedRelationship '${String(input.proposedRelationship)}'.`
+      );
+    }
+    if (!input.verificationOutcome || !VALID_VERIFICATION_OUTCOMES.has(input.verificationOutcome)) {
+      throw new ValidationError(
+        `Invalid verificationOutcome '${String(input.verificationOutcome)}'.`
+      );
+    }
+    if (!input.verifierId || typeof input.verifierId !== 'string' || input.verifierId.trim() === '') {
+      throw new ValidationError('Verification verifierId must be a non-empty string.');
+    }
+    if (!input.verifierVersion || typeof input.verifierVersion !== 'string' || input.verifierVersion.trim() === '') {
+      throw new ValidationError('Verification verifierVersion must be a non-empty string.');
+    }
+    if (!input.promptPolicyVersion || typeof input.promptPolicyVersion !== 'string' || input.promptPolicyVersion.trim() === '') {
+      throw new ValidationError('Verification promptPolicyVersion must be a non-empty string.');
+    }
+    if (!input.promptPolicyHash || typeof input.promptPolicyHash !== 'string' || input.promptPolicyHash.trim() === '') {
+      throw new ValidationError('Verification promptPolicyHash must be a non-empty string.');
+    }
+    if (
+      input.confidence !== undefined &&
+      input.confidence !== null &&
+      (typeof input.confidence !== 'number' || !Number.isFinite(input.confidence) || input.confidence < 0 || input.confidence > 1)
+    ) {
+      throw new ValidationError(`Verification confidence must be a finite number in [0, 1], received '${String(input.confidence)}'.`);
+    }
+    if (typeof input.explanation !== 'string' || input.explanation.trim() === '') {
+      throw new ValidationError('Verification explanation must be a non-empty string.');
+    }
+    if (input.explanation.length > 1000) {
+      throw new ValidationError(`Verification explanation exceeds limit of 1000 characters (${input.explanation.length}).`);
+    }
   }
 
   private validateEvidenceInput(input: CreateEvidenceInput): void {

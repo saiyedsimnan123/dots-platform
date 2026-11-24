@@ -72,6 +72,7 @@ import type { AuthenticatedPrincipal, MemoryAuthorizer } from '../security/memor
 import { TokenIdentityProvider } from '../security/token-identity-provider.ts';
 import { VerificationEngine } from '../verification/verifier.ts';
 import { MemoryService } from '../memory/memory-service.ts';
+import { EvidenceVerificationEngine } from '../memory/evidence-verifier.ts';
 import { TaskCoordinator } from '../orchestrator/coordinator.ts';
 import { AgentRegistry, ResearchAgent, AnalyticsAgent, DeveloperAgent, type AgentMetadata } from '../agents/index.ts';
 import { TaskScheduler } from '../scheduler/task-scheduler.ts';
@@ -222,6 +223,7 @@ export class DotsRuntime {
   public readonly identityProvider: TokenIdentityProvider;
   public readonly authorizer: MemoryAuthorizer;
   public readonly memoryService: MemoryService;
+  public readonly evidenceVerifier: EvidenceVerificationEngine;
   public readonly toolRegistry: ToolRegistry;
   public readonly policyEngine: PolicyEngine;
   public readonly approvalBroker: ApprovalBroker;
@@ -366,6 +368,14 @@ export class DotsRuntime {
           })
         : new MockModelProvider());
 
+    this.evidenceVerifier = new EvidenceVerificationEngine({
+      modelProvider: this.modelProvider,
+      memoryRepo: this.memoryRepo,
+      authorizer: this.authorizer,
+      auditRepo: this.auditRepo,
+      taskRepo: this.taskRepo
+    });
+
     this.agentRegistry = options.agentRegistry ?? new AgentRegistry();
     if (!this.agentRegistry.has('research-agent')) {
       this.agentRegistry.register(new ResearchAgent({ id: 'research-agent' }));
@@ -401,7 +411,8 @@ export class DotsRuntime {
       authorizer: this.authorizer,
       enableDynamicReplan: this.config.enableDynamicReplan,
       enableCompensation: this.config.enableCompensation,
-      agentRegistry: this.agentRegistry
+      agentRegistry: this.agentRegistry,
+      evidenceVerifier: this.evidenceVerifier
     });
 
     this.crashRecovery = new CrashRecoveryEngine(this.taskRepo, this.auditRepo);

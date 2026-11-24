@@ -538,6 +538,43 @@ export class DatabaseManager {
               ON memory_claims(scope_type, scope_id, claim_hash);
           `);
         }
+      },
+      {
+        version: '011_claim_evidence_verifications',
+        up: (db) => {
+          db.exec(`
+            CREATE TABLE IF NOT EXISTS claim_evidence_verifications (
+              id TEXT PRIMARY KEY,
+              claim_id TEXT NOT NULL REFERENCES memory_claims(id) ON DELETE CASCADE,
+              evidence_id TEXT NOT NULL REFERENCES memory_evidence(id) ON DELETE CASCADE,
+              scope_type TEXT NOT NULL CHECK (scope_type IN ('GLOBAL', 'WORKSPACE')),
+              scope_id TEXT NOT NULL,
+              proposed_relationship TEXT NOT NULL CHECK (
+                proposed_relationship IN ('SUPPORTS', 'CONTRADICTS', 'LIMITATION', 'INSUFFICIENT', 'AMBIGUOUS')
+              ),
+              verification_outcome TEXT NOT NULL CHECK (
+                verification_outcome IN ('PROPOSED', 'INSUFFICIENT', 'AMBIGUOUS')
+              ),
+              verifier_id TEXT NOT NULL,
+              verifier_version TEXT NOT NULL,
+              prompt_policy_version TEXT NOT NULL,
+              prompt_policy_hash TEXT NOT NULL,
+              confidence REAL CHECK (confidence IS NULL OR (confidence >= 0.0 AND confidence <= 1.0)),
+              explanation TEXT NOT NULL,
+              review_recommended INTEGER NOT NULL DEFAULT 0 CHECK (review_recommended IN (0, 1)),
+              task_id TEXT,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_cev_claim_id ON claim_evidence_verifications(claim_id);
+            CREATE INDEX IF NOT EXISTS idx_cev_evidence_id ON claim_evidence_verifications(evidence_id);
+            CREATE INDEX IF NOT EXISTS idx_cev_scope ON claim_evidence_verifications(scope_type, scope_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_cev_dedup
+              ON claim_evidence_verifications(
+                claim_id, evidence_id, verifier_id, verifier_version, prompt_policy_hash
+              );
+          `);
+        }
       }
     ];
 

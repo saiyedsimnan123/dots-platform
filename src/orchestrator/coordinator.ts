@@ -39,6 +39,7 @@ import { PromptCompiler } from '../model/prompt-compiler.ts';
 import { defaultSecretScrubber } from '../model/secret-scrubber.ts';
 import { createMemoryProposeTool, createMemorySearchTool } from '../tools/memory-tools.ts';
 import { KnowledgeProposalPipeline } from '../memory/knowledge-pipeline.ts';
+import type { EvidenceVerificationEngine } from '../memory/evidence-verifier.ts';
 import { AgentRegistry, createAgentExecutionContext, mergeAgentContext, type AgentInput, type AgentOutput } from '../agents/index.ts';
 
 const NON_SENSITIVE_PROOF_WORDS = new Set([
@@ -156,6 +157,8 @@ export interface CoordinatorOptions {
   readonly agentRegistry?: AgentRegistry; // Shared agent registry for specialized agents
   readonly knowledgePipeline?: KnowledgeProposalPipeline;
   readonly enableKnowledgeProposals?: boolean;
+  readonly evidenceVerifier?: EvidenceVerificationEngine;
+  readonly enableEvidenceVerification?: boolean;
 }
 
 export class TaskCoordinator {
@@ -183,6 +186,8 @@ export class TaskCoordinator {
   public readonly agentRegistry: AgentRegistry;
   public readonly knowledgePipeline: KnowledgeProposalPipeline;
   public readonly enableKnowledgeProposals: boolean;
+  public readonly evidenceVerifier?: EvidenceVerificationEngine;
+  public readonly enableEvidenceVerification: boolean;
 
   constructor(options: CoordinatorOptions) {
     if (options.memoryService) {
@@ -245,6 +250,8 @@ export class TaskCoordinator {
     this.agentRegistry = options.agentRegistry ?? new AgentRegistry();
     this.knowledgePipeline = options.knowledgePipeline ?? new KnowledgeProposalPipeline();
     this.enableKnowledgeProposals = options.enableKnowledgeProposals ?? true;
+    this.evidenceVerifier = options.evidenceVerifier;
+    this.enableEvidenceVerification = options.enableEvidenceVerification ?? false;
 
     // Register agent memory tools when memory subsystem and authorizer are configured
     if (this.memoryService && this.authorizer) {
@@ -735,7 +742,10 @@ export class TaskCoordinator {
             agentId,
             output,
             caller: agentCaller,
-            memoryService: this.memoryService
+            memoryService: this.memoryService,
+            ...(this.enableEvidenceVerification && this.evidenceVerifier
+              ? { verificationEngine: this.evidenceVerifier }
+              : {})
           });
           if (proposed.length > 0) {
             this.auditRepo.appendEvent({

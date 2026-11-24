@@ -68,7 +68,9 @@ import type {
   MemoryClaim,
   CreateClaimInput,
   ListClaimsFilter,
-  CandidateClaim
+  CandidateClaim,
+  ClaimEvidenceVerification,
+  ListClaimVerificationsFilter
 } from '../domain/types.ts';
 import {
   ValidationError,
@@ -3009,6 +3011,73 @@ export class MemoryService {
     }, false);
 
     return claims;
+  }
+
+  /**
+   * Retrieves proposed claim-evidence verification records for a claim within caller's scope.
+   */
+  public getClaimVerificationsByClaimId(
+    caller: CallerContext,
+    claimId: string
+  ): ClaimEvidenceVerification[] {
+    this.validateCaller(caller, 'READ');
+    if (!claimId || typeof claimId !== 'string' || claimId.trim() === '') {
+      throw new ValidationError('Claim ID must be a non-empty string.');
+    }
+
+    try {
+      return this.memoryRepo.getVerificationsByClaimId(claimId, caller.scope);
+    } catch (err) {
+      if (err instanceof MemoryScopeViolationError) {
+        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+          reason: 'CROSS_SCOPE_CLAIM_ACCESS_ATTEMPT',
+          operation: 'getClaimById',
+          expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+        }, false);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Retrieves proposed claim-evidence verification records for an evidence item within caller's scope.
+   */
+  public getClaimVerificationsByEvidenceId(
+    caller: CallerContext,
+    evidenceId: string
+  ): ClaimEvidenceVerification[] {
+    this.validateCaller(caller, 'READ');
+    if (!evidenceId || typeof evidenceId !== 'string' || evidenceId.trim() === '') {
+      throw new ValidationError('Evidence ID must be a non-empty string.');
+    }
+
+    try {
+      return this.memoryRepo.getVerificationsByEvidenceId(evidenceId, caller.scope);
+    } catch (err) {
+      if (err instanceof MemoryScopeViolationError) {
+        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+          reason: 'CROSS_SCOPE_READ_ATTEMPT',
+          operation: 'getEvidenceByMemoryId',
+          expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+        }, false);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Lists proposed claim-evidence verification records within caller's authorized scope.
+   */
+  public listClaimVerifications(
+    caller: CallerContext,
+    filter?: Omit<ListClaimVerificationsFilter, 'scopeType' | 'scopeId'>
+  ): ClaimEvidenceVerification[] {
+    this.validateCaller(caller, 'READ');
+    return this.memoryRepo.listClaimVerifications({
+      ...filter,
+      scopeType: caller.scope.scopeType,
+      scopeId: caller.scope.scopeId
+    });
   }
 
   /**

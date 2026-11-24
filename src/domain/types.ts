@@ -104,7 +104,8 @@ export type AuditEventType =
   | 'CONVERSATION_ARCHIVED'
   | 'CONVERSATION_DELETED'
   | 'CONVERSATION_MESSAGE_SENT'
-  | 'KNOWLEDGE_PROPOSALS_GENERATED';
+  | 'KNOWLEDGE_PROPOSALS_GENERATED'
+  | 'CLAIM_EVIDENCE_VERIFIED';
 
 /**
  * Primary Task Entity.
@@ -405,6 +406,75 @@ export interface ListClaimsFilter {
   readonly scopeId: string;
   readonly taskId?: string;
   readonly memoryId?: string;
+  readonly limit?: number;
+  readonly offset?: number;
+}
+
+/**
+ * Phase 4D.3D.4C.3 - Claim-Evidence Verification Types
+ */
+
+export type ClaimVerificationRelationship =
+  | 'SUPPORTS'
+  | 'CONTRADICTS'
+  | 'LIMITATION'
+  | 'INSUFFICIENT'
+  | 'AMBIGUOUS';
+
+export type ClaimVerificationCandidateOutcome =
+  | 'PROPOSED'
+  | 'INSUFFICIENT'
+  | 'AMBIGUOUS';
+
+export type ClaimVerificationOutcome =
+  | ClaimVerificationCandidateOutcome
+  | 'UNVERIFIED'
+  | 'FAILED';
+
+export interface ClaimEvidenceVerification {
+  readonly id: string;
+  readonly claimId: string;
+  readonly evidenceId: string;
+  readonly scopeType: MemoryScopeType;
+  readonly scopeId: string;
+  readonly proposedRelationship: ClaimVerificationRelationship;
+  readonly verificationOutcome: ClaimVerificationCandidateOutcome;
+  readonly verifierId: string;
+  readonly verifierVersion: string;
+  readonly promptPolicyVersion: string;
+  readonly promptPolicyHash: string;
+  readonly confidence: number | null;
+  readonly explanation: string;
+  readonly reviewRecommended: boolean;
+  readonly taskId: string | null;
+  readonly createdAt: string;
+}
+
+export interface CreateClaimVerificationInput {
+  readonly id?: string;
+  readonly claimId: string;
+  readonly evidenceId: string;
+  readonly scopeType: MemoryScopeType;
+  readonly scopeId: string;
+  readonly proposedRelationship: ClaimVerificationRelationship;
+  readonly verificationOutcome: ClaimVerificationCandidateOutcome;
+  readonly verifierId: string;
+  readonly verifierVersion: string;
+  readonly promptPolicyVersion: string;
+  readonly promptPolicyHash: string;
+  readonly confidence?: number | null;
+  readonly explanation: string;
+  readonly reviewRecommended?: boolean;
+  readonly taskId?: string | null;
+  readonly createdAt?: string;
+}
+
+export interface ListClaimVerificationsFilter {
+  readonly scopeType: MemoryScopeType;
+  readonly scopeId: string;
+  readonly claimId?: string;
+  readonly evidenceId?: string;
+  readonly proposedRelationship?: ClaimVerificationRelationship;
   readonly limit?: number;
   readonly offset?: number;
 }

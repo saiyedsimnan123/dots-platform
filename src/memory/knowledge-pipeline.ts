@@ -35,6 +35,7 @@ import type {
 } from '../domain/types.ts';
 import type { AgentOutput } from '../agents/types.ts';
 import type { MemoryService } from './memory-service.ts';
+import type { EvidenceVerificationEngine } from './evidence-verifier.ts';
 import { defaultSecretScrubber } from '../model/secret-scrubber.ts';
 import { sanitizeProposalMetadata } from '../tools/memory-tools.ts';
 import { BASIC_ENGLISH_STOP_WORDS } from './relevance-matcher.ts';
@@ -56,6 +57,7 @@ export interface ProcessCompletedTaskOptions {
   readonly output: AgentOutput;
   readonly caller: CallerContext;
   readonly memoryService: MemoryService;
+  readonly verificationEngine?: EvidenceVerificationEngine;
 }
 
 /**
@@ -1081,6 +1083,22 @@ export class KnowledgeProposalPipeline {
         submitted.push(memory);
         runCandidateKeys.add(scrubbedKey);
         runCandidateContents.add(boundedContent.toLowerCase());
+
+        // Optional bounded evidence verification (fail-safe: unavailability never fails proposal submission or task)
+        if (
+          options.verificationEngine &&
+          memory.status === 'PENDING_APPROVAL' &&
+          candidate.claims &&
+          candidate.claims.length > 0 &&
+          candidate.evidence &&
+          candidate.evidence.length > 0
+        ) {
+          try {
+            await options.verificationEngine.verifyProposalClaims(caller, memory.id);
+          } catch {
+            // Verification failure or unavailability must never fail proposal creation or the research task
+          }
+        }
       } catch {
         // Individual proposal submission error should not fail the pipeline or task
       }

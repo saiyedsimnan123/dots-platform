@@ -56,6 +56,8 @@ export * from './memory/relevance-matcher.ts';
 export * from './memory/context-builder.ts';
 export * from './memory/hybrid-retriever.ts';
 export * from './memory/memory-service.ts';
+export * from './memory/claim-normalizer.ts';
+export * from './memory/evidence-verifier.ts';
 export * from './memory/canonical-json.ts';
 export type * from './memory/embedding-types.ts';
 export * from './memory/embedding-types.ts';
