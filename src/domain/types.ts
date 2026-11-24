@@ -361,6 +361,54 @@ export interface CreateEvidenceInput {
   readonly createdAt?: string;
 }
 
+export interface CandidateClaim {
+  readonly originalText: string;
+  readonly canonicalText?: string;
+  readonly claimHash?: string;
+  readonly subject?: string | null;
+  readonly predicate?: string | null;
+  readonly qualifier?: string | null;
+}
+
+export interface MemoryClaim {
+  readonly id: string;
+  readonly memoryId: string | null;
+  readonly scopeType: MemoryScopeType;
+  readonly scopeId: string;
+  readonly originalText: string;
+  readonly canonicalText: string;
+  readonly claimHash: string;
+  readonly subject: string | null;
+  readonly predicate: string | null;
+  readonly qualifier: string | null;
+  readonly taskId: string;
+  readonly createdAt: string;
+}
+
+export interface CreateClaimInput {
+  readonly id?: string;
+  readonly memoryId?: string | null;
+  readonly scopeType: MemoryScopeType;
+  readonly scopeId: string;
+  readonly originalText: string;
+  readonly canonicalText?: string;
+  readonly claimHash?: string;
+  readonly subject?: string | null;
+  readonly predicate?: string | null;
+  readonly qualifier?: string | null;
+  readonly taskId: string;
+  readonly createdAt?: string;
+}
+
+export interface ListClaimsFilter {
+  readonly scopeType: MemoryScopeType;
+  readonly scopeId: string;
+  readonly taskId?: string;
+  readonly memoryId?: string;
+  readonly limit?: number;
+  readonly offset?: number;
+}
+
 export type WritableMemoryStatus = Exclude<MemoryStatus, 'SUPERSEDED'>;
 
 export interface CreateMemoryInput {
@@ -375,6 +423,7 @@ export interface CreateMemoryInput {
   readonly tags?: readonly string[];
   readonly metadata?: Record<string, unknown>;
   readonly evidence?: readonly CandidateEvidence[];
+  readonly claims?: readonly CandidateClaim[];
 }
 
 export interface UpdateMemoryInput {

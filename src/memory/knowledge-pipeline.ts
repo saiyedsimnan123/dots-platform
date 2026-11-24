@@ -30,7 +30,8 @@ import type {
   Task,
   CandidateEvidence,
   EvidenceSourceType,
-  EvidenceRelationship
+  EvidenceRelationship,
+  CandidateClaim
 } from '../domain/types.ts';
 import type { AgentOutput } from '../agents/types.ts';
 import type { MemoryService } from './memory-service.ts';
@@ -46,6 +47,7 @@ export interface CandidateMemoryProposal {
   readonly priority?: number;
   readonly metadata?: Record<string, unknown>;
   readonly evidence?: readonly CandidateEvidence[];
+  readonly claims?: readonly CandidateClaim[];
 }
 
 export interface ProcessCompletedTaskOptions {
@@ -308,7 +310,8 @@ export function extractResearchProposals(
           findingsCount: 1,
           sourcesCount: sources.length
         },
-        evidence: evidenceList.length > 0 ? evidenceList : undefined
+        evidence: evidenceList.length > 0 ? evidenceList : undefined,
+        claims: [{ originalText: findings[0]! }]
       });
     } else {
       // Multiple findings: check for explicit source-to-finding references
@@ -348,7 +351,8 @@ export function extractResearchProposals(
               finding: claim,
               sourcesCount: targetedSources.length
             },
-            evidence: findingEvidence.length > 0 ? findingEvidence : undefined
+            evidence: findingEvidence.length > 0 ? findingEvidence : undefined,
+            claims: [{ originalText: claim }]
           });
         }
 
@@ -377,7 +381,8 @@ export function extractResearchProposals(
             findingsCount: findings.length,
             sourcesCount: sources.length
           },
-          evidence: generalEvidence.length > 0 ? generalEvidence : undefined
+          evidence: generalEvidence.length > 0 ? generalEvidence : undefined,
+          claims: findings.map((f) => ({ originalText: f }))
         });
       } else {
         // No explicit source-to-finding targets: preserve composite proposal.
@@ -395,7 +400,8 @@ export function extractResearchProposals(
             findingsCount: findings.length,
             sourcesCount: sources.length
           },
-          evidence: undefined
+          evidence: undefined,
+          claims: findings.map((f) => ({ originalText: f }))
         });
       }
     }
@@ -1068,7 +1074,8 @@ export class KnowledgeProposalPipeline {
           priority: candidate.priority ?? 50,
           tags,
           metadata,
-          evidence: candidate.evidence
+          evidence: candidate.evidence,
+          claims: candidate.claims
         });
 
         submitted.push(memory);

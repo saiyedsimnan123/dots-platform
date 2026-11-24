@@ -64,7 +64,11 @@ import type {
   MemoryPurgeResult,
   ScoredMemory,
   MemoryEvidence,
-  CandidateEvidence
+  CandidateEvidence,
+  MemoryClaim,
+  CreateClaimInput,
+  ListClaimsFilter,
+  CandidateClaim
 } from '../domain/types.ts';
 import {
   ValidationError,
@@ -516,6 +520,25 @@ export class MemoryService {
             relationship: ev.relationship,
             taskId: trustedTaskId,
             agentId: trustedAgentId
+          });
+        }
+      }
+
+      // Persist atomic claims atomically if provided
+      if (input.claims && input.claims.length > 0) {
+        const trustedTaskId = caller.taskId ?? (caller.actor === 'SYSTEM' ? ((input.metadata?.taskId as string) ?? 'system-task') : 'task-unspecified');
+        for (const c of input.claims) {
+          this.memoryRepo.addClaim({
+            memoryId: memory.id,
+            originalText: c.originalText,
+            canonicalText: c.canonicalText,
+            claimHash: c.claimHash,
+            subject: c.subject,
+            predicate: c.predicate,
+            qualifier: c.qualifier,
+            scopeType: caller.scope.scopeType,
+            scopeId: caller.scope.scopeId,
+            taskId: trustedTaskId
           });
         }
       }
@@ -2843,6 +2866,149 @@ export class MemoryService {
     }, false);
 
     return evidence;
+  }
+
+  /**
+   * Persists an atomic claim within the caller's authorized scope.
+   */
+  public createClaim(caller: CallerContext, input: CreateClaimInput): MemoryClaim {
+    this.validateCaller(caller, 'WRITE');
+    if (!input || typeof input !== 'object') {
+      throw new ValidationError('CreateClaimInput must be provided.');
+    }
+
+    this.assertCallerScopeMatch(caller, input.scopeType, input.scopeId, 'createClaim');
+
+    const trustedTaskId = caller.taskId ?? input.taskId;
+    if (!trustedTaskId || typeof trustedTaskId !== 'string' || trustedTaskId.trim() === '') {
+      throw new ValidationError('Task ID must be provided or attested on caller context.');
+    }
+
+    return this.memoryRepo.transaction(() => {
+      const claim = this.memoryRepo.addClaim({
+        ...input,
+        scopeType: caller.scope.scopeType,
+        scopeId: caller.scope.scopeId,
+        taskId: trustedTaskId
+      });
+
+      this.audit(caller, 'MEMORY_CREATED', {
+        operation: 'createClaim',
+        category: 'PROJECT_FACT',
+        scopeType: caller.scope.scopeType,
+        scopeId: caller.scope.scopeId,
+        status: 'ACTIVE'
+      }, true);
+
+      return claim;
+    });
+  }
+
+  /**
+   * Retrieves an atomic claim by ID strictly within the caller's authorized scope.
+   */
+  public getClaimById(caller: CallerContext, claimId: string): MemoryClaim | null {
+    this.validateCaller(caller, 'READ');
+    if (!claimId || typeof claimId !== 'string' || claimId.trim() === '') {
+      throw new ValidationError('Claim ID must be a non-empty string.');
+    }
+
+    let claim: MemoryClaim | null;
+    try {
+      claim = this.memoryRepo.getClaimById(claimId, caller.scope);
+    } catch (err) {
+      if (err instanceof MemoryScopeViolationError) {
+        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+          reason: 'CROSS_SCOPE_CLAIM_ACCESS_ATTEMPT',
+          operation: 'getClaimById',
+          expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+        }, false);
+      }
+      throw err;
+    }
+
+    this.audit(caller, 'MEMORY_RETRIEVED', {
+      operation: 'getClaimById',
+      scopeType: caller.scope.scopeType,
+      scopeId: caller.scope.scopeId
+    }, false);
+
+    return claim;
+  }
+
+  /**
+   * Retrieves an atomic claim by its canonical SHA-256 hash strictly within caller's scope.
+   */
+  public getClaimByHash(caller: CallerContext, claimHash: string): MemoryClaim | null {
+    this.validateCaller(caller, 'READ');
+    if (!claimHash || typeof claimHash !== 'string' || claimHash.trim() === '') {
+      throw new ValidationError('Claim hash must be a non-empty string.');
+    }
+
+    const claim = this.memoryRepo.getClaimByHash(claimHash, caller.scope);
+
+    this.audit(caller, 'MEMORY_RETRIEVED', {
+      operation: 'getClaimByHash',
+      scopeType: caller.scope.scopeType,
+      scopeId: caller.scope.scopeId
+    }, false);
+
+    return claim;
+  }
+
+  /**
+   * Retrieves all atomic claims linked to a memory within caller's scope.
+   */
+  public getClaimsByMemoryId(caller: CallerContext, memoryId: string): MemoryClaim[] {
+    this.validateCaller(caller, 'READ');
+    if (!memoryId || typeof memoryId !== 'string' || memoryId.trim() === '') {
+      throw new ValidationError('Memory ID must be a non-empty string.');
+    }
+
+    let claims: MemoryClaim[];
+    try {
+      claims = this.memoryRepo.getClaimsByMemoryId(memoryId, caller.scope);
+    } catch (err) {
+      if (err instanceof MemoryScopeViolationError) {
+        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+          reason: 'CROSS_SCOPE_CLAIM_ACCESS_ATTEMPT',
+          operation: 'getClaimsByMemoryId',
+          memoryId,
+          expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+        }, false);
+      }
+      throw err;
+    }
+
+    this.audit(caller, 'MEMORY_RETRIEVED', {
+      operation: 'getClaimsByMemoryId',
+      memoryId,
+      scopeType: caller.scope.scopeType,
+      scopeId: caller.scope.scopeId
+    }, false);
+
+    return claims;
+  }
+
+  /**
+   * Lists atomic claims within the caller's authorized scope.
+   */
+  public listClaims(caller: CallerContext, filter?: Omit<ListClaimsFilter, 'scopeType' | 'scopeId'>): MemoryClaim[] {
+    this.validateCaller(caller, 'READ');
+
+    const claims = this.memoryRepo.listClaims({
+      ...filter,
+      scopeType: caller.scope.scopeType,
+      scopeId: caller.scope.scopeId
+    });
+
+    this.audit(caller, 'MEMORY_RETRIEVED', {
+      operation: 'listClaims',
+      scopeType: caller.scope.scopeType,
+      scopeId: caller.scope.scopeId
+    }, false);
+
+    return claims;
   }
 
   /**

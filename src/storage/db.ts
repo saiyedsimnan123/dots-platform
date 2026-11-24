@@ -510,6 +510,34 @@ export class DatabaseManager {
               ON memory_evidence(memory_id, snippet_hash, relationship);
           `);
         }
+      },
+      {
+        version: '010_memory_claims',
+        up: (db) => {
+          db.exec(`
+            CREATE TABLE IF NOT EXISTS memory_claims (
+              id TEXT PRIMARY KEY,
+              memory_id TEXT REFERENCES memories(id) ON DELETE SET NULL,
+              scope_type TEXT NOT NULL CHECK (scope_type IN ('GLOBAL', 'WORKSPACE')),
+              scope_id TEXT NOT NULL,
+              original_text TEXT NOT NULL,
+              canonical_text TEXT NOT NULL,
+              claim_hash TEXT NOT NULL,
+              subject TEXT,
+              predicate TEXT,
+              qualifier TEXT,
+              task_id TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_claims_scope ON memory_claims(scope_type, scope_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_claims_memory_id ON memory_claims(memory_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_claims_task_id ON memory_claims(task_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_claims_hash ON memory_claims(claim_hash);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_claims_scope_hash
+              ON memory_claims(scope_type, scope_id, claim_hash);
+          `);
+        }
       }
     ];
 

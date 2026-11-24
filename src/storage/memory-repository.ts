@@ -29,8 +29,16 @@ import type {
   EvidenceSourceType,
   EvidenceRelationship,
   MemoryEvidence,
-  CreateEvidenceInput
+  CreateEvidenceInput,
+  MemoryClaim,
+  CreateClaimInput,
+  ListClaimsFilter
 } from '../domain/types.ts';
+import {
+  canonicalizeClaimText,
+  computeClaimHash,
+  computeClaimId
+} from '../memory/claim-normalizer.ts';
 import type {
   MissingEmbeddingMemoryRecord,
   ListMissingEmbeddingsFilter
@@ -42,7 +50,17 @@ import {
   MemoryScopeViolationError
 } from '../domain/errors.ts';
 
-export type { ScopeIdentifier, SupersedeMemoryParams, MemoryEvidence, CreateEvidenceInput, EvidenceSourceType, EvidenceRelationship };
+export type {
+  ScopeIdentifier,
+  SupersedeMemoryParams,
+  MemoryEvidence,
+  CreateEvidenceInput,
+  EvidenceSourceType,
+  EvidenceRelationship,
+  MemoryClaim,
+  CreateClaimInput,
+  ListClaimsFilter
+};
 
 export function computeSnippetHash(snippet?: string | null, fallback: string = ''): string {
   const content = (snippet && snippet.trim().length > 0) ? snippet.trim() : fallback.trim();
@@ -94,6 +112,21 @@ interface EvidenceDbRow {
   relationship: string;
   task_id: string;
   agent_id: string;
+  created_at: string;
+}
+
+interface ClaimDbRow {
+  id: string;
+  memory_id: string | null;
+  scope_type: string;
+  scope_id: string;
+  original_text: string;
+  canonical_text: string;
+  claim_hash: string;
+  subject: string | null;
+  predicate: string | null;
+  qualifier: string | null;
+  task_id: string;
   created_at: string;
 }
 
@@ -857,6 +890,242 @@ export class MemoryRepository {
   }
 
   /**
+   * Persists a deterministic, scope-aware atomic claim.
+   * If an identical claim exists in this scope, returns the existing claim (and updates memoryId if newly linked).
+   */
+  public addClaim(input: CreateClaimInput): MemoryClaim {
+    if (!input || typeof input !== 'object') {
+      throw new ValidationError('CreateClaimInput must be provided.');
+    }
+
+    const originalText = typeof input.originalText === 'string' ? input.originalText.trim() : '';
+    if (originalText === '') {
+      throw new ValidationError('Original claim text must be a non-empty string.');
+    }
+
+    this.validateScope(input.scopeType, input.scopeId);
+
+    const taskId = typeof input.taskId === 'string' ? input.taskId.trim() : '';
+    if (taskId === '') {
+      throw new ValidationError('Claim taskId must be a non-empty string.');
+    }
+
+    const canonicalText = input.canonicalText && input.canonicalText.trim() !== ''
+      ? input.canonicalText.trim()
+      : canonicalizeClaimText(originalText);
+
+    if (canonicalText === '') {
+      throw new ValidationError('Claim text cannot be empty or consist solely of citation markers.');
+    }
+
+    const claimHash = input.claimHash && input.claimHash.trim() !== ''
+      ? input.claimHash.trim()
+      : computeClaimHash(canonicalText);
+
+    const id = input.id && input.id.trim() !== ''
+      ? input.id.trim()
+      : computeClaimId(input.scopeType, input.scopeId, claimHash);
+
+    // 1. Check if identical claim already exists by id
+    const existingById = this.getClaimById(id);
+    if (existingById) {
+      if (input.memoryId && !existingById.memoryId) {
+        this.db.prepare('UPDATE memory_claims SET memory_id = ? WHERE id = ?').run(input.memoryId.trim(), id);
+        return { ...existingById, memoryId: input.memoryId.trim() };
+      }
+      return existingById;
+    }
+
+    // 2. Check if identical claim already exists by (scope_type, scope_id, claim_hash)
+    const existingByHash = this.getClaimByHash(claimHash, { scopeType: input.scopeType, scopeId: input.scopeId });
+    if (existingByHash) {
+      if (input.memoryId && !existingByHash.memoryId) {
+        this.db.prepare('UPDATE memory_claims SET memory_id = ? WHERE id = ?').run(input.memoryId.trim(), existingByHash.id);
+        return { ...existingByHash, memoryId: input.memoryId.trim() };
+      }
+      return existingByHash;
+    }
+
+    const now = input.createdAt ?? new Date().toISOString();
+    const memoryId = input.memoryId && input.memoryId.trim() !== '' ? input.memoryId.trim() : null;
+    const subject = typeof input.subject === 'string' && input.subject.trim() !== '' ? input.subject.trim() : null;
+    const predicate = typeof input.predicate === 'string' && input.predicate.trim() !== '' ? input.predicate.trim() : null;
+    const qualifier = typeof input.qualifier === 'string' && input.qualifier.trim() !== '' ? input.qualifier.trim() : null;
+
+    const stmt = this.db.prepare(`
+      INSERT INTO memory_claims (
+        id, memory_id, scope_type, scope_id, original_text, canonical_text,
+        claim_hash, subject, predicate, qualifier, task_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    try {
+      stmt.run(
+        id,
+        memoryId,
+        input.scopeType,
+        input.scopeId,
+        originalText,
+        canonicalText,
+        claimHash,
+        subject,
+        predicate,
+        qualifier,
+        taskId,
+        now
+      );
+    } catch (err: any) {
+      if (String(err?.message).includes('UNIQUE constraint failed')) {
+        const raceClaim = this.getClaimByHash(claimHash, { scopeType: input.scopeType, scopeId: input.scopeId });
+        if (raceClaim) {
+          if (input.memoryId && !raceClaim.memoryId) {
+            this.db.prepare('UPDATE memory_claims SET memory_id = ? WHERE id = ?').run(input.memoryId.trim(), raceClaim.id);
+            return { ...raceClaim, memoryId: input.memoryId.trim() };
+          }
+          return raceClaim;
+        }
+      }
+      throw err;
+    }
+
+    return {
+      id,
+      memoryId,
+      scopeType: input.scopeType,
+      scopeId: input.scopeId,
+      originalText,
+      canonicalText,
+      claimHash,
+      subject,
+      predicate,
+      qualifier,
+      taskId,
+      createdAt: now
+    };
+  }
+
+  /**
+   * Retrieves an atomic claim by ID.
+   * If scope is provided, verifies that the claim belongs to the designated scope.
+   * Throws MemoryScopeViolationError if the claim belongs to another scope.
+   */
+  public getClaimById(id: string, scope?: ScopeIdentifier): MemoryClaim | null {
+    if (!id || typeof id !== 'string' || id.trim() === '') {
+      throw new ValidationError('Claim ID must be a non-empty string.');
+    }
+    const row = this.db.prepare('SELECT * FROM memory_claims WHERE id = ?').get(id.trim()) as unknown as ClaimDbRow | undefined;
+    if (!row) {
+      return null;
+    }
+
+    if (scope) {
+      this.validateScope(scope.scopeType, scope.scopeId);
+      this.assertScopeMatch(row.scope_type as MemoryScopeType, row.scope_id, scope, id);
+    }
+
+    return this.mapClaimRow(row);
+  }
+
+  /**
+   * Retrieves a claim by its canonical SHA-256 hash strictly within a designated scope.
+   */
+  public getClaimByHash(claimHash: string, scope: ScopeIdentifier): MemoryClaim | null {
+    if (!claimHash || typeof claimHash !== 'string' || claimHash.trim() === '') {
+      throw new ValidationError('Claim hash must be a non-empty string.');
+    }
+    if (!scope || typeof scope !== 'object') {
+      throw new ValidationError('Scope must be provided to getClaimByHash.');
+    }
+    this.validateScope(scope.scopeType, scope.scopeId);
+
+    const row = this.db.prepare(`
+      SELECT * FROM memory_claims
+      WHERE scope_type = ? AND scope_id = ? AND claim_hash = ?
+    `).get(scope.scopeType, scope.scopeId, claimHash.trim()) as unknown as ClaimDbRow | undefined;
+
+    return row ? this.mapClaimRow(row) : null;
+  }
+
+  /**
+   * Retrieves all atomic claims linked to a memory or proposal.
+   * If scope is provided, verifies that the memory belongs to the designated scope.
+   */
+  public getClaimsByMemoryId(memoryId: string, scope?: ScopeIdentifier): MemoryClaim[] {
+    if (!memoryId || typeof memoryId !== 'string' || memoryId.trim() === '') {
+      throw new ValidationError('Memory ID must be a non-empty string.');
+    }
+
+    if (scope) {
+      this.validateScope(scope.scopeType, scope.scopeId);
+      const rows = this.db.prepare(`
+        SELECT c.*
+        FROM memory_claims c
+        INNER JOIN memories m ON c.memory_id = m.id
+        WHERE c.memory_id = ?
+          AND m.scope_type = ?
+          AND m.scope_id = ?
+        ORDER BY c.created_at ASC, c.id ASC
+      `).all(memoryId.trim(), scope.scopeType, scope.scopeId) as unknown as ClaimDbRow[];
+
+      return rows.map((r) => this.mapClaimRow(r));
+    }
+
+    const rows = this.db.prepare(`
+      SELECT *
+      FROM memory_claims
+      WHERE memory_id = ?
+      ORDER BY created_at ASC, id ASC
+    `).all(memoryId.trim()) as unknown as ClaimDbRow[];
+
+    return rows.map((r) => this.mapClaimRow(r));
+  }
+
+  /**
+   * Lists atomic claims within an explicit scope, with optional filtering.
+   */
+  public listClaims(filter: ListClaimsFilter): MemoryClaim[] {
+    if (!filter || typeof filter !== 'object') {
+      throw new ValidationError('Filter must be provided to listClaims.');
+    }
+    this.validateScope(filter.scopeType, filter.scopeId);
+
+    const conditions: string[] = ['scope_type = ?', 'scope_id = ?'];
+    const params: SqlParam[] = [filter.scopeType, filter.scopeId];
+
+    if (filter.taskId) {
+      conditions.push('task_id = ?');
+      params.push(filter.taskId.trim());
+    }
+
+    if (filter.memoryId) {
+      conditions.push('memory_id = ?');
+      params.push(filter.memoryId.trim());
+    }
+
+    let sql = `SELECT * FROM memory_claims WHERE ${conditions.join(' AND ')} ORDER BY created_at ASC, id ASC`;
+
+    if (filter.limit !== undefined) {
+      if (typeof filter.limit !== 'number' || filter.limit < 1) {
+        throw new ValidationError('Limit must be a positive integer.');
+      }
+      sql += ' LIMIT ?';
+      params.push(filter.limit);
+
+      if (filter.offset !== undefined) {
+        if (typeof filter.offset !== 'number' || filter.offset < 0) {
+          throw new ValidationError('Offset must be a non-negative integer.');
+        }
+        sql += ' OFFSET ?';
+        params.push(filter.offset);
+      }
+    }
+
+    const stmt = this.db.prepare(sql);
+    const rows = stmt.all(...params) as unknown as ClaimDbRow[];
+    return rows.map((r) => this.mapClaimRow(r));
+  }
+
+  /**
    * Retrieves the version history of a memory key within a designated scope.
    * Deterministically ordered by version ASC, created_at ASC, id ASC.
    * Returns records across all statuses (ACTIVE, SUPERSEDED, PENDING_APPROVAL, ARCHIVED).
@@ -1209,6 +1478,23 @@ export class MemoryRepository {
       relationship: row.relationship as EvidenceRelationship,
       taskId: row.task_id,
       agentId: row.agent_id,
+      createdAt: row.created_at
+    };
+  }
+
+  private mapClaimRow(row: ClaimDbRow): MemoryClaim {
+    return {
+      id: row.id,
+      memoryId: row.memory_id,
+      scopeType: row.scope_type as MemoryScopeType,
+      scopeId: row.scope_id,
+      originalText: row.original_text,
+      canonicalText: row.canonical_text,
+      claimHash: row.claim_hash,
+      subject: row.subject,
+      predicate: row.predicate,
+      qualifier: row.qualifier,
+      taskId: row.task_id,
       createdAt: row.created_at
     };
   }
