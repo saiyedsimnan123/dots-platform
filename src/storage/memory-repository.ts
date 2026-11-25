@@ -271,7 +271,8 @@ const VALID_VERIFICATION_OUTCOMES: ReadonlySet<ClaimVerificationCandidateOutcome
 const VALID_CLAIM_CONFLICT_TYPES: ReadonlySet<ClaimConflictType> = new Set([
   'EXPLICIT_CONTRADICTION',
   'VERIFIED_CONTRADICTION',
-  'OPPOSING_VERIFICATIONS'
+  'OPPOSING_VERIFICATIONS',
+  'VERIFIER_DISAGREEMENT'
 ]);
 
 export class MemoryRepository {
@@ -2189,6 +2190,17 @@ export class MemoryRepository {
           AND cev_vc.proposed_relationship = 'CONTRADICTS'
           AND cev_vc.verification_outcome = 'PROPOSED'${verifCond('cev_vc')}
           AND ev_vc.relationship <> 'LIMITATION'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM claim_evidence_verifications cev_peer
+            WHERE cev_peer.claim_id = cev_vc.claim_id
+              AND cev_peer.evidence_id = cev_vc.evidence_id
+              AND cev_peer.scope_type = cev_vc.scope_type
+              AND cev_peer.scope_id = cev_vc.scope_id
+              AND cev_peer.assumptions_hash = cev_vc.assumptions_hash
+              AND cev_peer.proposed_relationship = 'SUPPORTS'
+              AND cev_peer.verification_outcome = 'PROPOSED'${verifCond('cev_peer')}
+          )
       )
     `;
 
@@ -2209,6 +2221,24 @@ export class MemoryRepository {
           AND cea_ec.scope_type = c.scope_type
           AND cea_ec.scope_id = c.scope_id
           AND cea_ec.relationship = 'CONTRADICTS'${assocCond('cea_ec')}
+          AND NOT EXISTS (
+            SELECT 1
+            FROM claim_evidence_verifications cev_t1
+            INNER JOIN claim_evidence_verifications cev_t2
+              ON cev_t2.claim_id = cev_t1.claim_id
+             AND cev_t2.evidence_id = cev_t1.evidence_id
+             AND cev_t2.scope_type = cev_t1.scope_type
+             AND cev_t2.scope_id = cev_t1.scope_id
+             AND cev_t2.assumptions_hash = cev_t1.assumptions_hash
+             AND cev_t2.proposed_relationship = 'CONTRADICTS'
+             AND cev_t2.verification_outcome = 'PROPOSED'${verifCond('cev_t2')}
+            WHERE cev_t1.claim_id = cea_ec.claim_id
+              AND cev_t1.evidence_id = cea_ec.evidence_id
+              AND cev_t1.scope_type = cea_ec.scope_type
+              AND cev_t1.scope_id = cea_ec.scope_id
+              AND cev_t1.proposed_relationship = 'SUPPORTS'
+              AND cev_t1.verification_outcome = 'PROPOSED'${verifCond('cev_t1')}
+          )
           AND (
             NOT EXISTS (
               SELECT 1
@@ -2231,6 +2261,40 @@ export class MemoryRepository {
                 )
             )
           )
+      )
+    `;
+
+    const hasVerifierDisagreementExpr = `
+      EXISTS (
+        SELECT 1
+        FROM claim_evidence_verifications cev_d1
+        INNER JOIN claim_evidence_associations cea_vd
+          ON cea_vd.claim_id = cev_d1.claim_id
+         AND cea_vd.evidence_id = cev_d1.evidence_id
+         AND cea_vd.scope_type = cev_d1.scope_type
+         AND cea_vd.scope_id = cev_d1.scope_id${assocCond('cea_vd')}
+        INNER JOIN memory_claim_links mcl_vd
+          ON mcl_vd.claim_id = cea_vd.claim_id
+         AND mcl_vd.memory_id = cea_vd.memory_id
+         AND mcl_vd.scope_type = cea_vd.scope_type
+         AND mcl_vd.scope_id = cea_vd.scope_id${linkCond('mcl_vd')}
+        INNER JOIN memories m_vd
+          ON m_vd.id = cea_vd.memory_id
+         AND m_vd.scope_type = cea_vd.scope_type
+         AND m_vd.scope_id = cea_vd.scope_id${memCond('m_vd')}
+        INNER JOIN claim_evidence_verifications cev_d2
+          ON cev_d2.claim_id = cev_d1.claim_id
+         AND cev_d2.evidence_id = cev_d1.evidence_id
+         AND cev_d2.scope_type = cev_d1.scope_type
+         AND cev_d2.scope_id = cev_d1.scope_id
+         AND cev_d2.assumptions_hash = cev_d1.assumptions_hash
+         AND cev_d2.proposed_relationship = 'CONTRADICTS'
+         AND cev_d2.verification_outcome = 'PROPOSED'${verifCond('cev_d2')}
+        WHERE cev_d1.claim_id = c.id
+          AND cev_d1.scope_type = c.scope_type
+          AND cev_d1.scope_id = c.scope_id
+          AND cev_d1.proposed_relationship = 'SUPPORTS'
+          AND cev_d1.verification_outcome = 'PROPOSED'${verifCond('cev_d1')}
       )
     `;
 
@@ -2314,8 +2378,14 @@ export class MemoryRepository {
       claimConditions.push(
         `(NOT (${hasOpposingExpr})) AND (NOT (${hasVerifiedContradictExpr})) AND (${hasExplicitContradictExpr})`
       );
+    } else if (filter.conflictType === 'VERIFIER_DISAGREEMENT') {
+      claimConditions.push(
+        `(NOT (${hasOpposingExpr})) AND (NOT (${hasVerifiedContradictExpr})) AND (NOT (${hasExplicitContradictExpr})) AND (${hasVerifierDisagreementExpr})`
+      );
     } else {
-      claimConditions.push(`(${hasOpposingExpr} OR ${hasVerifiedContradictExpr} OR ${hasExplicitContradictExpr})`);
+      claimConditions.push(
+        `(${hasOpposingExpr} OR ${hasVerifiedContradictExpr} OR ${hasExplicitContradictExpr} OR ${hasVerifierDisagreementExpr})`
+      );
     }
 
     const whereClause = claimConditions.join(' AND ');
@@ -2347,7 +2417,8 @@ export class MemoryRepository {
         CASE
           WHEN ${hasOpposingExpr} THEN 'OPPOSING_VERIFICATIONS'
           WHEN ${hasVerifiedContradictExpr} THEN 'VERIFIED_CONTRADICTION'
-          ELSE 'EXPLICIT_CONTRADICTION'
+          WHEN ${hasExplicitContradictExpr} THEN 'EXPLICIT_CONTRADICTION'
+          ELSE 'VERIFIER_DISAGREEMENT'
         END AS computed_conflict_type
       FROM memory_claims c
       WHERE ${whereClause}
@@ -2569,6 +2640,7 @@ export class MemoryRepository {
 
       const verifierDisagreements: ConflictVerifierDisagreement[] = [];
       const evidenceIdsWithDisagreement = new Set<string>();
+      const opposingDisagreementHashesByEvidenceId = new Map<string, Set<string>>();
       const supportsByAssumptionHash = new Map<string, Set<string>>();
       const contradictsByAssumptionHash = new Map<string, Set<string>>();
 
@@ -2595,6 +2667,18 @@ export class MemoryRepository {
           if (group.length < 2) {
             continue;
           }
+          const hasPeerSupports = group.some(
+            (v) => v.proposedRelationship === 'SUPPORTS' && v.verificationOutcome === 'PROPOSED'
+          );
+          const hasPeerContradicts = group.some(
+            (v) => v.proposedRelationship === 'CONTRADICTS' && v.verificationOutcome === 'PROPOSED'
+          );
+          if (hasPeerSupports && hasPeerContradicts) {
+            const tieHashes = opposingDisagreementHashesByEvidenceId.get(evRef.evidenceId) ?? new Set<string>();
+            tieHashes.add(assumptionsHash);
+            opposingDisagreementHashesByEvidenceId.set(evRef.evidenceId, tieHashes);
+          }
+
           const distinctOutcomes = new Set(group.map((v) => `${v.verificationOutcome}:${v.proposedRelationship}`));
           if (distinctOutcomes.size > 1) {
             evidenceIdsWithDisagreement.add(evRef.evidenceId);
@@ -2652,8 +2736,15 @@ export class MemoryRepository {
 
       let hasExplicitContradiction = false;
       let hasVerifiedContradiction = false;
+      let hasSameEvidenceVerifierDisagreement = false;
 
       for (const evRef of evidenceRefs) {
+        const tieHashes = opposingDisagreementHashesByEvidenceId.get(evRef.evidenceId);
+        const hasSameEvidenceOpposingTie = tieHashes !== undefined && tieHashes.size > 0;
+        if (hasSameEvidenceOpposingTie) {
+          hasSameEvidenceVerifierDisagreement = true;
+        }
+
         const proposesContradicts = evRef.verifications.some(
           (v) => v.proposedRelationship === 'CONTRADICTS' && v.verificationOutcome === 'PROPOSED'
         );
@@ -2665,28 +2756,34 @@ export class MemoryRepository {
         );
 
         if (proposesContradicts) {
-          const escalatesLimitation =
-            evRef.relationship !== 'LIMITATION' ||
-            evRef.verifications.some((v) => {
-              if (v.proposedRelationship !== 'CONTRADICTS' || v.verificationOutcome !== 'PROPOSED') {
-                return false;
-              }
-              const otherSupports = supportsByAssumptionHash.get(v.assumptionsHash);
-              if (!otherSupports) {
-                return false;
-              }
-              for (const sEvId of otherSupports) {
-                if (sEvId !== evRef.evidenceId) {
-                  return true;
-                }
-              }
+          const hasUncontestedContradiction = evRef.verifications.some((v) => {
+            if (v.proposedRelationship !== 'CONTRADICTS' || v.verificationOutcome !== 'PROPOSED') {
               return false;
-            });
+            }
+            if (tieHashes?.has(v.assumptionsHash)) {
+              return false;
+            }
+            if (evRef.relationship !== 'LIMITATION') {
+              return true;
+            }
+            const otherSupports = supportsByAssumptionHash.get(v.assumptionsHash);
+            if (!otherSupports) {
+              return false;
+            }
+            for (const sEvId of otherSupports) {
+              if (sEvId !== evRef.evidenceId) {
+                return true;
+              }
+            }
+            return false;
+          });
 
-          if (escalatesLimitation) {
+          if (hasUncontestedContradiction) {
             hasVerifiedContradiction = true;
             contradictingEvidence.push(evRef);
           } else {
+            // Contested by opposing same-evidence verifier (or uncorroborated LIMITATION): never place in both
+            // supporting and contradicting buckets, and never present as an established contradiction alone.
             limitationEvidence.push(evRef);
           }
         } else if (evRef.verifications.length === 0) {
@@ -2723,9 +2820,15 @@ export class MemoryRepository {
         conflictType = 'VERIFIED_CONTRADICTION';
       } else if (hasExplicitContradiction) {
         conflictType = 'EXPLICIT_CONTRADICTION';
+      } else if (hasSameEvidenceVerifierDisagreement) {
+        conflictType = 'VERIFIER_DISAGREEMENT';
       }
 
-      if (!conflictType || contradictingEvidence.length === 0) {
+      if (
+        !conflictType ||
+        (conflictType !== 'VERIFIER_DISAGREEMENT' && contradictingEvidence.length === 0) ||
+        (conflictType === 'VERIFIER_DISAGREEMENT' && verifierDisagreements.length === 0)
+      ) {
         continue;
       }
 

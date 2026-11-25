@@ -530,7 +530,8 @@ export interface ListClaimVerificationsFilter {
 export type ClaimConflictType =
   | 'EXPLICIT_CONTRADICTION'
   | 'VERIFIED_CONTRADICTION'
-  | 'OPPOSING_VERIFICATIONS';
+  | 'OPPOSING_VERIFICATIONS'
+  | 'VERIFIER_DISAGREEMENT';
 
 export interface ConflictMemoryOrigin {
   readonly memoryId: string;
