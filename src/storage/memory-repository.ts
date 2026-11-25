@@ -2307,17 +2307,26 @@ export class MemoryRepository {
                 AND cev_any.scope_type = cea_ec.scope_type
                 AND cev_any.scope_id = cea_ec.scope_id${verifCond('cev_any')}
             )
-            OR EXISTS (
-              SELECT 1
-              FROM claim_evidence_verifications cev_unres
-              WHERE cev_unres.claim_id = cea_ec.claim_id
-                AND cev_unres.evidence_id = cea_ec.evidence_id
-                AND cev_unres.scope_type = cea_ec.scope_type
-                AND cev_unres.scope_id = cea_ec.scope_id${verifCond('cev_unres')}
-                AND (
-                  cev_unres.verification_outcome IN ('INSUFFICIENT', 'AMBIGUOUS')
-                  OR cev_unres.proposed_relationship = 'CONTRADICTS'
-                )
+            OR (
+              EXISTS (
+                SELECT 1
+                FROM claim_evidence_verifications cev_unres
+                WHERE cev_unres.claim_id = cea_ec.claim_id
+                  AND cev_unres.evidence_id = cea_ec.evidence_id
+                  AND cev_unres.scope_type = cea_ec.scope_type
+                  AND cev_unres.scope_id = cea_ec.scope_id${verifCond('cev_unres')}
+                  AND cev_unres.verification_outcome IN ('INSUFFICIENT', 'AMBIGUOUS')
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM claim_evidence_verifications cev_pc
+                WHERE cev_pc.claim_id = cea_ec.claim_id
+                  AND cev_pc.evidence_id = cea_ec.evidence_id
+                  AND cev_pc.scope_type = cea_ec.scope_type
+                  AND cev_pc.scope_id = cea_ec.scope_id${verifCond('cev_pc')}
+                  AND cev_pc.proposed_relationship = 'CONTRADICTS'
+                  AND cev_pc.verification_outcome = 'PROPOSED'
+              )
             )
           )
       )
@@ -2903,7 +2912,10 @@ export class MemoryRepository {
         } else if (
           incomparablePairIds.has(evRef.evidenceId) &&
           !comparableOpposingIds.has(evRef.evidenceId) &&
-          !(evRef.relationship === 'CONTRADICTS' && (evRef.verifications.length === 0 || hasUnresolvedVerif))
+          !(
+            evRef.relationship === 'CONTRADICTS' &&
+            (evRef.verifications.length === 0 || (hasUnresolvedVerif && !proposesContradicts))
+          )
         ) {
           incomparableEvidence.push(evRef);
         } else if (proposesContradicts) {

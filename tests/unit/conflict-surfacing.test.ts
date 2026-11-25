@@ -2838,3 +2838,176 @@ test('26. HTTP and CLI expose INCOMPARABLE_CONDITIONS filtering, incomparableEvi
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ============================================================================
+// 27. Regression (HIGH-01): Explicit CONTRADICTS verified CONTRADICTS + incomparable SUPPORTS parity
+// ============================================================================
+test('27. SQL conflictType filters match final JS classification for explicit+verified CONTRADICTS with incomparable SUPPORTS', async () => {
+  const env = setupConflictTestEnv();
+
+  const verifySqlFilterParity = (expectedType: string, claimId: string) => {
+    const unfiltered = env.memoryService.getConflictByClaimId(env.adminAlpha, claimId)!;
+    assert.ok(unfiltered);
+    assert.equal(unfiltered.conflictType, expectedType);
+
+    for (const filterType of [
+      'EXPLICIT_CONTRADICTION',
+      'VERIFIED_CONTRADICTION',
+      'OPPOSING_VERIFICATIONS',
+      'VERIFIER_DISAGREEMENT',
+      'INCOMPARABLE_CONDITIONS'
+    ] as const) {
+      const filtered = env.memoryService.listClaimConflicts(env.adminAlpha, {
+        claimId,
+        conflictType: filterType
+      });
+      if (filterType === expectedType) {
+        assert.equal(filtered.total, 1, `Expected total=1 for ${filterType}`);
+        assert.equal(filtered.conflicts[0]!.conflictType, filterType);
+      } else {
+        assert.equal(filtered.total, 0, `Expected total=0 for ${filterType} (actual=${expectedType})`);
+        assert.deepEqual(filtered.conflicts, []);
+      }
+    }
+    return unfiltered;
+  };
+
+  // Case G: explicit CONTRADICTS (verified CONTRADICTS under Region B) + SUPPORTS (verified SUPPORTS under Region A)
+  const propG = env.memoryService.createMemory(env.agentAlpha, {
+    key: 'high01.case.g',
+    content: 'Replication lag is below 20ms.',
+    category: 'PROJECT_FACT',
+    scopeType: env.scopeAlpha.scopeType,
+    scopeId: env.scopeAlpha.scopeId,
+    status: 'PENDING_APPROVAL',
+    claims: [{ originalText: 'Replication lag is below 20ms.' }],
+    evidence: [
+      { sourceType: 'DOCUMENTATION', snippet: 'Region B trace shows 90ms.', relationship: 'CONTRADICTS', targetClaimIndices: [0] },
+      { sourceType: 'TOOL_EXECUTION', snippet: 'Region A trace shows 12ms.', relationship: 'SUPPORTS', targetClaimIndices: [0] }
+    ]
+  });
+  const cG = env.memoryService.getClaimsByMemoryId(env.adminAlpha, propG.id)[0]!;
+  const eG = env.memoryService.getEvidenceByMemoryId(env.adminAlpha, propG.id);
+  const eGCon = eG.find((e) => e.relationship === 'CONTRADICTS')!;
+  const eGSup = eG.find((e) => e.relationship === 'SUPPORTS')!;
+
+  env.mockProvider.enqueueCompletion(JSON.stringify({
+    claimId: cG.id, evidenceId: eGCon.id, proposedRelationship: 'CONTRADICTS', outcome: 'PROPOSED', confidence: 0.9, explanation: '90ms in Region B.'
+  }));
+  await env.engine.verifyClaimAgainstEvidence(env.agentAlpha, {
+    claimId: cG.id, evidenceId: eGCon.id, assumptions: ['Region B']
+  });
+  env.mockProvider.enqueueCompletion(JSON.stringify({
+    claimId: cG.id, evidenceId: eGSup.id, proposedRelationship: 'SUPPORTS', outcome: 'PROPOSED', confidence: 0.9, explanation: '12ms in Region A.'
+  }));
+  await env.engine.verifyClaimAgainstEvidence(env.agentAlpha, {
+    claimId: cG.id, evidenceId: eGSup.id, assumptions: ['Region A']
+  });
+
+  const sumG = verifySqlFilterParity('INCOMPARABLE_CONDITIONS', cG.id);
+  assert.equal(sumG.incomparableEvidence.length, 2);
+  assert.equal(sumG.incomparableEvidence.find((e) => e.evidenceId === eGCon.id)?.relationship, 'CONTRADICTS');
+  assert.deepEqual(sumG.contradictingEvidence, []);
+
+  // Case H: single explicit CONTRADICTS verified SUPPORTS [A] and CONTRADICTS [B]
+  const propH = env.memoryService.createMemory(env.agentAlpha, {
+    key: 'high01.case.h',
+    content: 'Checkpoint interval takes under 1s.',
+    category: 'PROJECT_FACT',
+    scopeType: env.scopeAlpha.scopeType,
+    scopeId: env.scopeAlpha.scopeId,
+    status: 'PENDING_APPROVAL',
+    claims: [{ originalText: 'Checkpoint interval takes under 1s.' }],
+    evidence: [
+      { sourceType: 'TOOL_EXECUTION', snippet: 'NVMe = 400ms; HDD = 3.2s.', relationship: 'CONTRADICTS', targetClaimIndices: [0] }
+    ]
+  });
+  const cH = env.memoryService.getClaimsByMemoryId(env.adminAlpha, propH.id)[0]!;
+  const eH = env.memoryService.getEvidenceByMemoryId(env.adminAlpha, propH.id)[0]!;
+  env.mockProvider.enqueueCompletion(JSON.stringify({
+    claimId: cH.id, evidenceId: eH.id, proposedRelationship: 'SUPPORTS', outcome: 'PROPOSED', confidence: 0.9, explanation: 'Fast on NVMe.'
+  }));
+  await env.engine.verifyClaimAgainstEvidence(env.agentAlpha, {
+    claimId: cH.id, evidenceId: eH.id, assumptions: ['NVMe disk']
+  });
+  env.mockProvider.enqueueCompletion(JSON.stringify({
+    claimId: cH.id, evidenceId: eH.id, proposedRelationship: 'CONTRADICTS', outcome: 'PROPOSED', confidence: 0.9, explanation: 'Slow on HDD.'
+  }));
+  await env.engine.verifyClaimAgainstEvidence(env.agentAlpha, {
+    claimId: cH.id, evidenceId: eH.id, assumptions: ['Spinning HDD']
+  });
+  verifySqlFilterParity('INCOMPARABLE_CONDITIONS', cH.id);
+
+  // Case I: explicit CONTRADICTS verified CONTRADICTS [] + SUPPORTS verified SUPPORTS []
+  const propI = env.memoryService.createMemory(env.agentAlpha, {
+    key: 'high01.case.i',
+    content: 'Default shard count is 8.',
+    category: 'PROJECT_FACT',
+    scopeType: env.scopeAlpha.scopeType,
+    scopeId: env.scopeAlpha.scopeId,
+    status: 'PENDING_APPROVAL',
+    claims: [{ originalText: 'Default shard count is 8.' }],
+    evidence: [
+      { sourceType: 'DOCUMENTATION', snippet: 'Guide says 16 shards.', relationship: 'CONTRADICTS', targetClaimIndices: [0] },
+      { sourceType: 'TOOL_EXECUTION', snippet: 'Dev box uses 8 shards.', relationship: 'SUPPORTS', targetClaimIndices: [0] }
+    ]
+  });
+  const cI = env.memoryService.getClaimsByMemoryId(env.adminAlpha, propI.id)[0]!;
+  const eI = env.memoryService.getEvidenceByMemoryId(env.adminAlpha, propI.id);
+  const eICon = eI.find((e) => e.relationship === 'CONTRADICTS')!;
+  const eISup = eI.find((e) => e.relationship === 'SUPPORTS')!;
+  env.mockProvider.enqueueCompletion(JSON.stringify({
+    claimId: cI.id, evidenceId: eICon.id, proposedRelationship: 'CONTRADICTS', outcome: 'PROPOSED', confidence: 0.9, explanation: 'Guide says 16.'
+  }));
+  await env.engine.verifyClaimAgainstEvidence(env.agentAlpha, { claimId: cI.id, evidenceId: eICon.id });
+  env.mockProvider.enqueueCompletion(JSON.stringify({
+    claimId: cI.id, evidenceId: eISup.id, proposedRelationship: 'SUPPORTS', outcome: 'PROPOSED', confidence: 0.9, explanation: 'Dev uses 8.'
+  }));
+  await env.engine.verifyClaimAgainstEvidence(env.agentAlpha, { claimId: cI.id, evidenceId: eISup.id });
+  verifySqlFilterParity('INCOMPARABLE_CONDITIONS', cI.id);
+
+  // Genuine unresolved explicit CONTRADICTS co-occurring with incomparable pair MUST keep EXPLICIT_CONTRADICTION precedence
+  const propMixed = env.memoryService.createMemory(env.agentAlpha, {
+    key: 'high01.mixed.explicit.incomp',
+    content: 'Max batch payload size is 4MB.',
+    category: 'PROJECT_FACT',
+    scopeType: env.scopeAlpha.scopeType,
+    scopeId: env.scopeAlpha.scopeId,
+    status: 'PENDING_APPROVAL',
+    claims: [{ originalText: 'Max batch payload size is 4MB.' }],
+    evidence: [
+      { sourceType: 'TOOL_EXECUTION', snippet: 'Client A succeeded with 4MB.', relationship: 'SUPPORTS', targetClaimIndices: [0] },
+      { sourceType: 'TOOL_EXECUTION', snippet: 'Client B failed above 1MB.', relationship: 'SUPPORTS', targetClaimIndices: [0] },
+      { sourceType: 'DOCUMENTATION', snippet: 'Protocol spec rejects > 2MB.', relationship: 'CONTRADICTS', targetClaimIndices: [0] }
+    ]
+  });
+  const cMix = env.memoryService.getClaimsByMemoryId(env.adminAlpha, propMixed.id)[0]!;
+  const eMix = env.memoryService.getEvidenceByMemoryId(env.adminAlpha, propMixed.id);
+  const eMixSup = eMix.find((e) => e.snippet?.includes('Client A'))!;
+  const eMixCon = eMix.find((e) => e.snippet?.includes('Client B'))!;
+  const eMixExp = eMix.find((e) => e.relationship === 'CONTRADICTS')!;
+
+  env.mockProvider.enqueueCompletion(JSON.stringify({
+    claimId: cMix.id, evidenceId: eMixSup.id, proposedRelationship: 'SUPPORTS', outcome: 'PROPOSED', confidence: 0.9, explanation: '4MB ok under v2.'
+  }));
+  await env.engine.verifyClaimAgainstEvidence(env.agentAlpha, {
+    claimId: cMix.id, evidenceId: eMixSup.id, assumptions: ['Protocol v2']
+  });
+  env.mockProvider.enqueueCompletion(JSON.stringify({
+    claimId: cMix.id, evidenceId: eMixCon.id, proposedRelationship: 'CONTRADICTS', outcome: 'PROPOSED', confidence: 0.9, explanation: '1MB cap in v1.'
+  }));
+  await env.engine.verifyClaimAgainstEvidence(env.agentAlpha, {
+    claimId: cMix.id, evidenceId: eMixCon.id, assumptions: ['Protocol v1']
+  });
+  // Verify unresolved explicit CONTRADICTS as AMBIGUOUS -> stays EXPLICIT_CONTRADICTION
+  env.mockProvider.enqueueCompletion(JSON.stringify({
+    claimId: cMix.id, evidenceId: eMixExp.id, proposedRelationship: 'AMBIGUOUS', outcome: 'AMBIGUOUS', confidence: 0.4, explanation: 'Spec draft unclear.'
+  }));
+  await env.engine.verifyClaimAgainstEvidence(env.agentAlpha, {
+    claimId: cMix.id, evidenceId: eMixExp.id, assumptions: ['Spec draft']
+  });
+
+  const sumMix = verifySqlFilterParity('EXPLICIT_CONTRADICTION', cMix.id);
+  assert.equal(sumMix.contradictingEvidence.map((e) => e.evidenceId).join(','), eMixExp.id);
+  assert.equal(sumMix.incomparableEvidence.length, 2);
+});
