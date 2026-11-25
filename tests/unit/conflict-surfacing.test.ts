@@ -1239,17 +1239,19 @@ test('10. Two verifiers disagreeing on the same evidence do not classify as OPPO
   assert.equal(conflict.conflictType, 'VERIFIER_DISAGREEMENT');
   assert.deepEqual(conflict.supportingEvidence, []);
   assert.deepEqual(conflict.contradictingEvidence, []);
-  assert.equal(conflict.limitationEvidence.length, 1);
-  assert.equal(conflict.limitationEvidence[0]!.evidenceId, evidence.id);
-  assert.equal(conflict.limitationEvidence[0]!.relationship, 'SUPPORTS');
-  assert.equal(conflict.limitationEvidence[0]!.hasVerifierDisagreement, true);
-  assert.equal(conflict.limitationEvidence[0]!.verifications.length, 2);
+  assert.deepEqual(conflict.limitationEvidence, []);
+  assert.deepEqual(conflict.incomparableEvidence, []);
+  assert.equal(conflict.disputedEvidence.length, 1);
+  assert.equal(conflict.disputedEvidence[0]!.evidenceId, evidence.id);
+  assert.equal(conflict.disputedEvidence[0]!.relationship, 'SUPPORTS');
+  assert.equal(conflict.disputedEvidence[0]!.hasVerifierDisagreement, true);
+  assert.equal(conflict.disputedEvidence[0]!.verifications.length, 2);
   assert.equal(conflict.verifierDisagreements.length, 1);
   assert.equal(conflict.verifierDisagreements[0]!.evidenceId, evidence.id);
   assert.equal(conflict.verifierDisagreements[0]!.positions.length, 2);
   assert.deepEqual(conflict.verifierDisagreements[0]!.assumptions, ['CPU-bound service load']);
 
-  // Same evidence evaluated under DIFFERENT assumptions is not treated as verifier disagreement
+  // Same evidence evaluated under DIFFERENT assumptions is incomparable conditions (not contradiction or disagreement)
   const propDiffEnv = env.memoryService.createMemory(env.agentAlpha, {
     key: 'verifier.diff.assumptions.same.ev',
     content: 'Batch write latency stays under 15ms.',
@@ -1282,9 +1284,13 @@ test('10. Two verifiers disagreeing on the same evidence do not classify as OPPO
     claimId: dcDiff.id, evidenceId: deDiff.id, assumptions: ['Spinning HDD']
   });
   const diffAssumpConflict = env.memoryService.getConflictByClaimId(env.adminAlpha, dcDiff.id)!;
-  assert.equal(diffAssumpConflict.conflictType, 'VERIFIED_CONTRADICTION');
+  assert.equal(diffAssumpConflict.conflictType, 'INCOMPARABLE_CONDITIONS');
   assert.deepEqual(diffAssumpConflict.verifierDisagreements, []);
-  assert.equal(diffAssumpConflict.contradictingEvidence[0]!.hasVerifierDisagreement, false);
+  assert.deepEqual(diffAssumpConflict.contradictingEvidence, []);
+  assert.deepEqual(diffAssumpConflict.disputedEvidence, []);
+  assert.equal(diffAssumpConflict.incomparableEvidence.length, 1);
+  assert.equal(diffAssumpConflict.incomparableEvidence[0]!.evidenceId, deDiff.id);
+  assert.equal(diffAssumpConflict.incomparableEvidence[0]!.hasVerifierDisagreement, false);
 
   // Distinct independent evidence sources under matching assumptions DO still classify as OPPOSING_VERIFICATIONS
   const propDistinct = env.memoryService.createMemory(env.agentAlpha, {
@@ -1317,7 +1323,8 @@ test('10. Two verifiers disagreeing on the same evidence do not classify as OPPO
   }));
   const resSup = await env.engine.verifyClaimAgainstEvidence(env.agentAlpha, {
     claimId: dc.id,
-    evidenceId: de[0]!.id
+    evidenceId: de[0]!.id,
+    assumptions: ['Shared async benchmark cluster']
   });
   assert.equal(resSup.ok, true);
 
@@ -1326,7 +1333,8 @@ test('10. Two verifiers disagreeing on the same evidence do not classify as OPPO
   }));
   const resCon = await env.engine.verifyClaimAgainstEvidence(env.agentAlpha, {
     claimId: dc.id,
-    evidenceId: de[1]!.id
+    evidenceId: de[1]!.id,
+    assumptions: ['Shared async benchmark cluster']
   });
   assert.equal(resCon.ok, true);
 
@@ -2007,6 +2015,8 @@ test('17. HTTP out-of-range offset returns empty page with total, and HTTP/CLI f
     assert.equal(vdBody.total, 1);
     assert.equal(vdBody.conflicts[0]!.conflictType, 'VERIFIER_DISAGREEMENT');
     assert.equal(vdBody.conflicts[0]!.verifierDisagreements.length, 1);
+    assert.equal(vdBody.conflicts[0]!.disputedEvidence.length, 1);
+    assert.deepEqual(vdBody.conflicts[0]!.limitationEvidence, []);
 
     const vcHttp = await fetch(`${started.url}/api/memories/conflicts?conflictType=VERIFIED_CONTRADICTION`, {
       headers: { Authorization: `Bearer ${ADMIN_TOKEN}` }
@@ -2035,6 +2045,8 @@ test('17. HTTP out-of-range offset returns empty page with total, and HTTP/CLI f
     const cliParsed = JSON.parse(cliOut.join('\n')) as { total: number; conflicts: ClaimConflictSummary[] };
     assert.equal(cliParsed.total, 1);
     assert.equal(cliParsed.conflicts[0]!.conflictType, 'VERIFIER_DISAGREEMENT');
+    assert.equal(cliParsed.conflicts[0]!.disputedEvidence.length, 1);
+    assert.deepEqual(cliParsed.conflicts[0]!.limitationEvidence, []);
   } finally {
     await server.stop().catch(() => undefined);
     rmSync(dir, { recursive: true, force: true });
@@ -2358,11 +2370,471 @@ test('21. Co-occurring verifier disagreement and unverified explicit CONTRADICTS
   // Genuine unverified explicit CONTRADICTS takes precedence over same-evidence verifier disagreement
   assert.equal(conflict.conflictType, 'EXPLICIT_CONTRADICTION');
   assert.deepEqual(conflict.supportingEvidence, []);
+  assert.deepEqual(conflict.limitationEvidence, []);
+  assert.deepEqual(conflict.incomparableEvidence, []);
   assert.equal(conflict.contradictingEvidence.length, 1);
   assert.equal(conflict.contradictingEvidence[0]!.evidenceId, explicitContradictEv.id);
-  assert.equal(conflict.limitationEvidence.length, 1);
-  assert.equal(conflict.limitationEvidence[0]!.evidenceId, disputedEv.id);
-  assert.equal(conflict.limitationEvidence[0]!.hasVerifierDisagreement, true);
+  assert.equal(conflict.disputedEvidence.length, 1);
+  assert.equal(conflict.disputedEvidence[0]!.evidenceId, disputedEv.id);
+  assert.equal(conflict.disputedEvidence[0]!.hasVerifierDisagreement, true);
   assert.equal(conflict.verifierDisagreements.length, 1);
   assert.equal(conflict.verifierDisagreements[0]!.evidenceId, disputedEv.id);
+});
+
+// ============================================================================
+// 22. Regression (4F): Empty assumptions hashes across independent evidence are incomparable
+// ============================================================================
+test('22. Empty assumptions across unrelated evidence sources classify as INCOMPARABLE_CONDITIONS rather than VERIFIED_CONTRADICTION or OPPOSING_VERIFICATIONS', async () => {
+  const env = setupConflictTestEnv();
+
+  const propEmpty = env.memoryService.createMemory(env.agentAlpha, {
+    key: 'comparability.empty.assumptions',
+    content: 'Vector index query p95 is under 12ms.',
+    category: 'PROJECT_FACT',
+    scopeType: env.scopeAlpha.scopeType,
+    scopeId: env.scopeAlpha.scopeId,
+    status: 'PENDING_APPROVAL',
+    claims: [{ originalText: 'Vector index query p95 is under 12ms.' }],
+    evidence: [
+      {
+        sourceType: 'TOOL_EXECUTION',
+        snippet: 'Dataset 1 run observed 9ms p95.',
+        relationship: 'SUPPORTS',
+        targetClaimIndices: [0]
+      },
+      {
+        sourceType: 'WEB_RESEARCH',
+        snippet: 'External blog reported 45ms p95 on unspecified setup.',
+        relationship: 'SUPPORTS',
+        targetClaimIndices: [0]
+      }
+    ]
+  });
+
+  const claim = env.memoryService.getClaimsByMemoryId(env.adminAlpha, propEmpty.id)[0]!;
+  const ev = env.memoryService.getEvidenceByMemoryId(env.adminAlpha, propEmpty.id);
+
+  env.mockProvider.enqueueCompletion(JSON.stringify({
+    claimId: claim.id, evidenceId: ev[0]!.id, proposedRelationship: 'SUPPORTS', outcome: 'PROPOSED', confidence: 0.89, explanation: 'Dataset 1 supports < 12ms.'
+  }));
+  await env.engine.verifyClaimAgainstEvidence(env.agentAlpha, { claimId: claim.id, evidenceId: ev[0]!.id });
+
+  env.mockProvider.enqueueCompletion(JSON.stringify({
+    claimId: claim.id, evidenceId: ev[1]!.id, proposedRelationship: 'CONTRADICTS', outcome: 'PROPOSED', confidence: 0.87, explanation: 'External blog shows 45ms.'
+  }));
+  await env.engine.verifyClaimAgainstEvidence(env.agentAlpha, { claimId: claim.id, evidenceId: ev[1]!.id });
+
+  assert.equal(env.memoryService.listClaimConflicts(env.adminAlpha, { conflictType: 'OPPOSING_VERIFICATIONS' }).total, 0);
+  assert.equal(env.memoryService.listClaimConflicts(env.adminAlpha, { conflictType: 'VERIFIED_CONTRADICTION' }).total, 0);
+  assert.equal(env.memoryService.listClaimConflicts(env.adminAlpha, { conflictType: 'VERIFIER_DISAGREEMENT' }).total, 0);
+
+  const summary = env.memoryService.getConflictByClaimId(env.adminAlpha, claim.id)!;
+  assert.ok(summary);
+  assert.equal(summary.conflictType, 'INCOMPARABLE_CONDITIONS');
+  assert.deepEqual(summary.supportingEvidence, []);
+  assert.deepEqual(summary.contradictingEvidence, []);
+  assert.deepEqual(summary.limitationEvidence, []);
+  assert.deepEqual(summary.disputedEvidence, []);
+  assert.equal(summary.incomparableEvidence.length, 2);
+
+  // Supplying matching non-empty assumptions on distinct evidence DOES establish OPPOSING_VERIFICATIONS
+  const propComp = env.memoryService.createMemory(env.agentAlpha, {
+    key: 'comparability.explicit.matching',
+    content: 'Column store scan finishes within 3 seconds.',
+    category: 'PROJECT_FACT',
+    scopeType: env.scopeAlpha.scopeType,
+    scopeId: env.scopeAlpha.scopeId,
+    status: 'PENDING_APPROVAL',
+    claims: [{ originalText: 'Column store scan finishes within 3 seconds.' }],
+    evidence: [
+      { sourceType: 'TOOL_EXECUTION', snippet: 'Run 1 = 2.1s', relationship: 'SUPPORTS', targetClaimIndices: [0] },
+      { sourceType: 'TOOL_EXECUTION', snippet: 'Run 2 = 6.8s', relationship: 'SUPPORTS', targetClaimIndices: [0] }
+    ]
+  });
+  const cComp = env.memoryService.getClaimsByMemoryId(env.adminAlpha, propComp.id)[0]!;
+  const eComp = env.memoryService.getEvidenceByMemoryId(env.adminAlpha, propComp.id);
+  env.mockProvider.enqueueCompletion(JSON.stringify({
+    claimId: cComp.id, evidenceId: eComp[0]!.id, proposedRelationship: 'SUPPORTS', outcome: 'PROPOSED', confidence: 0.9, explanation: '2.1s < 3s'
+  }));
+  await env.engine.verifyClaimAgainstEvidence(env.agentAlpha, {
+    claimId: cComp.id, evidenceId: eComp[0]!.id, assumptions: ['c7g.4xlarge NVMe 100GB parquet']
+  });
+  env.mockProvider.enqueueCompletion(JSON.stringify({
+    claimId: cComp.id, evidenceId: eComp[1]!.id, proposedRelationship: 'CONTRADICTS', outcome: 'PROPOSED', confidence: 0.9, explanation: '6.8s > 3s'
+  }));
+  await env.engine.verifyClaimAgainstEvidence(env.agentAlpha, {
+    claimId: cComp.id, evidenceId: eComp[1]!.id, assumptions: ['  C7G.4XLARGE NVMe 100GB Parquet ']
+  });
+  const compSummary = env.memoryService.getConflictByClaimId(env.adminAlpha, cComp.id)!;
+  assert.equal(compSummary.conflictType, 'OPPOSING_VERIFICATIONS');
+  assert.equal(compSummary.supportingEvidence.length, 1);
+  assert.equal(compSummary.contradictingEvidence.length, 1);
+  assert.deepEqual(compSummary.incomparableEvidence, []);
+});
+
+// ============================================================================
+// 23. Regression (4F): Different non-empty assumptions across distinct evidence -> INCOMPARABLE_CONDITIONS
+// ============================================================================
+test('23. Distinct evidence under different non-empty assumptions classifies as INCOMPARABLE_CONDITIONS and preserves provenance', async () => {
+  const env = setupConflictTestEnv();
+
+  const prop = env.memoryService.createMemory(env.agentAlpha, {
+    key: 'comparability.distinct.diff.assumptions',
+    content: 'Cold start latency stays below 200ms.',
+    category: 'PROJECT_FACT',
+    scopeType: env.scopeAlpha.scopeType,
+    scopeId: env.scopeAlpha.scopeId,
+    status: 'PENDING_APPROVAL',
+    claims: [{ originalText: 'Cold start latency stays below 200ms.' }],
+    evidence: [
+      { sourceType: 'TOOL_EXECUTION', snippet: 'ARM64 snapshot cold start = 140ms.', relationship: 'SUPPORTS', targetClaimIndices: [0] },
+      { sourceType: 'TOOL_EXECUTION', snippet: 'Legacy JVM no-JIT warmups = 890ms.', relationship: 'SUPPORTS', targetClaimIndices: [0] }
+    ]
+  });
+
+  const claim = env.memoryService.getClaimsByMemoryId(env.adminAlpha, prop.id)[0]!;
+  const ev = env.memoryService.getEvidenceByMemoryId(env.adminAlpha, prop.id);
+
+  env.mockProvider.enqueueCompletion(JSON.stringify({
+    claimId: claim.id, evidenceId: ev[0]!.id, proposedRelationship: 'SUPPORTS', outcome: 'PROPOSED', confidence: 0.91, explanation: '140ms on ARM64 snapshot.'
+  }));
+  await env.engine.verifyClaimAgainstEvidence(env.agentAlpha, {
+    claimId: claim.id, evidenceId: ev[0]!.id, assumptions: ['ARM64 snapshot runtime']
+  });
+
+  env.mockProvider.enqueueCompletion(JSON.stringify({
+    claimId: claim.id, evidenceId: ev[1]!.id, proposedRelationship: 'CONTRADICTS', outcome: 'PROPOSED', confidence: 0.89, explanation: '890ms on legacy JVM.'
+  }));
+  await env.engine.verifyClaimAgainstEvidence(env.agentAlpha, {
+    claimId: claim.id, evidenceId: ev[1]!.id, assumptions: ['x86_64 unoptimized JVM']
+  });
+
+  const summary = env.memoryService.getConflictByClaimId(env.adminAlpha, claim.id)!;
+  assert.equal(summary.conflictType, 'INCOMPARABLE_CONDITIONS');
+  assert.deepEqual(summary.supportingEvidence, []);
+  assert.deepEqual(summary.contradictingEvidence, []);
+  assert.deepEqual(summary.limitationEvidence, []);
+  assert.deepEqual(summary.disputedEvidence, []);
+  assert.equal(summary.incomparableEvidence.length, 2);
+  assert.deepEqual([...summary.assumptions].sort(), ['ARM64 snapshot runtime', 'x86_64 unoptimized JVM']);
+});
+
+// ============================================================================
+// 24. Regression (4F): Explicit CONTRADICTS + opposing verifiers on same evidence preserves both cleanly
+// ============================================================================
+test('24. Explicit CONTRADICTS with opposing same-evidence verifiers stays VERIFIER_DISAGREEMENT in disputedEvidence and preserves relationship', async () => {
+  const env = setupConflictTestEnv();
+
+  const prop = env.memoryService.createMemory(env.agentAlpha, {
+    key: 'explicit.contradicts.with.opposing.verifiers',
+    content: 'Failover promotes secondary within 5 seconds.',
+    category: 'PROJECT_FACT',
+    scopeType: env.scopeAlpha.scopeType,
+    scopeId: env.scopeAlpha.scopeId,
+    status: 'PENDING_APPROVAL',
+    claims: [{ originalText: 'Failover promotes secondary within 5 seconds.' }],
+    evidence: [
+      {
+        sourceType: 'TOOL_EXECUTION',
+        snippet: 'Chaos run showed 4.8s promotion plus 1.5s DNS TTL.',
+        relationship: 'CONTRADICTS',
+        targetClaimIndices: [0]
+      }
+    ]
+  });
+
+  const claim = env.memoryService.getClaimsByMemoryId(env.adminAlpha, prop.id)[0]!;
+  const ev = env.memoryService.getEvidenceByMemoryId(env.adminAlpha, prop.id)[0]!;
+
+  const mkVerifier = (id: string, rel: 'SUPPORTS' | 'CONTRADICTS', hash: string) =>
+    new EvidenceVerificationEngine({
+      verifier: {
+        verifierId: id,
+        verifierVersion: '1.0',
+        promptPolicyVersion: 'v1',
+        promptPolicyHash: hash,
+        async evaluate() {
+          return {
+            claimId: claim.id,
+            evidenceId: ev.id,
+            proposedRelationship: rel,
+            outcome: 'PROPOSED',
+            confidence: 0.85,
+            explanation: `${id}: ${rel}`,
+            verifierId: id,
+            verifierVersion: '1.0'
+          };
+        }
+      },
+      memoryRepo: env.memoryRepo,
+      authorizer: env.authorizer,
+      auditRepo: env.auditRepo,
+      taskRepo: env.taskRepo
+    });
+
+  await mkVerifier('v-exp-1', 'SUPPORTS', 'p1').verifyClaimAgainstEvidence(env.agentAlpha, {
+    claimId: claim.id, evidenceId: ev.id, assumptions: ['Primary quorum intact']
+  });
+  await mkVerifier('v-exp-2', 'CONTRADICTS', 'p2').verifyClaimAgainstEvidence(env.agentAlpha, {
+    claimId: claim.id, evidenceId: ev.id, assumptions: ['Primary quorum intact']
+  });
+
+  const conflict = env.memoryService.getConflictByClaimId(env.adminAlpha, claim.id)!;
+  assert.equal(conflict.conflictType, 'VERIFIER_DISAGREEMENT');
+  assert.deepEqual(conflict.supportingEvidence, []);
+  assert.deepEqual(conflict.contradictingEvidence, []);
+  assert.deepEqual(conflict.limitationEvidence, []);
+  assert.deepEqual(conflict.incomparableEvidence, []);
+  assert.equal(conflict.disputedEvidence.length, 1);
+  assert.equal(conflict.disputedEvidence[0]!.evidenceId, ev.id);
+  assert.equal(conflict.disputedEvidence[0]!.relationship, 'CONTRADICTS');
+  assert.equal(conflict.disputedEvidence[0]!.hasVerifierDisagreement, true);
+  assert.equal(conflict.disputedEvidence[0]!.verifications.length, 2);
+  assert.equal(conflict.verifierDisagreements.length, 1);
+  assert.equal(conflict.verifierDisagreements[0]!.positions.length, 2);
+});
+
+// ============================================================================
+// 25. Regression (4F): Same-evidence disagreement co-occurring with independent VERIFIED_CONTRADICTION & bucket exclusivity
+// ============================================================================
+test('25. Co-occurring same-evidence disagreement and independent verified CONTRADICTS classify as VERIFIED_CONTRADICTION with exclusive buckets', async () => {
+  const env = setupConflictTestEnv();
+
+  const prop = env.memoryService.createMemory(env.agentAlpha, {
+    key: 'cooccurring.disagreement.and.verified.contradict',
+    content: 'Compression always reduces JSON payload size.',
+    category: 'PROJECT_FACT',
+    scopeType: env.scopeAlpha.scopeType,
+    scopeId: env.scopeAlpha.scopeId,
+    status: 'PENDING_APPROVAL',
+    claims: [{ originalText: 'Compression always reduces JSON payload size.' }],
+    evidence: [
+      {
+        sourceType: 'DOCUMENTATION',
+        snippet: 'Middleware compresses bodies >= 1KB.',
+        relationship: 'SUPPORTS',
+        targetClaimIndices: [0]
+      },
+      {
+        sourceType: 'TOOL_EXECUTION',
+        snippet: 'Small 30-byte JSON responses expand to 48 bytes with gzip framing.',
+        relationship: 'SUPPORTS',
+        targetClaimIndices: [0]
+      },
+      {
+        sourceType: 'DOCUMENTATION',
+        snippet: 'Clients without Accept-Encoding skip compression.',
+        relationship: 'LIMITATION',
+        targetClaimIndices: [0]
+      }
+    ]
+  });
+
+  const claim = env.memoryService.getClaimsByMemoryId(env.adminAlpha, prop.id)[0]!;
+  const evs = env.memoryService.getEvidenceByMemoryId(env.adminAlpha, prop.id);
+  const disputedEv = evs.find((e) => e.snippet?.includes('Middleware'))!;
+  const verifiedContradictEv = evs.find((e) => e.snippet?.includes('Small 30-byte'))!;
+  const limitationEv = evs.find((e) => e.relationship === 'LIMITATION')!;
+
+  const mkVerifier = (id: string, rel: 'SUPPORTS' | 'CONTRADICTS', hash: string) =>
+    new EvidenceVerificationEngine({
+      verifier: {
+        verifierId: id,
+        verifierVersion: '1.0',
+        promptPolicyVersion: 'v1',
+        promptPolicyHash: hash,
+        async evaluate() {
+          return {
+            claimId: claim.id,
+            evidenceId: disputedEv.id,
+            proposedRelationship: rel,
+            outcome: 'PROPOSED',
+            confidence: 0.85,
+            explanation: `${id}: ${rel}`,
+            verifierId: id,
+            verifierVersion: '1.0'
+          };
+        }
+      },
+      memoryRepo: env.memoryRepo,
+      authorizer: env.authorizer,
+      auditRepo: env.auditRepo,
+      taskRepo: env.taskRepo
+    });
+
+  await mkVerifier('v-cov-1', 'SUPPORTS', 'p1').verifyClaimAgainstEvidence(env.agentAlpha, {
+    claimId: claim.id, evidenceId: disputedEv.id, assumptions: ['API responses']
+  });
+  await mkVerifier('v-cov-2', 'CONTRADICTS', 'p2').verifyClaimAgainstEvidence(env.agentAlpha, {
+    claimId: claim.id, evidenceId: disputedEv.id, assumptions: ['API responses']
+  });
+
+  env.mockProvider.enqueueCompletion(JSON.stringify({
+    claimId: claim.id,
+    evidenceId: verifiedContradictEv.id,
+    proposedRelationship: 'CONTRADICTS',
+    outcome: 'PROPOSED',
+    confidence: 0.94,
+    explanation: 'Small payloads expand under gzip framing.'
+  }));
+  await env.engine.verifyClaimAgainstEvidence(env.agentAlpha, {
+    claimId: claim.id,
+    evidenceId: verifiedContradictEv.id,
+    assumptions: ['API responses']
+  });
+
+  const conflict = env.memoryService.getConflictByClaimId(env.adminAlpha, claim.id)!;
+  assert.equal(conflict.conflictType, 'VERIFIED_CONTRADICTION');
+  assert.equal(conflict.supportingEvidence.length, 0);
+  assert.equal(conflict.contradictingEvidence.map((e) => e.evidenceId).join(','), verifiedContradictEv.id);
+  assert.equal(conflict.disputedEvidence.map((e) => e.evidenceId).join(','), disputedEv.id);
+  assert.equal(conflict.limitationEvidence.map((e) => e.evidenceId).join(','), limitationEv.id);
+  assert.equal(conflict.incomparableEvidence.length, 0);
+  assert.equal(conflict.verifierDisagreements.length, 1);
+
+  // Strict bucket exclusivity: every evidence ID belongs to at most one bucket
+  const allBucketIds = [
+    ...conflict.supportingEvidence.map((e) => e.evidenceId),
+    ...conflict.contradictingEvidence.map((e) => e.evidenceId),
+    ...conflict.limitationEvidence.map((e) => e.evidenceId),
+    ...conflict.disputedEvidence.map((e) => e.evidenceId),
+    ...conflict.incomparableEvidence.map((e) => e.evidenceId)
+  ];
+  assert.equal(allBucketIds.length, new Set(allBucketIds).size);
+  assert.equal(allBucketIds.length, 3);
+});
+
+// ============================================================================
+// 26. Regression (4F): HTTP & CLI serialization of INCOMPARABLE_CONDITIONS & CLI --help types
+// ============================================================================
+test('26. HTTP and CLI expose INCOMPARABLE_CONDITIONS filtering, incomparableEvidence DTO, and complete --help types', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dots-incomp-cli-'));
+  const dbPath = join(dir, 'dots.db');
+  const ADMIN_TOKEN = 'admin-incomp-secret-12345';
+  const tokens = [
+    {
+      token: ADMIN_TOKEN,
+      principalId: 'alice-alpha',
+      role: 'ADMIN' as const,
+      permittedScopes: [{ scopeType: 'WORKSPACE' as const, scopeId: 'ws-alpha' }]
+    }
+  ];
+
+  // Verify --help lists all 5 supported conflict types
+  const helpOut: string[] = [];
+  const helpCode = await runCli(['--help'], {
+    stdout: (l) => helpOut.push(l),
+    stderr: () => undefined
+  });
+  assert.equal(helpCode, 0);
+  const helpText = helpOut.join('\n');
+  for (const t of [
+    'EXPLICIT_CONTRADICTION',
+    'VERIFIED_CONTRADICTION',
+    'OPPOSING_VERIFICATIONS',
+    'VERIFIER_DISAGREEMENT',
+    'INCOMPARABLE_CONDITIONS'
+  ]) {
+    assert.ok(helpText.includes(t), `CLI --help missing conflict type ${t}`);
+  }
+
+  const runtime = new DotsRuntime({
+    dbPath,
+    workspaceRoot: dir,
+    host: '127.0.0.1',
+    port: 0,
+    silentLogs: true,
+    enableScheduler: false,
+    modelProvider: new MockModelProvider(),
+    tokens
+  });
+  const server = new DotsHttpServer(runtime);
+
+  try {
+    const admin = runtime.authorizer.authorizeUser({
+      credentials: ADMIN_TOKEN,
+      requestedScope: { scopeType: 'WORKSPACE', scopeId: 'ws-alpha' }
+    });
+    const prop = runtime.memoryService.createMemory(admin, {
+      key: 'http.incomparable.item',
+      content: 'Cache hit ratio exceeds 95%.',
+      category: 'PROJECT_FACT',
+      scopeType: 'WORKSPACE',
+      scopeId: 'ws-alpha',
+      status: 'PENDING_APPROVAL',
+      claims: [{ originalText: 'Cache hit ratio exceeds 95%.' }],
+      evidence: [
+        { sourceType: 'TOOL_EXECUTION', snippet: 'Zipf load = 98%.', relationship: 'SUPPORTS', targetClaimIndices: [0] },
+        { sourceType: 'TOOL_EXECUTION', snippet: 'Uniform load = 32%.', relationship: 'SUPPORTS', targetClaimIndices: [0] }
+      ]
+    });
+    const claim = runtime.memoryService.getClaimsByMemoryId(admin, prop.id)[0]!;
+    const ev = runtime.memoryService.getEvidenceByMemoryId(admin, prop.id);
+
+    const engine = new EvidenceVerificationEngine({
+      verifier: {
+        verifierId: 'v-http-incomp',
+        verifierVersion: '1.0',
+        promptPolicyVersion: 'v1',
+        promptPolicyHash: 'ph-incomp',
+        async evaluate({ evidence }) {
+          const isSup = evidence.id === ev[0]!.id;
+          return {
+            claimId: claim.id,
+            evidenceId: evidence.id,
+            proposedRelationship: isSup ? 'SUPPORTS' : 'CONTRADICTS',
+            outcome: 'PROPOSED',
+            confidence: 0.9,
+            explanation: isSup ? 'Supports on Zipf.' : 'Fails on uniform.',
+            verifierId: 'v-http-incomp',
+            verifierVersion: '1.0'
+          };
+        }
+      },
+      memoryRepo: runtime.memoryRepo,
+      authorizer: runtime.authorizer,
+      auditRepo: runtime.auditRepo,
+      taskRepo: runtime.taskRepo
+    });
+    await engine.verifyClaimAgainstEvidence(admin, { claimId: claim.id, evidenceId: ev[0]!.id, assumptions: ['Zipf'] });
+    await engine.verifyClaimAgainstEvidence(admin, { claimId: claim.id, evidenceId: ev[1]!.id, assumptions: ['Uniform'] });
+
+    const started = await server.start();
+
+    const httpRes = await fetch(`${started.url}/api/memories/conflicts?conflictType=INCOMPARABLE_CONDITIONS`, {
+      headers: { Authorization: `Bearer ${ADMIN_TOKEN}` }
+    });
+    assert.equal(httpRes.status, 200);
+    const httpBody = (await httpRes.json()) as { total: number; conflicts: ClaimConflictSummary[] };
+    assert.equal(httpBody.total, 1);
+    assert.equal(httpBody.conflicts[0]!.conflictType, 'INCOMPARABLE_CONDITIONS');
+    assert.equal(httpBody.conflicts[0]!.incomparableEvidence.length, 2);
+    assert.deepEqual(httpBody.conflicts[0]!.disputedEvidence, []);
+    assert.deepEqual(httpBody.conflicts[0]!.contradictingEvidence, []);
+
+    const cliOut: string[] = [];
+    const cliErr: string[] = [];
+    const cliCode = await runCli(
+      [
+        '--server',
+        started.url,
+        '--token',
+        ADMIN_TOKEN,
+        '--json',
+        'memory',
+        'conflicts',
+        '--conflict-type',
+        'INCOMPARABLE_CONDITIONS'
+      ],
+      { stdout: (l) => cliOut.push(l), stderr: (l) => cliErr.push(l) }
+    );
+    assert.equal(cliCode, 0, cliErr.join('\n'));
+    const cliParsed = JSON.parse(cliOut.join('\n')) as { total: number; conflicts: ClaimConflictSummary[] };
+    assert.equal(cliParsed.total, 1);
+    assert.equal(cliParsed.conflicts[0]!.conflictType, 'INCOMPARABLE_CONDITIONS');
+    assert.equal(cliParsed.conflicts[0]!.incomparableEvidence.length, 2);
+  } finally {
+    await server.stop().catch(() => undefined);
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -531,7 +531,8 @@ export type ClaimConflictType =
   | 'EXPLICIT_CONTRADICTION'
   | 'VERIFIED_CONTRADICTION'
   | 'OPPOSING_VERIFICATIONS'
-  | 'VERIFIER_DISAGREEMENT';
+  | 'VERIFIER_DISAGREEMENT'
+  | 'INCOMPARABLE_CONDITIONS';
 
 export interface ConflictMemoryOrigin {
   readonly memoryId: string;
@@ -600,6 +601,8 @@ export interface ClaimConflictSummary {
   readonly supportingEvidence: readonly ConflictEvidenceReference[];
   readonly contradictingEvidence: readonly ConflictEvidenceReference[];
   readonly limitationEvidence: readonly ConflictEvidenceReference[];
+  readonly disputedEvidence: readonly ConflictEvidenceReference[];
+  readonly incomparableEvidence: readonly ConflictEvidenceReference[];
   readonly verifierDisagreements: readonly ConflictVerifierDisagreement[];
   readonly assumptions: readonly string[];
   readonly contextualAssumptions: readonly string[];

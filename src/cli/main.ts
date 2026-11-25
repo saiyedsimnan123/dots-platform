@@ -210,7 +210,7 @@ function renderHelp(): string {
     '  memory delete <id>',
     '  memory approve <id> [--reason <text>]',
     '  memory reject <id> [--reason <text>]',
-    '  memory conflicts [--memory-id <id>] [--claim-id <id>] [--conflict-type <type>] [--include-historical] [--limit <n>] [--offset <n>]',
+    '  memory conflicts [--memory-id <id>] [--claim-id <id>] [--conflict-type <EXPLICIT_CONTRADICTION|VERIFIED_CONTRADICTION|OPPOSING_VERIFICATIONS|VERIFIER_DISAGREEMENT|INCOMPARABLE_CONDITIONS>] [--include-historical] [--limit <n>] [--offset <n>]',
     '  memory export [--category <cat>] [--include-archived] [--out <file>]',
     '  memory import <file> [--strategy <FAIL|SKIP|OVERWRITE>]',
     '  memory purge [--ids a,b | --older-than <iso>] [--dry-run] [--max-batch <n>]',

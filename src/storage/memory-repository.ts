@@ -272,7 +272,8 @@ const VALID_CLAIM_CONFLICT_TYPES: ReadonlySet<ClaimConflictType> = new Set([
   'EXPLICIT_CONTRADICTION',
   'VERIFIED_CONTRADICTION',
   'OPPOSING_VERIFICATIONS',
-  'VERIFIER_DISAGREEMENT'
+  'VERIFIER_DISAGREEMENT',
+  'INCOMPARABLE_CONDITIONS'
 ]);
 
 export class MemoryRepository {
@@ -2139,6 +2140,7 @@ export class MemoryRepository {
          AND cev_c.scope_id = cev_s.scope_id
          AND cev_c.evidence_id <> cev_s.evidence_id
          AND cev_c.assumptions_hash = cev_s.assumptions_hash
+         AND cev_c.assumptions_hash <> ''
          AND cev_c.proposed_relationship = 'CONTRADICTS'
          AND cev_c.verification_outcome = 'PROPOSED'${verifCond('cev_c')}
         INNER JOIN claim_evidence_associations cea_c
@@ -2158,8 +2160,31 @@ export class MemoryRepository {
         WHERE cev_s.claim_id = c.id
           AND cev_s.scope_type = c.scope_type
           AND cev_s.scope_id = c.scope_id
+          AND cev_s.assumptions_hash <> ''
           AND cev_s.proposed_relationship = 'SUPPORTS'
           AND cev_s.verification_outcome = 'PROPOSED'${verifCond('cev_s')}
+          AND NOT EXISTS (
+            SELECT 1
+            FROM claim_evidence_verifications cev_s_tie
+            WHERE cev_s_tie.claim_id = cev_s.claim_id
+              AND cev_s_tie.evidence_id = cev_s.evidence_id
+              AND cev_s_tie.scope_type = cev_s.scope_type
+              AND cev_s_tie.scope_id = cev_s.scope_id
+              AND cev_s_tie.assumptions_hash = cev_s.assumptions_hash
+              AND cev_s_tie.proposed_relationship = 'CONTRADICTS'
+              AND cev_s_tie.verification_outcome = 'PROPOSED'${verifCond('cev_s_tie')}
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM claim_evidence_verifications cev_c_tie
+            WHERE cev_c_tie.claim_id = cev_c.claim_id
+              AND cev_c_tie.evidence_id = cev_c.evidence_id
+              AND cev_c_tie.scope_type = cev_c.scope_type
+              AND cev_c_tie.scope_id = cev_c.scope_id
+              AND cev_c_tie.assumptions_hash = cev_c.assumptions_hash
+              AND cev_c_tie.proposed_relationship = 'SUPPORTS'
+              AND cev_c_tie.verification_outcome = 'PROPOSED'${verifCond('cev_c_tie')}
+          )
       )
     `;
 
@@ -2200,6 +2225,40 @@ export class MemoryRepository {
               AND cev_peer.assumptions_hash = cev_vc.assumptions_hash
               AND cev_peer.proposed_relationship = 'SUPPORTS'
               AND cev_peer.verification_outcome = 'PROPOSED'${verifCond('cev_peer')}
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM claim_evidence_verifications cev_sup
+            INNER JOIN claim_evidence_associations cea_sup
+              ON cea_sup.claim_id = cev_sup.claim_id
+             AND cea_sup.evidence_id = cev_sup.evidence_id
+             AND cea_sup.scope_type = cev_sup.scope_type
+             AND cea_sup.scope_id = cev_sup.scope_id${assocCond('cea_sup')}
+            INNER JOIN memory_claim_links mcl_sup
+              ON mcl_sup.claim_id = cea_sup.claim_id
+             AND mcl_sup.memory_id = cea_sup.memory_id
+             AND mcl_sup.scope_type = cea_sup.scope_type
+             AND mcl_sup.scope_id = cea_sup.scope_id${linkCond('mcl_sup')}
+            INNER JOIN memories m_sup
+              ON m_sup.id = cea_sup.memory_id
+             AND m_sup.scope_type = cea_sup.scope_type
+             AND m_sup.scope_id = cea_sup.scope_id${memCond('m_sup')}
+            WHERE cev_sup.claim_id = c.id
+              AND cev_sup.scope_type = c.scope_type
+              AND cev_sup.scope_id = c.scope_id
+              AND cev_sup.proposed_relationship = 'SUPPORTS'
+              AND cev_sup.verification_outcome = 'PROPOSED'${verifCond('cev_sup')}
+              AND NOT EXISTS (
+                SELECT 1
+                FROM claim_evidence_verifications cev_sup_tie
+                WHERE cev_sup_tie.claim_id = cev_sup.claim_id
+                  AND cev_sup_tie.evidence_id = cev_sup.evidence_id
+                  AND cev_sup_tie.scope_type = cev_sup.scope_type
+                  AND cev_sup_tie.scope_id = cev_sup.scope_id
+                  AND cev_sup_tie.assumptions_hash = cev_sup.assumptions_hash
+                  AND cev_sup_tie.proposed_relationship = 'CONTRADICTS'
+                  AND cev_sup_tie.verification_outcome = 'PROPOSED'${verifCond('cev_sup_tie')}
+              )
           )
       )
     `;
@@ -2298,6 +2357,78 @@ export class MemoryRepository {
       )
     `;
 
+    const hasIncomparableExpr = `
+      EXISTS (
+        SELECT 1
+        FROM claim_evidence_verifications cev_is
+        INNER JOIN claim_evidence_associations cea_is
+          ON cea_is.claim_id = cev_is.claim_id
+         AND cea_is.evidence_id = cev_is.evidence_id
+         AND cea_is.scope_type = cev_is.scope_type
+         AND cea_is.scope_id = cev_is.scope_id${assocCond('cea_is')}
+        INNER JOIN memory_claim_links mcl_is
+          ON mcl_is.claim_id = cea_is.claim_id
+         AND mcl_is.memory_id = cea_is.memory_id
+         AND mcl_is.scope_type = cea_is.scope_type
+         AND mcl_is.scope_id = cea_is.scope_id${linkCond('mcl_is')}
+        INNER JOIN memories m_is
+          ON m_is.id = cea_is.memory_id
+         AND m_is.scope_type = cea_is.scope_type
+         AND m_is.scope_id = cea_is.scope_id${memCond('m_is')}
+        INNER JOIN claim_evidence_verifications cev_ic
+          ON cev_ic.claim_id = cev_is.claim_id
+         AND cev_ic.scope_type = cev_is.scope_type
+         AND cev_ic.scope_id = cev_is.scope_id
+         AND cev_ic.proposed_relationship = 'CONTRADICTS'
+         AND cev_ic.verification_outcome = 'PROPOSED'${verifCond('cev_ic')}
+        INNER JOIN claim_evidence_associations cea_ic
+          ON cea_ic.claim_id = cev_ic.claim_id
+         AND cea_ic.evidence_id = cev_ic.evidence_id
+         AND cea_ic.scope_type = cev_ic.scope_type
+         AND cea_ic.scope_id = cev_ic.scope_id${assocCond('cea_ic')}
+        INNER JOIN memory_claim_links mcl_ic
+          ON mcl_ic.claim_id = cea_ic.claim_id
+         AND mcl_ic.memory_id = cea_ic.memory_id
+         AND mcl_ic.scope_type = cea_ic.scope_type
+         AND mcl_ic.scope_id = cea_ic.scope_id${linkCond('mcl_ic')}
+        INNER JOIN memories m_ic
+          ON m_ic.id = cea_ic.memory_id
+         AND m_ic.scope_type = cea_ic.scope_type
+         AND m_ic.scope_id = cea_ic.scope_id${memCond('m_ic')}
+        WHERE cev_is.claim_id = c.id
+          AND cev_is.scope_type = c.scope_type
+          AND cev_is.scope_id = c.scope_id
+          AND cev_is.proposed_relationship = 'SUPPORTS'
+          AND cev_is.verification_outcome = 'PROPOSED'${verifCond('cev_is')}
+          AND NOT EXISTS (
+            SELECT 1
+            FROM claim_evidence_verifications cev_is_tie
+            WHERE cev_is_tie.claim_id = cev_is.claim_id
+              AND cev_is_tie.evidence_id = cev_is.evidence_id
+              AND cev_is_tie.scope_type = cev_is.scope_type
+              AND cev_is_tie.scope_id = cev_is.scope_id
+              AND cev_is_tie.assumptions_hash = cev_is.assumptions_hash
+              AND cev_is_tie.proposed_relationship = 'CONTRADICTS'
+              AND cev_is_tie.verification_outcome = 'PROPOSED'${verifCond('cev_is_tie')}
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM claim_evidence_verifications cev_ic_tie
+            WHERE cev_ic_tie.claim_id = cev_ic.claim_id
+              AND cev_ic_tie.evidence_id = cev_ic.evidence_id
+              AND cev_ic_tie.scope_type = cev_ic.scope_type
+              AND cev_ic_tie.scope_id = cev_ic.scope_id
+              AND cev_ic_tie.assumptions_hash = cev_ic.assumptions_hash
+              AND cev_ic_tie.proposed_relationship = 'SUPPORTS'
+              AND cev_ic_tie.verification_outcome = 'PROPOSED'${verifCond('cev_ic_tie')}
+          )
+          AND (
+            cev_ic.assumptions_hash <> cev_is.assumptions_hash
+            OR cev_is.assumptions_hash = ''
+          )
+      )
+    `;
+
     const detectedAtExpr = `
       MAX(
         c.created_at,
@@ -2382,9 +2513,13 @@ export class MemoryRepository {
       claimConditions.push(
         `(NOT (${hasOpposingExpr})) AND (NOT (${hasVerifiedContradictExpr})) AND (NOT (${hasExplicitContradictExpr})) AND (${hasVerifierDisagreementExpr})`
       );
+    } else if (filter.conflictType === 'INCOMPARABLE_CONDITIONS') {
+      claimConditions.push(
+        `(NOT (${hasOpposingExpr})) AND (NOT (${hasVerifiedContradictExpr})) AND (NOT (${hasExplicitContradictExpr})) AND (NOT (${hasVerifierDisagreementExpr})) AND (${hasIncomparableExpr})`
+      );
     } else {
       claimConditions.push(
-        `(${hasOpposingExpr} OR ${hasVerifiedContradictExpr} OR ${hasExplicitContradictExpr} OR ${hasVerifierDisagreementExpr})`
+        `(${hasOpposingExpr} OR ${hasVerifiedContradictExpr} OR ${hasExplicitContradictExpr} OR ${hasVerifierDisagreementExpr} OR ${hasIncomparableExpr})`
       );
     }
 
@@ -2418,7 +2553,8 @@ export class MemoryRepository {
           WHEN ${hasOpposingExpr} THEN 'OPPOSING_VERIFICATIONS'
           WHEN ${hasVerifiedContradictExpr} THEN 'VERIFIED_CONTRADICTION'
           WHEN ${hasExplicitContradictExpr} THEN 'EXPLICIT_CONTRADICTION'
-          ELSE 'VERIFIER_DISAGREEMENT'
+          WHEN ${hasVerifierDisagreementExpr} THEN 'VERIFIER_DISAGREEMENT'
+          ELSE 'INCOMPARABLE_CONDITIONS'
         END AS computed_conflict_type
       FROM memory_claims c
       WHERE ${whereClause}
@@ -2641,8 +2777,12 @@ export class MemoryRepository {
       const verifierDisagreements: ConflictVerifierDisagreement[] = [];
       const evidenceIdsWithDisagreement = new Set<string>();
       const opposingDisagreementHashesByEvidenceId = new Map<string, Set<string>>();
-      const supportsByAssumptionHash = new Map<string, Set<string>>();
-      const contradictsByAssumptionHash = new Map<string, Set<string>>();
+      const undisputedSupportsEntries: Array<{ readonly evidenceId: string; readonly assumptionsHash: string }> = [];
+      const undisputedContradictsEntries: Array<{
+        readonly evidenceId: string;
+        readonly assumptionsHash: string;
+        readonly evidenceRelationship: EvidenceRelationship;
+      }> = [];
 
       for (const evRef of rawEvidenceRefs) {
         const verifsByHash = new Map<string, ClaimEvidenceVerification[]>();
@@ -2650,23 +2790,9 @@ export class MemoryRepository {
           const group = verifsByHash.get(v.assumptionsHash) ?? [];
           group.push(v);
           verifsByHash.set(v.assumptionsHash, group);
-
-          if (v.verificationOutcome === 'PROPOSED' && v.proposedRelationship === 'SUPPORTS') {
-            const evSet = supportsByAssumptionHash.get(v.assumptionsHash) ?? new Set<string>();
-            evSet.add(evRef.evidenceId);
-            supportsByAssumptionHash.set(v.assumptionsHash, evSet);
-          }
-          if (v.verificationOutcome === 'PROPOSED' && v.proposedRelationship === 'CONTRADICTS') {
-            const evSet = contradictsByAssumptionHash.get(v.assumptionsHash) ?? new Set<string>();
-            evSet.add(evRef.evidenceId);
-            contradictsByAssumptionHash.set(v.assumptionsHash, evSet);
-          }
         }
 
         for (const [assumptionsHash, group] of verifsByHash.entries()) {
-          if (group.length < 2) {
-            continue;
-          }
           const hasPeerSupports = group.some(
             (v) => v.proposedRelationship === 'SUPPORTS' && v.verificationOutcome === 'PROPOSED'
           );
@@ -2677,8 +2803,19 @@ export class MemoryRepository {
             const tieHashes = opposingDisagreementHashesByEvidenceId.get(evRef.evidenceId) ?? new Set<string>();
             tieHashes.add(assumptionsHash);
             opposingDisagreementHashesByEvidenceId.set(evRef.evidenceId, tieHashes);
+          } else if (hasPeerSupports) {
+            undisputedSupportsEntries.push({ evidenceId: evRef.evidenceId, assumptionsHash });
+          } else if (hasPeerContradicts) {
+            undisputedContradictsEntries.push({
+              evidenceId: evRef.evidenceId,
+              assumptionsHash,
+              evidenceRelationship: evRef.relationship
+            });
           }
 
+          if (group.length < 2) {
+            continue;
+          }
           const distinctOutcomes = new Set(group.map((v) => `${v.verificationOutcome}:${v.proposedRelationship}`));
           if (distinctOutcomes.size > 1) {
             evidenceIdsWithDisagreement.add(evRef.evidenceId);
@@ -2708,31 +2845,36 @@ export class MemoryRepository {
         hasVerifierDisagreement: evidenceIdsWithDisagreement.has(evRef.evidenceId)
       }));
 
+      // Evaluate comparability strictly across undisputed verification findings
+      const comparableOpposingIds = new Set<string>();
+      const incomparablePairIds = new Set<string>();
       let hasOpposingDistinctEvidenceVerifications = false;
-      for (const [hash, contradictsEvIds] of contradictsByAssumptionHash.entries()) {
-        const supportsEvIds = supportsByAssumptionHash.get(hash);
-        if (!supportsEvIds) {
-          continue;
-        }
-        for (const cEvId of contradictsEvIds) {
-          for (const sEvId of supportsEvIds) {
-            if (cEvId !== sEvId) {
-              hasOpposingDistinctEvidenceVerifications = true;
-              break;
-            }
+      let hasIncomparableConditions = false;
+
+      for (const cEntry of undisputedContradictsEntries) {
+        for (const sEntry of undisputedSupportsEntries) {
+          if (
+            cEntry.evidenceId !== sEntry.evidenceId &&
+            sEntry.assumptionsHash !== '' &&
+            cEntry.assumptionsHash === sEntry.assumptionsHash
+          ) {
+            hasOpposingDistinctEvidenceVerifications = true;
+            comparableOpposingIds.add(cEntry.evidenceId);
+            comparableOpposingIds.add(sEntry.evidenceId);
+          } else {
+            hasIncomparableConditions = true;
+            incomparablePairIds.add(cEntry.evidenceId);
+            incomparablePairIds.add(sEntry.evidenceId);
           }
-          if (hasOpposingDistinctEvidenceVerifications) {
-            break;
-          }
-        }
-        if (hasOpposingDistinctEvidenceVerifications) {
-          break;
         }
       }
 
+      const hasAnyUndisputedSupports = undisputedSupportsEntries.length > 0;
       const supportingEvidence: ConflictEvidenceReference[] = [];
       const contradictingEvidence: ConflictEvidenceReference[] = [];
       const limitationEvidence: ConflictEvidenceReference[] = [];
+      const disputedEvidence: ConflictEvidenceReference[] = [];
+      const incomparableEvidence: ConflictEvidenceReference[] = [];
 
       let hasExplicitContradiction = false;
       let hasVerifiedContradiction = false;
@@ -2755,35 +2897,32 @@ export class MemoryRepository {
           (v) => v.verificationOutcome === 'INSUFFICIENT' || v.verificationOutcome === 'AMBIGUOUS'
         );
 
-        if (proposesContradicts) {
-          const hasUncontestedContradiction = evRef.verifications.some((v) => {
-            if (v.proposedRelationship !== 'CONTRADICTS' || v.verificationOutcome !== 'PROPOSED') {
-              return false;
+        // Strict mutually-exclusive bucket assignment
+        if (hasSameEvidenceOpposingTie) {
+          disputedEvidence.push(evRef);
+        } else if (
+          incomparablePairIds.has(evRef.evidenceId) &&
+          !comparableOpposingIds.has(evRef.evidenceId) &&
+          !(evRef.relationship === 'CONTRADICTS' && (evRef.verifications.length === 0 || hasUnresolvedVerif))
+        ) {
+          incomparableEvidence.push(evRef);
+        } else if (proposesContradicts) {
+          const isUncontestedContradiction = evRef.verifications.some(
+            (v) =>
+              v.proposedRelationship === 'CONTRADICTS' &&
+              v.verificationOutcome === 'PROPOSED' &&
+              !tieHashes?.has(v.assumptionsHash)
+          );
+          if (
+            isUncontestedContradiction &&
+            (comparableOpposingIds.has(evRef.evidenceId) ||
+              (evRef.relationship !== 'LIMITATION' && !hasAnyUndisputedSupports))
+          ) {
+            if (evRef.relationship !== 'LIMITATION' && !hasAnyUndisputedSupports) {
+              hasVerifiedContradiction = true;
             }
-            if (tieHashes?.has(v.assumptionsHash)) {
-              return false;
-            }
-            if (evRef.relationship !== 'LIMITATION') {
-              return true;
-            }
-            const otherSupports = supportsByAssumptionHash.get(v.assumptionsHash);
-            if (!otherSupports) {
-              return false;
-            }
-            for (const sEvId of otherSupports) {
-              if (sEvId !== evRef.evidenceId) {
-                return true;
-              }
-            }
-            return false;
-          });
-
-          if (hasUncontestedContradiction) {
-            hasVerifiedContradiction = true;
             contradictingEvidence.push(evRef);
           } else {
-            // Contested by opposing same-evidence verifier (or uncorroborated LIMITATION): never place in both
-            // supporting and contradicting buckets, and never present as an established contradiction alone.
             limitationEvidence.push(evRef);
           }
         } else if (evRef.verifications.length === 0) {
@@ -2822,12 +2961,18 @@ export class MemoryRepository {
         conflictType = 'EXPLICIT_CONTRADICTION';
       } else if (hasSameEvidenceVerifierDisagreement) {
         conflictType = 'VERIFIER_DISAGREEMENT';
+      } else if (hasIncomparableConditions) {
+        conflictType = 'INCOMPARABLE_CONDITIONS';
       }
 
       if (
         !conflictType ||
-        (conflictType !== 'VERIFIER_DISAGREEMENT' && contradictingEvidence.length === 0) ||
-        (conflictType === 'VERIFIER_DISAGREEMENT' && verifierDisagreements.length === 0)
+        ((conflictType === 'OPPOSING_VERIFICATIONS' ||
+          conflictType === 'VERIFIED_CONTRADICTION' ||
+          conflictType === 'EXPLICIT_CONTRADICTION') &&
+          contradictingEvidence.length === 0) ||
+        (conflictType === 'VERIFIER_DISAGREEMENT' && disputedEvidence.length === 0) ||
+        (conflictType === 'INCOMPARABLE_CONDITIONS' && incomparableEvidence.length === 0)
       ) {
         continue;
       }
@@ -2872,6 +3017,8 @@ export class MemoryRepository {
         supportingEvidence,
         contradictingEvidence,
         limitationEvidence,
+        disputedEvidence,
+        incomparableEvidence,
         verifierDisagreements,
         assumptions: normalizeVerificationAssumptions(verifierAssumptions),
         contextualAssumptions: normalizeVerificationAssumptions(contextualMemoryAssumptions),
