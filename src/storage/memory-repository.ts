@@ -41,7 +41,13 @@ import type {
   ClaimEvidenceAssociation,
   CreateClaimEvidenceAssociationInput,
   ClaimAssociationStatus,
-  ClaimVerificationLifecycleStatus
+  ClaimVerificationLifecycleStatus,
+  ClaimConflictType,
+  ConflictMemoryOrigin,
+  ConflictEvidenceReference,
+  ClaimConflictSummary,
+  ListClaimConflictsFilter,
+  ClaimConflictsResult
 } from '../domain/types.ts';
 import {
   canonicalizeClaimText,
@@ -77,7 +83,13 @@ export type {
   CreateClaimVerificationInput,
   ListClaimVerificationsFilter,
   ClaimEvidenceAssociation,
-  CreateClaimEvidenceAssociationInput
+  CreateClaimEvidenceAssociationInput,
+  ClaimConflictType,
+  ConflictMemoryOrigin,
+  ConflictEvidenceReference,
+  ClaimConflictSummary,
+  ListClaimConflictsFilter,
+  ClaimConflictsResult
 };
 
 export function computeSnippetHash(snippet?: string | null, fallback: string = ''): string {
@@ -250,6 +262,12 @@ const VALID_VERIFICATION_OUTCOMES: ReadonlySet<ClaimVerificationCandidateOutcome
   'PROPOSED',
   'INSUFFICIENT',
   'AMBIGUOUS'
+]);
+
+const VALID_CLAIM_CONFLICT_TYPES: ReadonlySet<ClaimConflictType> = new Set([
+  'EXPLICIT_CONTRADICTION',
+  'VERIFIED_CONTRADICTION',
+  'OPPOSING_VERIFICATIONS'
 ]);
 
 export class MemoryRepository {
@@ -2026,6 +2044,490 @@ export class MemoryRepository {
 
     const rows = this.db.prepare(sql).all(...params) as unknown as ClaimVerificationDbRow[];
     return rows.map((r) => this.mapClaimVerificationRow(r));
+  }
+
+  /**
+   * Surfaces conflicting research evidence and opposing structured verifications grouped by normalized claim
+   * within an explicit authorized scope. Strictly read-only: never mutates memory or proposal lifecycle state.
+   */
+  public listClaimConflicts(filter: ListClaimConflictsFilter): ClaimConflictsResult {
+    if (!filter || typeof filter !== 'object') {
+      throw new ValidationError('Filter must be provided to listClaimConflicts.');
+    }
+    this.validateScope(filter.scopeType, filter.scopeId);
+
+    if (filter.includeHistorical !== undefined && typeof filter.includeHistorical !== 'boolean') {
+      throw new ValidationError('includeHistorical must be a boolean when provided.');
+    }
+    const includeHistorical = filter.includeHistorical === true;
+
+    if (filter.conflictType !== undefined && !VALID_CLAIM_CONFLICT_TYPES.has(filter.conflictType)) {
+      throw new ValidationError(`Invalid conflictType '${String(filter.conflictType)}'.`);
+    }
+
+    const limit = filter.limit ?? 50;
+    if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1 || limit > 200) {
+      throw new ValidationError('Conflict query limit must be an integer between 1 and 200.');
+    }
+
+    const offset = filter.offset ?? 0;
+    if (typeof offset !== 'number' || !Number.isInteger(offset) || offset < 0) {
+      throw new ValidationError('Conflict query offset must be a non-negative integer.');
+    }
+
+    const scope: ScopeIdentifier = { scopeType: filter.scopeType, scopeId: filter.scopeId };
+
+    let targetClaimId: string | undefined;
+    if (filter.claimId !== undefined) {
+      if (typeof filter.claimId !== 'string' || filter.claimId.trim() === '') {
+        throw new ValidationError('Filter claimId must be a non-empty string when provided.');
+      }
+      targetClaimId = filter.claimId.trim();
+      const claimExists = this.getClaimById(targetClaimId, scope);
+      if (!claimExists) {
+        return { conflicts: [], total: 0, includeHistorical };
+      }
+    }
+
+    let targetMemoryId: string | undefined;
+    if (filter.memoryId !== undefined) {
+      if (typeof filter.memoryId !== 'string' || filter.memoryId.trim() === '') {
+        throw new ValidationError('Filter memoryId must be a non-empty string when provided.');
+      }
+      targetMemoryId = filter.memoryId.trim();
+      const memExists = this.getMemoryById(targetMemoryId, scope);
+      if (!memExists) {
+        return { conflicts: [], total: 0, includeHistorical };
+      }
+    }
+
+    const memStatusClause = includeHistorical ? '' : " AND m.status IN ('ACTIVE', 'PENDING_APPROVAL')";
+    const linkStatusClause = includeHistorical ? '' : " AND mcl.status = 'ACTIVE'";
+    const assocStatusClause = includeHistorical ? '' : " AND cea.status = 'ACTIVE'";
+    const verifStatusClause = includeHistorical ? '' : " AND cev.status = 'CURRENT'";
+
+    const claimConditions: string[] = [
+      'c.scope_type = ?',
+      'c.scope_id = ?',
+      `(
+        EXISTS (
+          SELECT 1
+          FROM claim_evidence_associations cea
+          INNER JOIN memory_claim_links mcl
+            ON mcl.claim_id = cea.claim_id
+            AND mcl.memory_id = cea.memory_id
+            AND mcl.scope_type = cea.scope_type
+            AND mcl.scope_id = cea.scope_id${linkStatusClause}
+          INNER JOIN memories m
+            ON m.id = cea.memory_id
+            AND m.scope_type = cea.scope_type
+            AND m.scope_id = cea.scope_id${memStatusClause}
+          WHERE cea.claim_id = c.id
+            AND cea.scope_type = c.scope_type
+            AND cea.scope_id = c.scope_id
+            AND cea.relationship = 'CONTRADICTS'${assocStatusClause}
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM claim_evidence_verifications cev
+          INNER JOIN claim_evidence_associations cea
+            ON cea.claim_id = cev.claim_id
+            AND cea.evidence_id = cev.evidence_id
+            AND cea.scope_type = cev.scope_type
+            AND cea.scope_id = cev.scope_id${assocStatusClause}
+          INNER JOIN memory_claim_links mcl
+            ON mcl.claim_id = cea.claim_id
+            AND mcl.memory_id = cea.memory_id
+            AND mcl.scope_type = cea.scope_type
+            AND mcl.scope_id = cea.scope_id${linkStatusClause}
+          INNER JOIN memories m
+            ON m.id = cea.memory_id
+            AND m.scope_type = cea.scope_type
+            AND m.scope_id = cea.scope_id${memStatusClause}
+          WHERE cev.claim_id = c.id
+            AND cev.scope_type = c.scope_type
+            AND cev.scope_id = c.scope_id
+            AND cev.proposed_relationship = 'CONTRADICTS'
+            AND cev.verification_outcome = 'PROPOSED'${verifStatusClause}
+        )
+      )`
+    ];
+    const claimParams: SqlParam[] = [filter.scopeType, filter.scopeId];
+
+    if (targetClaimId) {
+      claimConditions.push('c.id = ?');
+      claimParams.push(targetClaimId);
+    }
+
+    if (targetMemoryId) {
+      claimConditions.push(`
+        EXISTS (
+          SELECT 1
+          FROM memory_claim_links mcl_t
+          INNER JOIN memories m_t
+            ON m_t.id = mcl_t.memory_id
+            AND m_t.scope_type = mcl_t.scope_type
+            AND m_t.scope_id = mcl_t.scope_id
+          WHERE mcl_t.claim_id = c.id
+            AND mcl_t.memory_id = ?
+            AND mcl_t.scope_type = c.scope_type
+            AND mcl_t.scope_id = c.scope_id
+            ${includeHistorical ? '' : "AND mcl_t.status = 'ACTIVE' AND m_t.status IN ('ACTIVE', 'PENDING_APPROVAL')"}
+        )
+      `);
+      claimParams.push(targetMemoryId);
+    }
+
+    const claimRows = this.db.prepare(`
+      SELECT c.*
+      FROM memory_claims c
+      WHERE ${claimConditions.join(' AND ')}
+      ORDER BY c.created_at ASC, c.id ASC
+    `).all(...claimParams) as unknown as ClaimDbRow[];
+
+    const linkStmt = this.db.prepare(`
+      SELECT
+        m.id AS memory_id,
+        m.key AS memory_key,
+        m.status AS memory_status,
+        m.category AS memory_category,
+        m.version AS memory_version,
+        m.metadata_json AS memory_metadata_json,
+        mcl.status AS link_status,
+        mcl.invalidated_at AS invalidated_at,
+        mcl.invalidation_reason AS invalidation_reason
+      FROM memory_claim_links mcl
+      INNER JOIN memories m
+        ON m.id = mcl.memory_id
+        AND m.scope_type = mcl.scope_type
+        AND m.scope_id = mcl.scope_id
+      WHERE mcl.claim_id = ?
+        AND mcl.scope_type = ?
+        AND mcl.scope_id = ?${linkStatusClause}${memStatusClause}
+      ORDER BY m.id ASC
+    `);
+
+    const assocStmt = this.db.prepare(`
+      SELECT
+        cea.id AS association_id,
+        cea.claim_id AS claim_id,
+        cea.evidence_id AS evidence_id,
+        cea.memory_id AS memory_id,
+        cea.relationship AS association_relationship,
+        cea.status AS association_status,
+        cea.invalidated_at AS invalidated_at,
+        cea.invalidation_reason AS invalidation_reason,
+        ev.source_type AS source_type,
+        ev.source_url AS source_url,
+        ev.source_domain AS source_domain,
+        ev.source_title AS source_title,
+        ev.snippet AS snippet,
+        ev.snippet_hash AS snippet_hash,
+        ev.relationship AS evidence_relationship,
+        ev.task_id AS task_id,
+        ev.agent_id AS agent_id,
+        ev.created_at AS evidence_created_at
+      FROM claim_evidence_associations cea
+      INNER JOIN memory_evidence ev
+        ON ev.id = cea.evidence_id
+        AND ev.memory_id = cea.memory_id
+      WHERE cea.claim_id = ?
+        AND cea.scope_type = ?
+        AND cea.scope_id = ?${assocStatusClause}
+      ORDER BY ev.created_at ASC, ev.id ASC
+    `);
+
+    const verifStmt = this.db.prepare(`
+      SELECT *
+      FROM claim_evidence_verifications
+      WHERE claim_id = ?
+        AND scope_type = ?
+        AND scope_id = ?${includeHistorical ? '' : " AND status = 'CURRENT'"}
+      ORDER BY created_at ASC, id ASC
+    `);
+
+    const matchedConflicts: ClaimConflictSummary[] = [];
+
+    for (const cRow of claimRows) {
+      const claim = this.mapClaimRow(cRow);
+
+      const linkedMemRows = linkStmt.all(claim.id, filter.scopeType, filter.scopeId) as Array<{
+        memory_id: string;
+        memory_key: string;
+        memory_status: string;
+        memory_category: string;
+        memory_version: number;
+        memory_metadata_json: string;
+        link_status: string;
+        invalidated_at: string | null;
+        invalidation_reason: string | null;
+      }>;
+
+      const memoryOriginsById = new Map<string, ConflictMemoryOrigin>();
+      for (const lr of linkedMemRows) {
+        let verificationAssumptions: string[] = [];
+        if (lr.memory_metadata_json) {
+          try {
+            const parsedMeta = JSON.parse(lr.memory_metadata_json) as Record<string, unknown>;
+            if (Array.isArray(parsedMeta.verificationAssumptions)) {
+              verificationAssumptions = normalizeVerificationAssumptions(
+                parsedMeta.verificationAssumptions.filter((v): v is string => typeof v === 'string')
+              );
+            }
+          } catch {
+            verificationAssumptions = [];
+          }
+        }
+        memoryOriginsById.set(lr.memory_id, {
+          memoryId: lr.memory_id,
+          key: lr.memory_key,
+          status: lr.memory_status as MemoryStatus,
+          category: lr.memory_category as MemoryCategory,
+          version: lr.memory_version,
+          linkStatus: (lr.link_status as ClaimAssociationStatus) ?? 'ACTIVE',
+          invalidatedAt: lr.invalidated_at ?? null,
+          invalidationReason: lr.invalidation_reason ?? null,
+          verificationAssumptions
+        });
+      }
+
+      if (memoryOriginsById.size === 0) {
+        continue;
+      }
+
+      const rawAssocs = assocStmt.all(claim.id, filter.scopeType, filter.scopeId) as Array<{
+        association_id: string;
+        claim_id: string;
+        evidence_id: string;
+        memory_id: string;
+        association_relationship: string;
+        association_status: string;
+        invalidated_at: string | null;
+        invalidation_reason: string | null;
+        source_type: string;
+        source_url: string | null;
+        source_domain: string | null;
+        source_title: string | null;
+        snippet: string | null;
+        snippet_hash: string;
+        evidence_relationship: string;
+        task_id: string;
+        agent_id: string;
+        evidence_created_at: string;
+      }>;
+
+      const verifRows = verifStmt.all(claim.id, filter.scopeType, filter.scopeId) as unknown as ClaimVerificationDbRow[];
+      const verificationsByEvidenceId = new Map<string, ClaimEvidenceVerification[]>();
+      const seenVerifIds = new Set<string>();
+      for (const vr of verifRows) {
+        if (seenVerifIds.has(vr.id)) {
+          continue;
+        }
+        seenVerifIds.add(vr.id);
+        const mapped = this.mapClaimVerificationRow(vr);
+        const list = verificationsByEvidenceId.get(mapped.evidenceId) ?? [];
+        list.push(mapped);
+        verificationsByEvidenceId.set(mapped.evidenceId, list);
+      }
+
+      const evidenceById = new Map<string, ConflictEvidenceReference>();
+      for (const ar of rawAssocs) {
+        const origin = memoryOriginsById.get(ar.memory_id);
+        if (!origin) {
+          continue;
+        }
+        const existingRef = evidenceById.get(ar.evidence_id);
+        // Prefer ACTIVE association row if multiple historical rows exist for the same evidence item
+        if (existingRef && (existingRef.associationStatus === 'ACTIVE' || ar.association_status !== 'ACTIVE')) {
+          continue;
+        }
+        const verifications = verificationsByEvidenceId.get(ar.evidence_id) ?? [];
+        evidenceById.set(ar.evidence_id, {
+          evidenceId: ar.evidence_id,
+          memoryId: ar.memory_id,
+          memoryKey: origin.key,
+          memoryStatus: origin.status,
+          memoryVersion: origin.version,
+          sourceType: ar.source_type as EvidenceSourceType,
+          sourceUrl: ar.source_url,
+          sourceDomain: ar.source_domain,
+          sourceTitle: ar.source_title,
+          snippet: ar.snippet,
+          snippetHash: ar.snippet_hash,
+          relationship: ar.evidence_relationship as EvidenceRelationship,
+          associationId: ar.association_id,
+          associationStatus: (ar.association_status as ClaimAssociationStatus) ?? 'ACTIVE',
+          invalidatedAt: ar.invalidated_at ?? null,
+          invalidationReason: ar.invalidation_reason ?? null,
+          taskId: ar.task_id,
+          agentId: ar.agent_id,
+          createdAt: ar.evidence_created_at,
+          verifications
+        });
+      }
+
+      const evidenceRefs = Array.from(evidenceById.values());
+      if (evidenceRefs.length === 0) {
+        continue;
+      }
+
+      const supportingEvidence: ConflictEvidenceReference[] = [];
+      const contradictingEvidence: ConflictEvidenceReference[] = [];
+      const limitationEvidence: ConflictEvidenceReference[] = [];
+
+      const supportsAssumptionHashes = new Set<string>();
+      const contradictsAssumptionHashes = new Set<string>();
+      let hasExplicitUnverifiedContradiction = false;
+      let hasVerifiedContradiction = false;
+
+      for (const evRef of evidenceRefs) {
+        for (const v of evRef.verifications) {
+          if (v.verificationOutcome === 'PROPOSED' && v.proposedRelationship === 'SUPPORTS') {
+            supportsAssumptionHashes.add(v.assumptionsHash);
+          }
+          if (v.verificationOutcome === 'PROPOSED' && v.proposedRelationship === 'CONTRADICTS') {
+            contradictsAssumptionHashes.add(v.assumptionsHash);
+          }
+        }
+      }
+
+      let hasOpposingSameAssumptionVerifications = false;
+      for (const hash of contradictsAssumptionHashes) {
+        if (supportsAssumptionHashes.has(hash)) {
+          hasOpposingSameAssumptionVerifications = true;
+          break;
+        }
+      }
+
+      for (const evRef of evidenceRefs) {
+        const hasContradictsVerif = evRef.verifications.some(
+          (v) => v.proposedRelationship === 'CONTRADICTS' && v.verificationOutcome === 'PROPOSED'
+        );
+        const hasSupportsVerif = evRef.verifications.some(
+          (v) => v.proposedRelationship === 'SUPPORTS' && v.verificationOutcome === 'PROPOSED'
+        );
+        const hasOnlyNonConflictingVerifs =
+          evRef.verifications.length > 0 &&
+          evRef.verifications.every(
+            (v) =>
+              v.proposedRelationship === 'LIMITATION' ||
+              v.proposedRelationship === 'INSUFFICIENT' ||
+              v.proposedRelationship === 'AMBIGUOUS'
+          );
+
+        const isExplicitContradictionEv = evRef.relationship === 'CONTRADICTS' && !hasOnlyNonConflictingVerifs;
+        if (evRef.relationship === 'CONTRADICTS' && evRef.verifications.length === 0) {
+          hasExplicitUnverifiedContradiction = true;
+        }
+        if (
+          evRef.verifications.some(
+            (v) =>
+              v.proposedRelationship === 'CONTRADICTS' &&
+              v.verificationOutcome === 'PROPOSED' &&
+              (evRef.relationship !== 'LIMITATION' || supportsAssumptionHashes.has(v.assumptionsHash))
+          )
+        ) {
+          hasVerifiedContradiction = true;
+        }
+
+        if (hasContradictsVerif || isExplicitContradictionEv) {
+          contradictingEvidence.push(evRef);
+        } else if (hasSupportsVerif || (evRef.relationship === 'SUPPORTS' && !hasOnlyNonConflictingVerifs)) {
+          supportingEvidence.push(evRef);
+        } else {
+          limitationEvidence.push(evRef);
+        }
+      }
+
+      let conflictType: ClaimConflictType | null = null;
+      if (hasOpposingSameAssumptionVerifications) {
+        conflictType = 'OPPOSING_VERIFICATIONS';
+      } else if (hasVerifiedContradiction) {
+        conflictType = 'VERIFIED_CONTRADICTION';
+      } else if (hasExplicitUnverifiedContradiction) {
+        conflictType = 'EXPLICIT_CONTRADICTION';
+      }
+
+      if (!conflictType || contradictingEvidence.length === 0) {
+        continue;
+      }
+
+      if (filter.conflictType && conflictType !== filter.conflictType) {
+        continue;
+      }
+
+      const memories = Array.from(memoryOriginsById.values());
+      const isHistorical =
+        memories.some(
+          (m) =>
+            m.linkStatus === 'INVALIDATED' ||
+            m.status === 'ARCHIVED' ||
+            m.status === 'SUPERSEDED'
+        ) ||
+        evidenceRefs.some(
+          (e) =>
+            e.associationStatus === 'INVALIDATED' ||
+            e.verifications.some((v) => v.status === 'STALE')
+        );
+
+      const allAssumptionStrings: string[] = [];
+      for (const m of memories) {
+        allAssumptionStrings.push(...m.verificationAssumptions);
+      }
+      for (const e of evidenceRefs) {
+        for (const v of e.verifications) {
+          allAssumptionStrings.push(...v.assumptions);
+        }
+      }
+      const assumptions = normalizeVerificationAssumptions(allAssumptionStrings);
+
+      let detectedAt = claim.createdAt;
+      for (const e of evidenceRefs) {
+        if (e.createdAt > detectedAt) {
+          detectedAt = e.createdAt;
+        }
+        for (const v of e.verifications) {
+          if (v.createdAt > detectedAt) {
+            detectedAt = v.createdAt;
+          }
+        }
+      }
+
+      const conflictId = createHash('sha256')
+        .update(`conflict:${claim.id}:${includeHistorical ? 'historical' : 'current'}`, 'utf8')
+        .digest('hex');
+
+      matchedConflicts.push({
+        conflictId,
+        scopeType: claim.scopeType,
+        scopeId: claim.scopeId,
+        conflictType,
+        isHistorical,
+        claim,
+        memories,
+        supportingEvidence,
+        contradictingEvidence,
+        limitationEvidence,
+        assumptions,
+        detectedAt
+      });
+    }
+
+    matchedConflicts.sort((a, b) => {
+      if (a.detectedAt !== b.detectedAt) {
+        return a.detectedAt > b.detectedAt ? -1 : 1;
+      }
+      return a.claim.id.localeCompare(b.claim.id);
+    });
+
+    const total = matchedConflicts.length;
+    const paged = matchedConflicts.slice(offset, offset + limit);
+
+    return {
+      conflicts: paged,
+      total,
+      includeHistorical
+    };
   }
 
   /**

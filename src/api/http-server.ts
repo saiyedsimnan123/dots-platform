@@ -10,6 +10,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type {
   ApprovalDecision,
+  ClaimConflictType,
   ConversationMessageRole,
   ConversationStatus,
   CreateMemoryInput,
@@ -476,6 +477,25 @@ export class DotsHttpServer {
     }
 
     // --- Memories (static subroutes before :id) ---
+    if (method === 'GET' && pathname === '/api/memories/conflicts') {
+      const claimId = url.searchParams.get('claimId')?.trim() || undefined;
+      const memoryId = url.searchParams.get('memoryId')?.trim() || undefined;
+      const conflictType = (url.searchParams.get('conflictType')?.trim() || undefined) as ClaimConflictType | undefined;
+      const includeHistorical = parseOptionalBool(url.searchParams.get('includeHistorical'), 'includeHistorical');
+      const limit = parseOptionalInt(url.searchParams.get('limit'), 'limit');
+      const offset = parseOptionalInt(url.searchParams.get('offset'), 'offset');
+      const result = this.runtime.memoryService.listClaimConflicts(caller, {
+        claimId,
+        memoryId,
+        conflictType,
+        includeHistorical,
+        limit,
+        offset
+      });
+      this.sendJson(res, 200, result);
+      return;
+    }
+
     if (method === 'GET' && pathname === '/api/memories/export') {
       const category = (url.searchParams.get('category')?.trim() || undefined) as MemoryCategory | undefined;
       const includeArchived = parseOptionalBool(url.searchParams.get('includeArchived'), 'includeArchived');
@@ -622,6 +642,23 @@ export class DotsHttpServer {
         reason: typeof body.reason === 'string' ? body.reason : undefined
       });
       this.sendJson(res, 200, { memory });
+      return;
+    }
+
+    match = /^\/api\/memories\/([^/]+)\/conflicts$/.exec(pathname);
+    if (match && method === 'GET') {
+      const memoryId = decodeURIComponent(match[1]!);
+      const conflictType = (url.searchParams.get('conflictType')?.trim() || undefined) as ClaimConflictType | undefined;
+      const includeHistorical = parseOptionalBool(url.searchParams.get('includeHistorical'), 'includeHistorical');
+      const limit = parseOptionalInt(url.searchParams.get('limit'), 'limit');
+      const offset = parseOptionalInt(url.searchParams.get('offset'), 'offset');
+      const result = this.runtime.memoryService.getConflictsByMemoryId(caller, memoryId, {
+        conflictType,
+        includeHistorical,
+        limit,
+        offset
+      });
+      this.sendJson(res, 200, { memoryId, ...result });
       return;
     }
 

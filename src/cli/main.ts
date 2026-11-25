@@ -12,6 +12,7 @@ import { readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import type {
   ApprovalDecision,
+  ClaimConflictType,
   ConversationMessageRole,
   ConversationStatus,
   CreateScheduleInput,
@@ -54,6 +55,7 @@ const BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
   'no-resume',
   'reject',
   'include-archived',
+  'include-historical',
   'dry-run',
   'hard'
 ]);
@@ -176,6 +178,7 @@ function renderHelp(): string {
     '  memory delete <id>',
     '  memory approve <id> [--reason <text>]',
     '  memory reject <id> [--reason <text>]',
+    '  memory conflicts [--memory-id <id>] [--claim-id <id>] [--conflict-type <type>] [--include-historical] [--limit <n>] [--offset <n>]',
     '  memory export [--category <cat>] [--include-archived] [--out <file>]',
     '  memory import <file> [--strategy <FAIL|SKIP|OVERWRITE>]',
     '  memory purge [--ids a,b | --older-than <iso>] [--dry-run] [--max-batch <n>]',
@@ -589,6 +592,22 @@ async function executeLocalCommand(
         })
       };
     }
+    if (sub === 'conflicts') {
+      const memoryId = getStringFlag(flags, 'memory-id');
+      const claimId = getStringFlag(flags, 'claim-id');
+      const conflictType = getStringFlag(flags, 'conflict-type') as ClaimConflictType | undefined;
+      const includeHistorical = flags.get('include-historical') === true;
+      const limit = getIntFlag(flags, 'limit');
+      const offset = getIntFlag(flags, 'offset');
+      return runtime.memoryService.listClaimConflicts(caller, {
+        memoryId,
+        claimId,
+        conflictType,
+        includeHistorical,
+        limit,
+        offset
+      });
+    }
     throw new ValidationError(`Unknown memory subcommand '${sub}'.`);
   }
 
@@ -983,6 +1002,23 @@ async function executeRemoteCommand(
         dryRun,
         ...(maxBatchSize !== undefined ? { maxBatchSize } : {})
       });
+    }
+    if (sub === 'conflicts') {
+      const qs = new URLSearchParams();
+      const memoryId = getStringFlag(flags, 'memory-id');
+      const claimId = getStringFlag(flags, 'claim-id');
+      const conflictType = getStringFlag(flags, 'conflict-type');
+      const includeHistorical = flags.get('include-historical') === true;
+      const limit = getIntFlag(flags, 'limit');
+      const offset = getIntFlag(flags, 'offset');
+      if (memoryId) qs.set('memoryId', memoryId);
+      if (claimId) qs.set('claimId', claimId);
+      if (conflictType) qs.set('conflictType', conflictType);
+      if (includeHistorical) qs.set('includeHistorical', 'true');
+      if (limit !== undefined) qs.set('limit', String(limit));
+      if (offset !== undefined) qs.set('offset', String(offset));
+      const suffix = qs.toString() ? `?${qs.toString()}` : '';
+      return await callHttpApi(serverUrl, 'GET', `/api/memories/conflicts${suffix}`, token, scopeSpec);
     }
     throw new ValidationError(`Unknown memory subcommand '${sub}'.`);
   }

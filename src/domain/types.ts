@@ -523,6 +523,82 @@ export interface ListClaimVerificationsFilter {
   readonly offset?: number;
 }
 
+/**
+ * Phase 4D.3D.4C.4 - Conflict Surfacing Types
+ */
+
+export type ClaimConflictType =
+  | 'EXPLICIT_CONTRADICTION'
+  | 'VERIFIED_CONTRADICTION'
+  | 'OPPOSING_VERIFICATIONS';
+
+export interface ConflictMemoryOrigin {
+  readonly memoryId: string;
+  readonly key: string;
+  readonly status: MemoryStatus;
+  readonly category: MemoryCategory;
+  readonly version: number;
+  readonly linkStatus: ClaimAssociationStatus;
+  readonly invalidatedAt: string | null;
+  readonly invalidationReason: string | null;
+  readonly verificationAssumptions: readonly string[];
+}
+
+export interface ConflictEvidenceReference {
+  readonly evidenceId: string;
+  readonly memoryId: string;
+  readonly memoryKey: string;
+  readonly memoryStatus: MemoryStatus;
+  readonly memoryVersion: number;
+  readonly sourceType: EvidenceSourceType;
+  readonly sourceUrl: string | null;
+  readonly sourceDomain: string | null;
+  readonly sourceTitle: string | null;
+  readonly snippet: string | null;
+  readonly snippetHash: string;
+  readonly relationship: EvidenceRelationship;
+  readonly associationId: string;
+  readonly associationStatus: ClaimAssociationStatus;
+  readonly invalidatedAt: string | null;
+  readonly invalidationReason: string | null;
+  readonly taskId: string;
+  readonly agentId: string;
+  readonly createdAt: string;
+  readonly verifications: readonly ClaimEvidenceVerification[];
+}
+
+export interface ClaimConflictSummary {
+  readonly conflictId: string;
+  readonly scopeType: MemoryScopeType;
+  readonly scopeId: string;
+  readonly conflictType: ClaimConflictType;
+  readonly isHistorical: boolean;
+  readonly claim: MemoryClaim;
+  readonly memories: readonly ConflictMemoryOrigin[];
+  readonly supportingEvidence: readonly ConflictEvidenceReference[];
+  readonly contradictingEvidence: readonly ConflictEvidenceReference[];
+  readonly limitationEvidence: readonly ConflictEvidenceReference[];
+  readonly assumptions: readonly string[];
+  readonly detectedAt: string;
+}
+
+export interface ListClaimConflictsFilter {
+  readonly scopeType: MemoryScopeType;
+  readonly scopeId: string;
+  readonly claimId?: string;
+  readonly memoryId?: string;
+  readonly conflictType?: ClaimConflictType;
+  readonly includeHistorical?: boolean;
+  readonly limit?: number;
+  readonly offset?: number;
+}
+
+export interface ClaimConflictsResult {
+  readonly conflicts: readonly ClaimConflictSummary[];
+  readonly total: number;
+  readonly includeHistorical: boolean;
+}
+
 export type WritableMemoryStatus = Exclude<MemoryStatus, 'SUPERSEDED'>;
 
 export interface CreateMemoryInput {

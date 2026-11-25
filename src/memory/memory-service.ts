@@ -72,7 +72,11 @@ import type {
   ClaimEvidenceVerification,
   ListClaimVerificationsFilter,
   ClaimEvidenceAssociation,
-  ClaimVerificationLifecycleStatus
+  ClaimVerificationLifecycleStatus,
+  ClaimConflictType,
+  ClaimConflictSummary,
+  ListClaimConflictsFilter,
+  ClaimConflictsResult
 } from '../domain/types.ts';
 import {
   ValidationError,
@@ -3215,6 +3219,119 @@ export class MemoryService {
       }
       throw err;
     }
+  }
+
+  /**
+   * Surfaces structured evidence conflicts within caller's authorized scope.
+   * Strictly read-only: never mutates memory, claim, evidence, or proposal lifecycle state.
+   */
+  public listClaimConflicts(
+    caller: CallerContext,
+    filter: Omit<ListClaimConflictsFilter, 'scopeType' | 'scopeId'> = {}
+  ): ClaimConflictsResult {
+    this.validateCaller(caller, 'READ');
+
+    try {
+      const result = this.memoryRepo.listClaimConflicts({
+        ...filter,
+        scopeType: caller.scope.scopeType,
+        scopeId: caller.scope.scopeId
+      });
+
+      this.audit(caller, 'MEMORY_RETRIEVED', {
+        operation: 'listClaimConflicts',
+        scopeType: caller.scope.scopeType,
+        scopeId: caller.scope.scopeId,
+        includeHistorical: result.includeHistorical,
+        resultCount: result.conflicts.length,
+        totalCount: result.total
+      }, false);
+
+      return result;
+    } catch (err) {
+      if (err instanceof MemoryScopeViolationError) {
+        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+          reason: 'CROSS_SCOPE_READ_ATTEMPT',
+          operation: 'listClaimConflicts',
+          expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+        }, false);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Surfaces structured evidence conflicts linked to a specific memory within caller's scope.
+   */
+  public getConflictsByMemoryId(
+    caller: CallerContext,
+    memoryId: string,
+    options: Omit<ListClaimConflictsFilter, 'scopeType' | 'scopeId' | 'memoryId'> = {}
+  ): ClaimConflictsResult {
+    this.validateCaller(caller, 'READ');
+    if (!memoryId || typeof memoryId !== 'string' || memoryId.trim() === '') {
+      throw new ValidationError('Memory ID must be a non-empty string.');
+    }
+
+    const trimmedMemoryId = memoryId.trim();
+    try {
+      const existingMemory = this.memoryRepo.getMemoryById(trimmedMemoryId, caller.scope);
+      if (!existingMemory) {
+        throw new MemoryNotFoundError(trimmedMemoryId);
+      }
+
+      const result = this.memoryRepo.listClaimConflicts({
+        ...options,
+        memoryId: existingMemory.id,
+        scopeType: caller.scope.scopeType,
+        scopeId: caller.scope.scopeId
+      });
+
+      this.audit(caller, 'MEMORY_RETRIEVED', {
+        operation: 'getConflictsByMemoryId',
+        memoryId: existingMemory.id,
+        scopeType: caller.scope.scopeType,
+        scopeId: caller.scope.scopeId,
+        includeHistorical: result.includeHistorical,
+        resultCount: result.conflicts.length
+      }, false);
+
+      return result;
+    } catch (err) {
+      if (err instanceof MemoryScopeViolationError) {
+        this.audit(caller, 'MEMORY_ACCESS_DENIED', {
+          reason: 'CROSS_SCOPE_READ_ATTEMPT',
+          operation: 'getConflictsByMemoryId',
+          memoryId: trimmedMemoryId,
+          expectedScope: `${caller.scope.scopeType}:${caller.scope.scopeId}`
+        }, false);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Surfaces a structured conflict summary for a specific atomic claim within caller's scope, or null if none.
+   */
+  public getConflictByClaimId(
+    caller: CallerContext,
+    claimId: string,
+    options: { readonly includeHistorical?: boolean; readonly conflictType?: ClaimConflictType } = {}
+  ): ClaimConflictSummary | null {
+    this.validateCaller(caller, 'READ');
+    if (!claimId || typeof claimId !== 'string' || claimId.trim() === '') {
+      throw new ValidationError('Claim ID must be a non-empty string.');
+    }
+
+    const result = this.listClaimConflicts(caller, {
+      claimId: claimId.trim(),
+      conflictType: options.conflictType,
+      includeHistorical: options.includeHistorical,
+      limit: 1,
+      offset: 0
+    });
+
+    return result.conflicts[0] ?? null;
   }
 
   private resolveExplicitEvidenceTargetClaimIds(
