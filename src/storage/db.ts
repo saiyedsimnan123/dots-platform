@@ -679,6 +679,32 @@ export class DatabaseManager {
               ON claim_evidence_verifications(status);
           `);
         }
+      },
+      {
+        version: '014_conflict_surfacing_indexes',
+        up(database: DatabaseSync): void {
+          database.exec(`
+            CREATE INDEX IF NOT EXISTS idx_mcl_claim_scope_status
+              ON memory_claim_links(claim_id, scope_type, scope_id, status, memory_id);
+            CREATE INDEX IF NOT EXISTS idx_cea_claim_scope_status_rel
+              ON claim_evidence_associations(claim_id, scope_type, scope_id, status, relationship, evidence_id, memory_id);
+            CREATE INDEX IF NOT EXISTS idx_cea_scope_rel_status
+              ON claim_evidence_associations(scope_type, scope_id, relationship, status, claim_id);
+            CREATE INDEX IF NOT EXISTS idx_cev_claim_scope_status
+              ON claim_evidence_verifications(
+                claim_id,
+                scope_type,
+                scope_id,
+                status,
+                proposed_relationship,
+                verification_outcome,
+                assumptions_hash,
+                evidence_id
+              );
+            CREATE INDEX IF NOT EXISTS idx_cev_claim_ev_scope_status
+              ON claim_evidence_verifications(claim_id, evidence_id, scope_type, scope_id, status);
+          `);
+        }
       }
     ];
 

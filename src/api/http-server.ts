@@ -648,11 +648,13 @@ export class DotsHttpServer {
     match = /^\/api\/memories\/([^/]+)\/conflicts$/.exec(pathname);
     if (match && method === 'GET') {
       const memoryId = decodeURIComponent(match[1]!);
+      const claimId = url.searchParams.get('claimId')?.trim() || undefined;
       const conflictType = (url.searchParams.get('conflictType')?.trim() || undefined) as ClaimConflictType | undefined;
       const includeHistorical = parseOptionalBool(url.searchParams.get('includeHistorical'), 'includeHistorical');
       const limit = parseOptionalInt(url.searchParams.get('limit'), 'limit');
       const offset = parseOptionalInt(url.searchParams.get('offset'), 'offset');
       const result = this.runtime.memoryService.getConflictsByMemoryId(caller, memoryId, {
+        claimId,
         conflictType,
         includeHistorical,
         limit,

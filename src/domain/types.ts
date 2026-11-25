@@ -544,6 +544,26 @@ export interface ConflictMemoryOrigin {
   readonly verificationAssumptions: readonly string[];
 }
 
+export interface ConflictVerifierPosition {
+  readonly verificationId: string;
+  readonly verifierId: string;
+  readonly verifierVersion: string;
+  readonly promptPolicyVersion: string;
+  readonly promptPolicyHash: string;
+  readonly proposedRelationship: ClaimVerificationRelationship;
+  readonly verificationOutcome: ClaimVerificationCandidateOutcome;
+  readonly confidence: number | null;
+  readonly status: ClaimVerificationLifecycleStatus;
+  readonly createdAt: string;
+}
+
+export interface ConflictVerifierDisagreement {
+  readonly evidenceId: string;
+  readonly assumptionsHash: string;
+  readonly assumptions: readonly string[];
+  readonly positions: readonly ConflictVerifierPosition[];
+}
+
 export interface ConflictEvidenceReference {
   readonly evidenceId: string;
   readonly memoryId: string;
@@ -564,6 +584,7 @@ export interface ConflictEvidenceReference {
   readonly taskId: string;
   readonly agentId: string;
   readonly createdAt: string;
+  readonly hasVerifierDisagreement: boolean;
   readonly verifications: readonly ClaimEvidenceVerification[];
 }
 
@@ -578,7 +599,9 @@ export interface ClaimConflictSummary {
   readonly supportingEvidence: readonly ConflictEvidenceReference[];
   readonly contradictingEvidence: readonly ConflictEvidenceReference[];
   readonly limitationEvidence: readonly ConflictEvidenceReference[];
+  readonly verifierDisagreements: readonly ConflictVerifierDisagreement[];
   readonly assumptions: readonly string[];
+  readonly contextualAssumptions: readonly string[];
   readonly detectedAt: string;
 }
 

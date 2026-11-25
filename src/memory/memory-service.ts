@@ -1194,6 +1194,12 @@ export class MemoryService {
       // Strategy 1: REJECT or REJECTED
       if (input.decision === 'REJECT' || input.decision === 'REJECTED') {
         const updated = this.memoryRepo.updateMemory(input.memoryId, caller.scope, { status: 'ARCHIVED' });
+        this.memoryRepo.invalidateMemoryVerificationLifecycle(
+          updated.id,
+          caller.scope,
+          'PROPOSAL_REJECTED',
+          updated.updatedAt
+        );
 
         if (this.embeddingRepo) {
           this.embeddingRepo.deleteEmbeddingsByMemoryId(updated.id);

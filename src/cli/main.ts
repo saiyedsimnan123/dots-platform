@@ -103,16 +103,48 @@ function getStringFlag(flags: Map<string, string | boolean>, key: string): strin
   return typeof val === 'string' ? val : undefined;
 }
 
-function getIntFlag(flags: Map<string, string | boolean>, key: string): number | undefined {
-  const raw = getStringFlag(flags, key);
-  if (raw === undefined) {
+function getOptionalRequiredStringFlag(flags: Map<string, string | boolean>, key: string): string | undefined {
+  if (!flags.has(key)) {
     return undefined;
   }
-  const n = Number(raw);
+  const val = flags.get(key);
+  if (typeof val !== 'string' || val.trim() === '') {
+    throw new ValidationError(`Flag '--${key}' requires a non-empty value.`);
+  }
+  return val.trim();
+}
+
+function getIntFlag(flags: Map<string, string | boolean>, key: string): number | undefined {
+  if (!flags.has(key)) {
+    return undefined;
+  }
+  const val = flags.get(key);
+  if (typeof val !== 'string' || val.trim() === '') {
+    throw new ValidationError(`Flag '--${key}' must be a non-negative integer.`);
+  }
+  const n = Number(val);
   if (!Number.isInteger(n) || n < 0) {
     throw new ValidationError(`Flag '--${key}' must be a non-negative integer.`);
   }
   return n;
+}
+
+function parseConflictFlags(flags: Map<string, string | boolean>): {
+  readonly memoryId?: string;
+  readonly claimId?: string;
+  readonly conflictType?: ClaimConflictType;
+  readonly includeHistorical: boolean;
+  readonly limit?: number;
+  readonly offset?: number;
+} {
+  return {
+    memoryId: getOptionalRequiredStringFlag(flags, 'memory-id'),
+    claimId: getOptionalRequiredStringFlag(flags, 'claim-id'),
+    conflictType: getOptionalRequiredStringFlag(flags, 'conflict-type') as ClaimConflictType | undefined,
+    includeHistorical: flags.get('include-historical') === true,
+    limit: getIntFlag(flags, 'limit'),
+    offset: getIntFlag(flags, 'offset')
+  };
 }
 
 function requireArg(val: string | undefined, label: string): string {
@@ -593,19 +625,23 @@ async function executeLocalCommand(
       };
     }
     if (sub === 'conflicts') {
-      const memoryId = getStringFlag(flags, 'memory-id');
-      const claimId = getStringFlag(flags, 'claim-id');
-      const conflictType = getStringFlag(flags, 'conflict-type') as ClaimConflictType | undefined;
-      const includeHistorical = flags.get('include-historical') === true;
-      const limit = getIntFlag(flags, 'limit');
-      const offset = getIntFlag(flags, 'offset');
+      const parsed = parseConflictFlags(flags);
+      if (parsed.memoryId !== undefined) {
+        const result = runtime.memoryService.getConflictsByMemoryId(caller, parsed.memoryId, {
+          claimId: parsed.claimId,
+          conflictType: parsed.conflictType,
+          includeHistorical: parsed.includeHistorical,
+          limit: parsed.limit,
+          offset: parsed.offset
+        });
+        return { memoryId: parsed.memoryId, ...result };
+      }
       return runtime.memoryService.listClaimConflicts(caller, {
-        memoryId,
-        claimId,
-        conflictType,
-        includeHistorical,
-        limit,
-        offset
+        claimId: parsed.claimId,
+        conflictType: parsed.conflictType,
+        includeHistorical: parsed.includeHistorical,
+        limit: parsed.limit,
+        offset: parsed.offset
       });
     }
     throw new ValidationError(`Unknown memory subcommand '${sub}'.`);
@@ -1004,20 +1040,23 @@ async function executeRemoteCommand(
       });
     }
     if (sub === 'conflicts') {
+      const parsed = parseConflictFlags(flags);
       const qs = new URLSearchParams();
-      const memoryId = getStringFlag(flags, 'memory-id');
-      const claimId = getStringFlag(flags, 'claim-id');
-      const conflictType = getStringFlag(flags, 'conflict-type');
-      const includeHistorical = flags.get('include-historical') === true;
-      const limit = getIntFlag(flags, 'limit');
-      const offset = getIntFlag(flags, 'offset');
-      if (memoryId) qs.set('memoryId', memoryId);
-      if (claimId) qs.set('claimId', claimId);
-      if (conflictType) qs.set('conflictType', conflictType);
-      if (includeHistorical) qs.set('includeHistorical', 'true');
-      if (limit !== undefined) qs.set('limit', String(limit));
-      if (offset !== undefined) qs.set('offset', String(offset));
+      if (parsed.claimId) qs.set('claimId', parsed.claimId);
+      if (parsed.conflictType) qs.set('conflictType', parsed.conflictType);
+      if (parsed.includeHistorical) qs.set('includeHistorical', 'true');
+      if (parsed.limit !== undefined) qs.set('limit', String(parsed.limit));
+      if (parsed.offset !== undefined) qs.set('offset', String(parsed.offset));
       const suffix = qs.toString() ? `?${qs.toString()}` : '';
+      if (parsed.memoryId !== undefined) {
+        return await callHttpApi(
+          serverUrl,
+          'GET',
+          `/api/memories/${encodeURIComponent(parsed.memoryId)}/conflicts${suffix}`,
+          token,
+          scopeSpec
+        );
+      }
       return await callHttpApi(serverUrl, 'GET', `/api/memories/conflicts${suffix}`, token, scopeSpec);
     }
     throw new ValidationError(`Unknown memory subcommand '${sub}'.`);
